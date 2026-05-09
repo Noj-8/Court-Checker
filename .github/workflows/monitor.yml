@@ -48,5 +48,13 @@ jobs:
             git config user.email "tennis-monitor@users.noreply.github.com"
             git add state.json
             git commit -m "Update state [skip ci]"
-            git push
+            # Push, retrying with rebase if something else committed concurrently.
+            # state.json doesn't conflict with config.json edits, so rebase is safe.
+            for i in 1 2 3; do
+              if git push; then
+                break
+              fi
+              echo "Push rejected (try $i/3) — pulling and retrying..."
+              git pull --rebase origin main
+            done
           fi
