@@ -1,5 +1,15 @@
 {
-  "known_open": {},
-  "last_check": "2026-05-10T02:55:10.855997+07:00",
-  "currently_open_count": 0
+  "known_open": {
+    "2026-05-15|LOC001|North-1|23:00": true,
+    "2026-05-15|LOC001|North-2|23:00": true,
+    "2026-05-15|LOC001|South-1|23:00": true,
+    "2026-05-15|LOC001|South-2|23:00": true,
+    "2026-05-15|LOC001|South-3|23:00": true,
+    "2026-05-15|LOC002|G North-1|23:00": true,
+    "2026-05-15|LOC002|G North-3|23:00": true,
+    "2026-05-15|LOC002|G Center-1|23:00": true,
+    "2026-05-15|LOC002|G South-3|23:00": true
+  },
+  "last_check": "2026-05-10T03:12:32.870910+07:00",
+  "currently_open_count": 9
 }
