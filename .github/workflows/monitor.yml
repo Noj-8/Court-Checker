@@ -1,0 +1,52 @@
+name: Tennis monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'    # every 5 minutes — the inner loop polls 4× per run for ~60s effective interval
+  workflow_dispatch:           # allow manual trigger from Actions tab
+
+permissions:
+  contents: write              # so the workflow can commit state.json back
+
+# Only one run at a time — prevents overlap if a check takes longer than the cron interval
+concurrency:
+  group: tennis-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          PHPSESSID: ${{ secrets.PHPSESSID }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          LOOP_ITERATIONS: '4'         # 4 polls per run
+          LOOP_INTERVAL_SECONDS: '60'  # 60s between polls = ~60s effective polling
+        run: python monitor.py
+
+      - name: Commit state if changed
+        run: |
+          if git diff --quiet state.json; then
+            echo "No state changes — skipping commit."
+          else
+            git config user.name "tennis-monitor[bot]"
+            git config user.email "tennis-monitor@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update state [skip ci]"
+            git push
+          fi
