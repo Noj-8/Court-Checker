@@ -368,11 +368,11 @@ function TargetRow({
       <div className="flex items-center gap-2 shrink-0">
         {openCount > 0 ? (
           <span className="px-2.5 py-1 bg-courtlight text-court text-xs font-medium rounded-md tabular">
-            {openCount} open
+            {openCount} Open
           </span>
         ) : (
           <span className="px-2.5 py-1 bg-line/40 text-ink3 text-xs font-medium rounded-md">
-            booked
+            Monitoring
           </span>
         )}
         <button
