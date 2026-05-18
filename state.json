@@ -1,5 +1,7 @@
 {
-  "known_open": {},
-  "last_check": "2026-05-18T13:23:46.650614+07:00",
-  "currently_open_count": 0
+  "known_open": {
+    "2026-05-21|LOC002|G North-1|21:00": true
+  },
+  "last_check": "2026-05-18T13:28:47.413810+07:00",
+  "currently_open_count": 1
 }
