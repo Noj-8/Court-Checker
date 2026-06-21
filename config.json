@@ -1,22 +1,6 @@
 {
   "targets": [
     {
-      "name": "Sunday Evening",
-      "date": "2026-06-21",
-      "locations": [
-        "LOC001",
-        "LOC002"
-      ],
-      "times": [
-        "16:00",
-        "17:00",
-        "18:00",
-        "19:00",
-        "20:00",
-        "21:00"
-      ]
-    },
-    {
       "name": "Sunday Evening 28 Jun.",
       "date": "2026-06-28",
       "locations": [
