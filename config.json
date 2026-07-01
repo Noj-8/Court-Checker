@@ -14,19 +14,6 @@
       ]
     },
     {
-      "name": "Thursday",
-      "date": "2026-07-02",
-      "locations": [
-        "LOC001",
-        "LOC002"
-      ],
-      "times": [
-        "19:00",
-        "20:00",
-        "21:00"
-      ]
-    },
-    {
       "name": "Friday",
       "date": "2026-07-03",
       "locations": [
