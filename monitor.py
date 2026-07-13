@@ -17,6 +17,7 @@ import os
 import smtplib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -143,15 +144,21 @@ def run_check_pass(state, config, phpsessid, email_user, email_pass, email_to):
 
     cache = {}
     session_expired = False
-    for date, loc in sorted(fetch_keys):
-        log(f"  → {LOCATIONS.get(loc, loc)} / {date}")
-        data, err = fetch_slots(date, loc, phpsessid)
-        if err == "session_expired":
-            session_expired = True
-            log("      ⚠ session expired")
-        elif err:
-            log(f"      ⚠ {err}")
-        cache[(date, loc)] = data
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(fetch_slots, date, loc, phpsessid): (date, loc)
+            for date, loc in sorted(fetch_keys)
+        }
+        for future in as_completed(futures):
+            date, loc = futures[future]
+            data, err = future.result()
+            log(f"  → {LOCATIONS.get(loc, loc)} / {date}")
+            if err == "session_expired":
+                session_expired = True
+                log("      ⚠ session expired")
+            elif err:
+                log(f"      ⚠ {err}")
+            cache[(date, loc)] = data
 
     if session_expired:
         last = state.get("last_session_alert", 0)
