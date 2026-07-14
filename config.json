@@ -4,8 +4,7 @@
       "name": "Wednesday",
       "date": "2026-07-15",
       "locations": [
-        "LOC001",
-        "LOC002"
+        "LOC001"
       ],
       "times": [
         "20:00"
