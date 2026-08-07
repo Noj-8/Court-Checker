@@ -1,8 +1,6 @@
 {
-  "known_open": {
-    "2026-08-08|LOC001|South-1|09:00": true
-  },
-  "last_check": "2026-08-07T07:38:34.008334+07:00",
-  "currently_open_count": 1,
-  "last_session_alert": 1786027555.2420304
+  "known_open": {},
+  "last_check": "2026-08-07T07:43:56.346540+07:00",
+  "currently_open_count": 0,
+  "last_session_alert": 1786063373.2824275
 }
