@@ -1,8 +1,6 @@
 {
-  "known_open": {
-    "2026-08-24|LOC002|G Center-2|19:00": true
-  },
-  "last_check": "2026-08-23T12:18:53.941492+07:00",
-  "currently_open_count": 1,
+  "known_open": {},
+  "last_check": "2026-08-23T12:23:38.657163+07:00",
+  "currently_open_count": 0,
   "last_session_alert": 1787445338.1212094
 }
