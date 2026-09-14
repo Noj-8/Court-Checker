@@ -1,3 +1,16 @@
 {
-  "targets": []
+  "targets": [
+    {
+      "name": "Tue",
+      "date": "2026-09-15",
+      "locations": [
+        "LOC001",
+        "LOC002"
+      ],
+      "times": [
+        "20:00",
+        "21:00"
+      ]
+    }
+  ]
 }
