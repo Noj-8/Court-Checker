@@ -59,11 +59,28 @@ def log(msg):
     print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
+def normalize_times(times):
+    """Accept either a legacy plain time string or a {time, autoBook} object
+    per entry, and always return the latter. Lets old and new config.json
+    shapes coexist indefinitely — targets aren't rewritten until edited
+    through the dashboard, and plain strings just mean autoBook=False."""
+    normalized = []
+    for t in times:
+        if isinstance(t, str):
+            normalized.append({"time": t, "autoBook": False})
+        else:
+            normalized.append({"time": t["time"], "autoBook": bool(t.get("autoBook", False))})
+    return normalized
+
+
 def load_config():
     if not CONFIG_FILE.exists():
         log(f"ERROR: {CONFIG_FILE.name} not found")
         sys.exit(1)
-    return json.loads(CONFIG_FILE.read_text())
+    config = json.loads(CONFIG_FILE.read_text())
+    for target in config.get("targets", []):
+        target["times"] = normalize_times(target["times"])
+    return config
 
 
 def load_state():
@@ -102,7 +119,7 @@ def fetch_slots(date, loc_id, phpsessid):
 
 
 def find_open_slots(slots, target, loc_id):
-    times = set(target["times"])
+    times = {t["time"] for t in target["times"]}
     return [
         s for s in slots
         if s.get("locId") == loc_id
