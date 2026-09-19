@@ -3,6 +3,7 @@ import { NextResponse } from "next/server"
 import { authOptions } from "@/lib/auth"
 import { getFile, putFile } from "@/lib/github"
 import type { Config } from "@/lib/types"
+import { normalizeTimes } from "@/lib/types"
 
 export const dynamic = "force-dynamic"
 
@@ -18,6 +19,9 @@ export async function GET() {
   }
   const file = await getFile("config.json")
   const config: Config = file ? JSON.parse(file.content) : { targets: [] }
+  for (const t of config.targets) {
+    t.times = normalizeTimes(t.times)
+  }
   return NextResponse.json(config)
 }
 
@@ -52,6 +56,7 @@ export async function PUT(req: Request) {
     if (!Array.isArray(t.times) || t.times.length === 0) {
       return NextResponse.json({ error: "each target needs at least 1 time" }, { status: 400 })
     }
+    t.times = normalizeTimes(t.times)
   }
 
   const username = (session.user as any)?.login || "user"

@@ -1,10 +1,27 @@
 export type LocId = "LOC001" | "LOC002"
 
+export type TimeSlot = {
+  time: string                    // "20:00"
+  autoBook: boolean               // starred — auto-book to pending payment when this slot opens
+}
+
 export type Target = {
   name: string
   date: string                    // YYYY-MM-DD
   locations: LocId[]
-  times: string[]                 // ["20:00", "21:00", ...]
+  times: TimeSlot[]
+}
+
+// Accepts either a legacy plain time string or a {time, autoBook} object per
+// entry, and always returns the latter. Mirrors monitor.py's
+// normalize_times() so config.json's shape is interpreted identically
+// regardless of which side last touched it.
+export function normalizeTimes(times: unknown[]): TimeSlot[] {
+  return times.map((t) =>
+    typeof t === "string"
+      ? { time: t, autoBook: false }
+      : { time: (t as TimeSlot).time, autoBook: !!(t as TimeSlot).autoBook },
+  )
 }
 
 export type Config = {

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo } from "react"
 import { signOut } from "next-auth/react"
-import type { Config, State, Target, LocId } from "@/lib/types"
+import type { Config, State, Target, LocId, TimeSlot } from "@/lib/types"
 import { LOCATIONS, ALL_TIMES } from "@/lib/types"
 
 type Props = {
@@ -103,7 +103,7 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
       activeTargets.forEach((t, i) => {
         if (t.date !== date) return
         if (!t.locations.includes(locId as LocId)) return
-        if (!t.times.includes(timeName)) return
+        if (!t.times.some((x) => x.time === timeName)) return
         m.set(i, (m.get(i) || 0) + 1)
       })
     }
@@ -354,8 +354,9 @@ function TargetRow({
       : LOCATIONS[target.locations[0] as LocId]
   const timeStr =
     target.times.length <= 3
-      ? target.times.join(", ")
-      : `${target.times[0]}–${target.times[target.times.length - 1]} (${target.times.length} slots)`
+      ? target.times.map((t) => t.time).join(", ")
+      : `${target.times[0].time}–${target.times[target.times.length - 1].time} (${target.times.length} slots)`
+  const starredTimes = target.times.filter((t) => t.autoBook).map((t) => t.time)
 
   return (
     <div className="bg-white border border-line rounded-xl p-4 flex items-center justify-between gap-4 hover:border-line2 transition-colors">
@@ -364,6 +365,18 @@ function TargetRow({
         <div className="text-sm text-ink3 tabular">
           {target.date} · {timeStr} · {locStr}
         </div>
+        {starredTimes.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {starredTimes.map((t) => (
+              <span
+                key={t}
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amberlight text-amber text-[11px] font-medium rounded tabular"
+              >
+                ★ {t} auto-book
+              </span>
+            ))}
+          </div>
+        )}
       </div>
       <div className="flex items-center gap-2 shrink-0">
         {openCount > 0 ? (
@@ -414,7 +427,7 @@ function TargetForm({
   const [locations, setLocations] = useState<LocId[]>(
     initial?.locations || ["LOC001", "LOC002"],
   )
-  const [times, setTimes] = useState<string[]>(initial?.times || [])
+  const [times, setTimes] = useState<TimeSlot[]>(initial?.times || [])
   const [submitting, setSubmitting] = useState(false)
 
   function toggleLoc(loc: LocId) {
@@ -425,13 +438,26 @@ function TargetForm({
 
   function toggleTime(t: string) {
     setTimes((prev) =>
-      prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t].sort(),
+      prev.some((x) => x.time === t)
+        ? prev.filter((x) => x.time !== t)
+        : [...prev, { time: t, autoBook: false }].sort((a, b) => a.time.localeCompare(b.time)),
+    )
+  }
+
+  function toggleStar(t: string) {
+    setTimes((prev) =>
+      prev.map((x) => (x.time === t ? { ...x, autoBook: !x.autoBook } : x)),
     )
   }
 
   function setTimeRange(from: number, to: number) {
-    const range: string[] = []
-    for (let h = from; h <= to; h++) range.push(`${String(h).padStart(2, "0")}:00`)
+    // Carry over autoBook for times that stay selected across the preset change
+    const existingByTime = new Map(times.map((x) => [x.time, x.autoBook]))
+    const range: TimeSlot[] = []
+    for (let h = from; h <= to; h++) {
+      const t = `${String(h).padStart(2, "0")}:00`
+      range.push({ time: t, autoBook: existingByTime.get(t) ?? false })
+    }
     setTimes(range)
   }
 
@@ -444,7 +470,7 @@ function TargetForm({
       name: name.trim(),
       date,
       locations: [...locations].sort() as LocId[],
-      times: [...times].sort(),
+      times: [...times].sort((a, b) => a.time.localeCompare(b.time)),
     })
   }
 
@@ -550,23 +576,54 @@ function TargetForm({
         </div>
         <div className="grid grid-cols-9 gap-1.5">
           {ALL_TIMES.map((t) => {
-            const active = times.includes(t)
+            const slot = times.find((x) => x.time === t)
+            const active = !!slot
+            const starred = slot?.autoBook ?? false
             return (
               <button
                 key={t}
                 type="button"
                 onClick={() => toggleTime(t)}
-                className={`px-2 py-1.5 text-xs rounded-md border transition-all tabular ${
+                className={`relative px-2 py-1.5 text-xs rounded-md border transition-all tabular ${
                   active
                     ? "bg-court text-canvas border-court"
                     : "bg-canvas text-ink2 border-line hover:border-line2"
                 }`}
               >
+                {active && (
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      toggleStar(t)
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        toggleStar(t)
+                      }
+                    }}
+                    className={`absolute -top-1.5 -right-1.5 w-4 h-4 flex items-center justify-center rounded-full text-[10px] leading-none transition-colors ${
+                      starred
+                        ? "bg-amber text-canvas"
+                        : "bg-white text-ink3 border border-line hover:border-line2"
+                    }`}
+                    aria-label={starred ? `Disable auto-book for ${t}` : `Enable auto-book for ${t}`}
+                    title={starred ? "Auto-book enabled" : "Auto-book disabled — click to star"}
+                  >
+                    {starred ? "★" : "☆"}
+                  </span>
+                )}
                 {t}
               </button>
             )
           })}
         </div>
+        <p className="text-xs text-ink3 mt-2">
+          Click a time to include it · click its star to auto-book that slot to pending payment the moment it opens
+        </p>
       </div>
 
       <div className="flex items-center justify-end gap-2 pt-2">
