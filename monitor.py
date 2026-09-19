@@ -33,7 +33,12 @@ API_URL = (
     "https://crystalsports-booking.kegroup.co.th"
     "/api_helper.php?action=getAvailableStadiums"
 )
+MEMBER_INFO_URL = (
+    "https://crystalsports-booking.kegroup.co.th"
+    "/api_helper.php?action=getMemberInfo"
+)
 BOOKING_URL = "https://crystalsports-booking.kegroup.co.th/booking.php"
+SAFE_WALLET_BALANCE = "0.00"
 BOOKED_STATUS = "1"
 TZ = ZoneInfo("Asia/Bangkok")
 
@@ -116,6 +121,70 @@ def fetch_slots(date, loc_id, phpsessid):
     if not isinstance(data, list):
         return None, "session_expired"
     return data, None
+
+
+def get_wallet_balance(member_mobile, phpsessid):
+    """Fetch the member's current wallet balance via getMemberInfo.
+
+    Mirrors fetch_slots()'s shape exactly: same request pattern, same
+    (value, err) return contract. err is None only when `value` is a
+    validated, trustworthy balance string — every other outcome (network
+    failure, bad status, unparseable body, wrong shape, missing/null/blank
+    field) returns (None, reason). Never raises: any unanticipated
+    exception is itself treated as a failed read, not a crash, so a caller
+    that only checks "was err set" can never be fooled into treating a
+    freak error as a clean result.
+
+    See WALLET_GUARD_SAFETY.md for the full failure-mode test matrix this
+    contract was verified against, and why every branch below fails closed
+    on purpose — do not "simplify" this without reading that first.
+    """
+    if not member_mobile:
+        return None, "missing member_mobile"
+    try:
+        resp = requests.post(
+            MEMBER_INFO_URL,
+            headers=HEADERS,
+            cookies={"PHPSESSID": phpsessid},
+            json={"memberMobile": member_mobile},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None, f"http {resp.status_code}"
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            return None, "session_expired"
+        if not isinstance(data, dict):
+            return None, "session_expired"
+        balance = data.get("walletBalance")
+        if not isinstance(balance, str) or not balance.strip():
+            return None, f"missing/invalid walletBalance in response: {balance!r}"
+        return balance, None
+    except requests.RequestException as e:
+        return None, f"network: {e}"
+    except Exception as e:
+        return None, f"unexpected: {e}"
+
+
+def wallet_is_safe_to_book(member_mobile, phpsessid):
+    """The Section 6 safety guard. Must be called fresh, immediately before
+    every bookingTransactions attempt — never cached, never skipped. Returns
+    True only when the balance was read successfully AND is exactly
+    "0.00". Any failure or ambiguity from get_wallet_balance(), or any
+    balance value other than an exact "0.00" match, returns False —
+    silence or uncertainty is never interpreted as safe to proceed.
+
+    See WALLET_GUARD_SAFETY.md for the full test matrix.
+    """
+    balance, err = get_wallet_balance(member_mobile, phpsessid)
+    if err:
+        log(f"      ⚠ wallet balance check failed ({err}) — treating as unsafe, will not auto-book")
+        return False
+    if balance != SAFE_WALLET_BALANCE:
+        log(f"      ⚠ wallet balance is {balance!r}, not exactly \"{SAFE_WALLET_BALANCE}\" — treating as unsafe, will not auto-book")
+        return False
+    return True
 
 
 def find_open_slots(slots, target, loc_id):
