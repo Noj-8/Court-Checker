@@ -14,13 +14,24 @@ implementation and how it was verified.
 
 ## Design principle: fail closed, always
 
-`wallet_is_safe_to_book()` has exactly one path to `True`: the balance read
+`wallet_is_safe_to_book()` returns `(is_safe, reason)`. It has exactly one
+path to `is_safe == True` (with `reason == None`): the balance read
 succeeded *and* the value is an exact string match to `"0.00"`. Every other
 outcome — a network error, a bad HTTP status, an unparseable body, a
 response with the wrong shape, a missing/null/blank `walletBalance` field, a
 near-miss value like `"0.0"`, or a completely unanticipated exception — falls
-through to `False`. There is no default branch that assumes safety; ambiguity
-is always treated as "do not proceed."
+through to `(False, reason)`, where `reason` is a specific, human-readable
+string naming which case occurred. There is no default branch that assumes
+safety; ambiguity is always treated as "do not proceed."
+
+The `reason` string exists so a caller never has to guess *why* the guard
+failed — added in Stage 5 so the guard-abort failure email can say something
+genuinely accurate ("could not read wallet balance (network: timed out)")
+instead of defaulting to "wallet balance was not zero" in a case where the
+balance was never actually confirmed either way. Originally
+`wallet_is_safe_to_book()` returned a plain bool; the signature changed once
+a real caller (the failure email) needed the distinction and it was cheaper
+to carry it through than to reconstruct it elsewhere.
 
 `get_wallet_balance()` backs this up structurally: it cannot raise past its
 own boundary. A final `except Exception` catches anything unanticipated and
@@ -39,11 +50,15 @@ money-moving call.
 
 Verified by actually mocking `requests.post` and exercising each case, not
 by inspection alone (see "a bug in verifying this," below, for why that
-distinction mattered).
+distinction mattered). Written when `wallet_is_safe_to_book()` still
+returned a plain bool; re-verified unchanged after the Stage 5 signature
+change to `(is_safe, reason)` — the "Result" column below is `is_safe`, and
+every non-`True` row also gets a specific, case-matching `reason` string
+now (see the design-principle section above).
 
 | Scenario | What happens inside `get_wallet_balance()` | Result |
 |---|---|---|
-| Clean `"0.00"` | Passes all checks | `wallet_is_safe_to_book() == True` — the only green light |
+| Clean `"0.00"` | Passes all checks | `wallet_is_safe_to_book() == (True, None)` — the only green light |
 | Non-zero balance (e.g. `"50.00"`) | Read succeeds, but `balance != "0.00"` | False |
 | Request timeout | `requests.exceptions.Timeout` → `except requests.RequestException` → `"network: ..."` | False |
 | Connection refused / DNS failure | Same `RequestException` branch | False |
