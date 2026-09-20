@@ -9,6 +9,10 @@ provides effective 60-second polling within each scheduled run.
   Reads config from:    config.json
   Reads secrets from:   PHPSESSID, EMAIL_USER, EMAIL_APP_PASSWORD env vars
   Reads loop tuning:    LOOP_ITERATIONS, LOOP_INTERVAL_SECONDS env vars (optional)
+  Reads:                MEMBER_MOBILE env var (optional — required only for
+                         auto-booking starred slots; unset means starred
+                         slots log as guard_abort instead, notify-only path
+                         is unaffected)
   Reads/writes state:   state.json
 """
 
@@ -19,6 +23,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -37,8 +42,13 @@ MEMBER_INFO_URL = (
     "https://crystalsports-booking.kegroup.co.th"
     "/api_helper.php?action=getMemberInfo"
 )
+BOOKING_TX_URL = (
+    "https://crystalsports-booking.kegroup.co.th"
+    "/api_helper.php?action=bookingTransactions"
+)
 BOOKING_URL = "https://crystalsports-booking.kegroup.co.th/booking.php"
 SAFE_WALLET_BALANCE = "0.00"
+EXPECTED_SUCCESS_STATUS_CODE = "10"  # the ONLY statusCode that means "parked into pending" — anything else is a failure, see Section 6 of the spec
 BOOKED_STATUS = "1"
 TZ = ZoneInfo("Asia/Bangkok")
 
@@ -187,6 +197,155 @@ def wallet_is_safe_to_book(member_mobile, phpsessid):
     return True
 
 
+def book_slot(member_mobile, phpsessid, stadiumtime_id, booking_date, amount):
+    """Fire the bookingTransactions call (spec Section 3A) that parks a slot
+    into pending payment. Only ever call this after wallet_is_safe_to_book()
+    has confirmed a fresh zero balance — this function does not check that
+    itself, callers must.
+
+    Mirrors get_wallet_balance()'s shape: (data, err), err is None only for
+    a well-formed JSON dict response. That does NOT mean the booking
+    succeeded — it only means the call completed and can be interpreted.
+    statusCode interpretation happens in the caller (attempt_autobook), the
+    same way find_open_slots() does interpretation on top of fetch_slots()'s
+    raw validated data. Uses the same blanket except-Exception fail-closed
+    shape as get_wallet_balance(), for the same reason: this is a
+    money-adjacent call, so an uncaught exception must never propagate past
+    this boundary into an ambiguous state.
+    """
+    try:
+        resp = requests.post(
+            BOOKING_TX_URL,
+            headers=HEADERS,
+            cookies={"PHPSESSID": phpsessid},
+            json={
+                "customer": member_mobile,
+                "createdBy": member_mobile,
+                "paymentType": "WALLET",
+                "transaction": [
+                    {
+                        "transactionCode": "COURT",
+                        "coachMemberId": 0,
+                        "stadiumtimeId": stadiumtime_id,
+                        "bookingDate": booking_date,
+                        "amount": amount,
+                    }
+                ],
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None, f"http {resp.status_code}"
+        try:
+            data = resp.json()
+        except json.JSONDecodeError:
+            return None, "session_expired"
+        if not isinstance(data, dict):
+            return None, "session_expired"
+        return data, None
+    except requests.RequestException as e:
+        return None, f"network: {e}"
+    except Exception as e:
+        return None, f"unexpected: {e}"
+
+
+def format_amount(raw_price):
+    """Normalize a stadiumtimePrice value (e.g. "500.0000", as returned by
+    getAvailableStadiums) to the 2-decimal string format bookingTransactions
+    expects (e.g. "500.00"), matching the confirmed HAR-captured contract.
+    Returns None if the value can't be parsed as a valid amount — this feeds
+    a money-moving call, so an unparseable price must abort, never guess."""
+    try:
+        return str(Decimal(str(raw_price)).quantize(Decimal("0.01")))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessid):
+    """The Section 6/7 auto-book decision-and-record logic for one starred
+    slot that just opened. Always writes an outcome into
+    autobook_attempts[k] before returning — including on every abort path —
+    so the caller's "already attempted" check (in run_check_pass) is
+    guaranteed to see this slot on the next poll regardless of outcome.
+
+    Call order, unconditional: (1) re-check not already attempted — belt-
+    and-suspenders on top of the caller's own check, since this property
+    matters enough not to rely on a single enforcement point; (2)
+    wallet_is_safe_to_book() — the very first real check, hard stop (return)
+    on False, no code path below this reaches the network; (3) parse/
+    validate the amount — hard stop on failure, before any booking call;
+    (4) book_slot() — the actual bookingTransactions call; (5) interpret
+    statusCode — ONLY an exact "10" match counts as success, every other
+    value (wrong code, missing, null, wrong type, or a code we've never
+    seen) is a failure needing investigation, never assumed safe.
+    """
+    if k in autobook_attempts:
+        log(f"      ⚠ {k} already has a recorded auto-book attempt ({autobook_attempts[k].get('outcome')}) — this should have been filtered before calling attempt_autobook; not re-attempting")
+        return autobook_attempts[k]
+
+    attempted_at = datetime.now(TZ).isoformat()
+
+    if not wallet_is_safe_to_book(member_mobile, phpsessid):
+        log(f"      ⛔ auto-book HARD-STOPPED for {k}: wallet balance guard failed, no booking call made")
+        autobook_attempts[k] = {
+            "outcome": "guard_abort",
+            "statusCode": None,
+            "bookingRef": None,
+            "message": None,
+            "attempted_at": attempted_at,
+        }
+        return autobook_attempts[k]
+
+    amount = format_amount(slot.get("stadiumtimePrice"))
+    if amount is None:
+        log(f"      ⛔ auto-book aborted for {k}: could not parse a valid amount from stadiumtimePrice={slot.get('stadiumtimePrice')!r}, no booking call made")
+        autobook_attempts[k] = {
+            "outcome": "invalid_amount",
+            "statusCode": None,
+            "bookingRef": None,
+            "message": None,
+            "attempted_at": attempted_at,
+        }
+        return autobook_attempts[k]
+
+    log(f"      → attempting auto-book for {k} (amount {amount})")
+    data, err = book_slot(member_mobile, phpsessid, slot["stadiumtimeId"], target["date"], amount)
+
+    if err:
+        log(f"      ⛔ auto-book call failed for {k}: {err}")
+        autobook_attempts[k] = {
+            "outcome": "call_failed",
+            "statusCode": None,
+            "bookingRef": None,
+            "message": err,
+            "attempted_at": attempted_at,
+        }
+        return autobook_attempts[k]
+
+    status_code = data.get("statusCode")
+    booking_ref = data.get("bookingRef")
+    message = data.get("message")
+
+    if status_code == EXPECTED_SUCCESS_STATUS_CODE:
+        log(f"      ✅ auto-book parked into pending payment for {k}: bookingRef={booking_ref!r}")
+        outcome = "parked"
+    else:
+        # Anything other than an exact "10" match is a failure — including a
+        # status code we've never seen before. No assumption that "not an
+        # error" means success.
+        log(f"      ⛔ auto-book returned unexpected statusCode={status_code!r} for {k} (message={message!r}) — treating as failure, needs investigation")
+        outcome = "unexpected_status"
+
+    autobook_attempts[k] = {
+        "outcome": outcome,
+        "statusCode": status_code,
+        "bookingRef": booking_ref,
+        "message": message,
+        "attempted_at": attempted_at,
+    }
+    return autobook_attempts[k]
+
+
 def find_open_slots(slots, target, loc_id):
     times = {t["time"] for t in target["times"]}
     return [
@@ -213,7 +372,7 @@ def slot_key(date, loc_id, court, time_name):
     return f"{date}|{loc_id}|{court}|{time_name}"
 
 
-def run_check_pass(state, config, phpsessid, email_user, email_pass, email_to):
+def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pass, email_to):
     """Performs one full check. Mutates `state` in place."""
     today_str = datetime.now(TZ).date().isoformat()
 
@@ -272,11 +431,21 @@ def run_check_pass(state, config, phpsessid, email_user, email_pass, email_to):
         k: v for k, v in state.get("known_open", {}).items()
         if k.split("|", 1)[0] >= today_str
     }
+    # Deliberately NOT pruned when a slot stops showing as currently open
+    # (unlike known_open above) — an already-recorded attempt, of any
+    # outcome, must permanently block re-attempts for that slot, even if it
+    # flickers open/closed/open again across polls. Only date-based pruning,
+    # since a target for a past date can never be re-detected as open again.
+    autobook_attempts = {
+        k: v for k, v in state.get("autobook_attempts", {}).items()
+        if k.split("|", 1)[0] >= today_str
+    }
 
     new_alerts = []
     currently_open = set()
 
     for target in active:
+        starred_times = {t["time"] for t in target["times"] if t["autoBook"]}
         for loc in target["locations"]:
             slots = cache.get((target["date"], loc))
             if not slots:
@@ -294,6 +463,14 @@ def run_check_pass(state, config, phpsessid, email_user, email_pass, email_to):
                         "time": s["timeName"],
                         "price": s.get("stadiumtimePrice", ""),
                     })
+                    if s["timeName"] in starred_times:
+                        if k in autobook_attempts:
+                            log(f"      ⚠ {k} already has a recorded auto-book attempt ({autobook_attempts[k].get('outcome')}) — not re-attempting")
+                        else:
+                            # Sequential, not parallel, even if several starred
+                            # slots open in the same pass — each call is
+                            # real-money-adjacent (spec Section 7).
+                            attempt_autobook(k, target, s, autobook_attempts, member_mobile, phpsessid)
 
     for k in list(known_open.keys()):
         d, l = k.split("|", 2)[:2]
@@ -302,6 +479,7 @@ def run_check_pass(state, config, phpsessid, email_user, email_pass, email_to):
             del known_open[k]
 
     state["known_open"] = known_open
+    state["autobook_attempts"] = autobook_attempts
     state["last_check"] = datetime.now(TZ).isoformat()
     state["currently_open_count"] = len(currently_open)
 
@@ -340,6 +518,13 @@ def main():
     phpsessid = os.environ.get("PHPSESSID", "").strip()
     email_user = os.environ.get("EMAIL_USER", "").strip()
     email_pass = os.environ.get("EMAIL_APP_PASSWORD", "").strip()
+    # Optional, unlike the three below: get_wallet_balance()/
+    # wallet_is_safe_to_book() already fail closed on an empty
+    # member_mobile (guard_abort, logged, recorded), so a not-yet-configured
+    # MEMBER_MOBILE secret only disables auto-booking for starred slots —
+    # it must never be able to take down the notify-only path for everyone
+    # else by exiting here.
+    member_mobile = os.environ.get("MEMBER_MOBILE", "").strip()
 
     missing = [k for k, v in {
         "PHPSESSID": phpsessid,
@@ -349,6 +534,8 @@ def main():
     if missing:
         log(f"ERROR: missing env vars: {', '.join(missing)}")
         sys.exit(1)
+    if not member_mobile:
+        log("  MEMBER_MOBILE not set — starred slots will be logged as guard_abort, not auto-booked")
 
     config = load_config()
     email_to = config.get("email_to") or email_user
@@ -362,7 +549,7 @@ def main():
     for i in range(iterations):
         log(f"--- iteration {i + 1}/{iterations} ---")
         try:
-            run_check_pass(state, config, phpsessid, email_user, email_pass, email_to)
+            run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pass, email_to)
             save_state(state)
         except Exception as e:
             log(f"⚠ iteration {i + 1} failed: {e}")

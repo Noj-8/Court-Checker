@@ -35,6 +35,7 @@ jobs:
           PHPSESSID: ${{ secrets.PHPSESSID }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          MEMBER_MOBILE: ${{ secrets.MEMBER_MOBILE }}  # optional — unset secret evaluates to "", monitor.py handles that (guard_abort, notify-only path unaffected)
           LOOP_ITERATIONS: '4'         # 4 polls per run
           LOOP_INTERVAL_SECONDS: '60'  # 60s between polls = ~60s effective polling
         run: python monitor.py
