@@ -69,6 +69,24 @@
           "autoBook": false
         }
       ]
+    },
+    {
+      "name": "Fri",
+      "date": "2026-09-25",
+      "locations": [
+        "LOC001",
+        "LOC002"
+      ],
+      "times": [
+        {
+          "time": "20:00",
+          "autoBook": true
+        },
+        {
+          "time": "21:00",
+          "autoBook": true
+        }
+      ]
     }
   ]
 }
