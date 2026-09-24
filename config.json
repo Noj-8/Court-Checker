@@ -30,7 +30,8 @@
       "name": "Sun",
       "date": "2026-09-27",
       "locations": [
-        "LOC001"
+        "LOC001",
+        "LOC002"
       ],
       "times": [
         {
@@ -42,8 +43,12 @@
           "autoBook": true
         },
         {
+          "time": "20:00",
+          "autoBook": false
+        },
+        {
           "time": "21:00",
-          "autoBook": true
+          "autoBook": false
         }
       ]
     }
