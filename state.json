@@ -2,7 +2,7 @@
   "known_open": {
     "2026-09-26|LOC001|South-2|21:00": true
   },
-  "last_check": "2026-09-25T17:48:25.411904+07:00",
+  "last_check": "2026-09-25T17:53:31.488760+07:00",
   "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
@@ -40,6 +40,13 @@
       "bookingRef": "SPORTS-20269195116",
       "message": "Insufficient fund | 500.00 THB",
       "attempted_at": "2026-09-25T15:17:27.809375+07:00"
+    },
+    "2026-09-26|LOC002|G South-2|16:00": {
+      "outcome": "parked",
+      "statusCode": "10",
+      "bookingRef": "SPORTS-20269195144",
+      "message": "Insufficient fund | 500.00 THB",
+      "attempted_at": "2026-09-25T17:50:22.693726+07:00"
     }
   }
 }
