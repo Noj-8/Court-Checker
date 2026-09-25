@@ -34,6 +34,14 @@
       ],
       "times": [
         {
+          "time": "16:00",
+          "autoBook": false
+        },
+        {
+          "time": "17:00",
+          "autoBook": false
+        },
+        {
           "time": "18:00",
           "autoBook": false
         },
