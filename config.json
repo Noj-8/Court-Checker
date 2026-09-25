@@ -9,19 +9,19 @@
       "times": [
         {
           "time": "16:00",
-          "autoBook": false
+          "autoBook": true
         },
         {
           "time": "18:00",
-          "autoBook": false
+          "autoBook": true
         },
         {
           "time": "19:00",
-          "autoBook": false
+          "autoBook": true
         },
         {
           "time": "21:00",
-          "autoBook": false
+          "autoBook": true
         }
       ]
     },
