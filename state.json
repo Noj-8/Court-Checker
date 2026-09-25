@@ -1,7 +1,9 @@
 {
-  "known_open": {},
-  "last_check": "2026-09-25T12:18:31.119920+07:00",
-  "currently_open_count": 0,
+  "known_open": {
+    "2026-09-26|LOC002|G Center-3|21:00": true
+  },
+  "last_check": "2026-09-25T12:23:28.695424+07:00",
+  "currently_open_count": 1,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
     "2026-09-26|LOC002|G South-1|19:00": {
