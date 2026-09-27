@@ -1,9 +1,10 @@
 {
   "known_open": {
-    "2026-09-28|LOC001|South-1|21:00": true
+    "2026-09-28|LOC001|South-1|21:00": true,
+    "2026-09-28|LOC001|North-2|21:00": true
   },
-  "last_check": "2026-09-27T21:48:48.025832+07:00",
-  "currently_open_count": 0,
+  "last_check": "2026-09-27T21:53:39.041873+07:00",
+  "currently_open_count": 2,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {}
 }
