@@ -1,9 +1,7 @@
 {
-  "known_open": {
-    "2026-10-01|LOC002|G North-1|21:00": true
-  },
-  "last_check": "2026-09-30T19:53:27.452781+07:00",
-  "currently_open_count": 1,
+  "known_open": {},
+  "last_check": "2026-09-30T19:58:24.907210+07:00",
+  "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {}
 }
