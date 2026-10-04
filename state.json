@@ -2,10 +2,11 @@
   "known_open": {
     "2026-10-05|LOC002|G North-3|21:00": true,
     "2026-10-05|LOC001|North-2|21:00": true,
-    "2026-10-05|LOC001|Center-2|20:00": true
+    "2026-10-05|LOC001|Center-2|20:00": true,
+    "2026-10-05|LOC001|Center-1|20:00": true
   },
-  "last_check": "2026-10-04T18:28:24.486106+07:00",
-  "currently_open_count": 3,
+  "last_check": "2026-10-04T18:33:31.384063+07:00",
+  "currently_open_count": 4,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {}
 }
