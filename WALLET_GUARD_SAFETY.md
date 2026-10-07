@@ -28,9 +28,22 @@
 >
 > **What changed:** starred slots now go straight to `bookingTransactions`
 > every time, unconditionally — see the commit that disabled this for the
-> exact diff and its test coverage. The response is classified into
-> `paid` / `parked` / `failed` instead of the old `parked` / `guard_abort`
-> / `unexpected_status` / `call_failed` / `invalid_amount` five-way split.
+> exact diff. The response is classified into `paid` / `parked` / `failed`
+> instead of the old `parked` / `guard_abort` / `unexpected_status` /
+> `call_failed` / `invalid_amount` five-way split, via the new
+> `classify_paid_or_parked()`.
+>
+> **Test coverage:** `test_monitor.py`, committed in this repo — run it
+> with `python3 -m unittest test_monitor -v`. It covers the classifier
+> itself, the full paid/parked/failed email routing, the ambiguous-case
+> warning, the guard functions never being called, unstarred slots being
+> unaffected, and the no-reattempt guarantee across a real
+> save_state()/load_state() file round trip. (An earlier version of this
+> note claimed "test coverage" for this change before any test file
+> existed in the repo — every round of testing up to that point ran from
+> throwaway scripts outside the repo and was never committed. Caught by
+> an /ultrareview pass; `test_monitor.py` is the actual fix, not just this
+> corrected sentence.)
 >
 > **The functions below are kept, not deleted** — dead code, in case an
 > opt-in version of this guard is ever wanted again. Everything past this

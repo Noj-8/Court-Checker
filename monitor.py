@@ -283,6 +283,26 @@ def format_amount(raw_price):
         return None
 
 
+PLACEHOLDER_PAYMENT_REFS = {"0", "-", "n/a", "na", "none", "null", "-1"}
+
+
+def _looks_like_real_payment_ref(payment_ref):
+    """A non-empty string alone isn't enough proof of a real payment — a
+    placeholder value (e.g. "0", "-", "N/A") on an otherwise-parked
+    response would pass that check and misclassify it as PAID. This
+    narrows it to "non-empty AND not a known placeholder." Still a
+    heuristic, not a verified contract — we have zero confirmed examples
+    of what a real paymentRef looks like either — but excluding obvious
+    placeholders is strictly safer than accepting any non-empty string.
+    """
+    if not isinstance(payment_ref, str):
+        return False
+    cleaned = payment_ref.strip()
+    if not cleaned:
+        return False
+    return cleaned.lower() not in PLACEHOLDER_PAYMENT_REFS
+
+
 def classify_paid_or_parked(api_message, payment_ref):
     """Distinguish a genuine payment success from the insufficient-fund
     parking response, given a bookingTransactions response that already
@@ -293,11 +313,20 @@ def classify_paid_or_parked(api_message, payment_ref):
 
     Known pattern: "insufficient" appears in the message (case-
     insensitive) -> PARKED. This is the only pattern actually confirmed
-    against the live API.
+    against the live API. api_message is coerced to str before this check
+    — the API's message field is unconfirmed shape, and a non-string
+    truthy value (a number, say) must never crash this function: it runs
+    AFTER book_slot() has already fired the real HTTP call, so an uncaught
+    exception here would skip the autobook_attempts write (and, via
+    main()'s per-iteration try/except, skip save_state() for the whole
+    pass) — leaving a slot that was genuinely just booked for real looking
+    unattempted on the next poll. That's the exact double-booking failure
+    mode the original wallet guard existed to prevent, reintroduced
+    through a different door — this function must not raise, period.
 
-    Everything else is inferred, conservatively: a non-empty paymentRef is
-    treated as concrete evidence a real payment was processed (the field
-    name implies exactly that), so PAID requires BOTH the absence of
+    Everything else is inferred, conservatively: a real-looking paymentRef
+    (see _looks_like_real_payment_ref()) is treated as concrete evidence a
+    real payment was processed, so PAID requires BOTH the absence of
     "insufficient" text AND a real-looking paymentRef. A "10" response
     that matches neither known pattern — no "insufficient" text, but also
     no real paymentRef — defaults to PARKED (the conservative choice, per
@@ -305,11 +334,10 @@ def classify_paid_or_parked(api_message, payment_ref):
     The raw message is always kept in the record either way so a human can
     eyeball it and refine this heuristic once a real PAID example exists.
     """
-    message_lower = (api_message or "").lower()
+    message_lower = str(api_message or "").lower()
     if "insufficient" in message_lower:
         return "parked"
-    looks_like_real_payment_ref = isinstance(payment_ref, str) and payment_ref.strip() != ""
-    if looks_like_real_payment_ref:
+    if _looks_like_real_payment_ref(payment_ref):
         return "paid"
     return "parked"
 
@@ -675,13 +703,18 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
                 # Confirmed "insufficient fund" case: unchanged, no extra
                 # line. Ambiguous "10"-but-unrecognized-message case that
                 # defaulted to parked (classify_paid_or_parked()'s
-                # conservative fallback): surface the raw message so it's
-                # not silently indistinguishable from a confirmed parked
-                # response — per explicit instruction, never just assumed.
-                msg = a.get("message") or ""
-                if msg and "insufficient" not in msg.lower():
+                # conservative fallback) — INCLUDING an empty/missing
+                # message, which is itself the ambiguous case, not a reason
+                # to skip the warning: surface it so it's never silently
+                # indistinguishable from a confirmed parked response, per
+                # explicit instruction. str(...) guards the same
+                # non-string-message crash risk classify_paid_or_parked()
+                # had — a[\"message\"] is the same unconfirmed-shape field.
+                msg = str(a.get("message") or "")
+                if "insufficient" not in msg.lower():
+                    shown = repr(msg) if msg else "no message was returned"
                     lines.append(
-                        f"      (booking system said: {msg!r} — didn't match the known "
+                        f"      (booking system said: {shown} — didn't match the known "
                         "insufficient-fund pattern, defaulted to parked as the safer "
                         "assumption; worth a glance to confirm)"
                     )
