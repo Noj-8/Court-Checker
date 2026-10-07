@@ -12,6 +12,23 @@
           "autoBook": true
         }
       ]
+    },
+    {
+      "name": "Thu",
+      "date": "2026-10-08",
+      "locations": [
+        "LOC001"
+      ],
+      "times": [
+        {
+          "time": "20:00",
+          "autoBook": true
+        },
+        {
+          "time": "21:00",
+          "autoBook": true
+        }
+      ]
     }
   ]
 }
