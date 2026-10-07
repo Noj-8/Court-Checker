@@ -11,7 +11,8 @@ provides effective 60-second polling within each scheduled run.
   Reads loop tuning:    LOOP_ITERATIONS, LOOP_INTERVAL_SECONDS env vars (optional)
   Reads:                MEMBER_MOBILE env var (optional — required only for
                          auto-booking starred slots; unset means starred
-                         slots log as guard_abort instead, notify-only path
+                         slots fail closed immediately ("failed" outcome,
+                         no booking call made), notify-only path
                          is unaffected)
   Reads/writes state:   state.json
 """
@@ -48,7 +49,7 @@ BOOKING_TX_URL = (
 )
 BOOKING_URL = "https://crystalsports-booking.kegroup.co.th/booking.php"
 SAFE_WALLET_BALANCE = "0.00"
-EXPECTED_SUCCESS_STATUS_CODE = "10"  # the ONLY statusCode that means "parked into pending" — anything else is a failure, see Section 6 of the spec
+EXPECTED_SUCCESS_STATUS_CODE = "10"  # the ONLY statusCode meaning the booking call produced a real outcome (paid or parked) — anything else is a failure
 BOOKED_STATUS = "1"
 TZ = ZoneInfo("Asia/Bangkok")
 
@@ -134,7 +135,14 @@ def fetch_slots(date, loc_id, phpsessid):
 
 
 def get_wallet_balance(member_mobile, phpsessid):
-    """Fetch the member's current wallet balance via getMemberInfo.
+    """DEAD CODE as of 2026-10-07 — no longer called anywhere in the
+    starred-slot auto-book path. Kept intentionally, not deleted, in case
+    an opt-in version of the guard is ever reintroduced. See the dated
+    note at the top of WALLET_GUARD_SAFETY.md before "fixing" this back
+    into attempt_autobook() — its removal was a deliberate owner decision,
+    not a bug.
+
+    Fetch the member's current wallet balance via getMemberInfo.
 
     Mirrors fetch_slots()'s shape exactly: same request pattern, same
     (value, err) return contract. err is None only when `value` is a
@@ -178,7 +186,12 @@ def get_wallet_balance(member_mobile, phpsessid):
 
 
 def wallet_is_safe_to_book(member_mobile, phpsessid):
-    """The Section 6 safety guard. Must be called fresh, immediately before
+    """DEAD CODE as of 2026-10-07 — no longer called anywhere in the
+    starred-slot auto-book path. Kept intentionally, not deleted. See the
+    dated note at the top of WALLET_GUARD_SAFETY.md before restoring this
+    call — its removal was a deliberate owner decision, not a bug.
+
+    The Section 6 safety guard. Must be called fresh, immediately before
     every bookingTransactions attempt — never cached, never skipped.
 
     Returns (is_safe, reason). is_safe is True only when the balance was
@@ -270,23 +283,60 @@ def format_amount(raw_price):
         return None
 
 
-def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessid):
-    """The Section 6/7 auto-book decision-and-record logic for one starred
-    slot that just opened. Always writes an outcome into
-    autobook_attempts[k] before returning — including on every abort path —
-    so the caller's "already attempted" check (in run_check_pass) is
-    guaranteed to see this slot on the next poll regardless of outcome.
+def classify_paid_or_parked(api_message, payment_ref):
+    """Distinguish a genuine payment success from the insufficient-fund
+    parking response, given a bookingTransactions response that already
+    came back with statusCode "10". As of 2026-10-07, the ONLY confirmed-
+    working pattern ever observed from the real API is the parking one
+    ("Insufficient fund | ... THB") — a real PAID response has never been
+    observed, so this is a best-effort heuristic, not a verified contract.
 
-    Call order, unconditional: (1) re-check not already attempted — belt-
-    and-suspenders on top of the caller's own check, since this property
-    matters enough not to rely on a single enforcement point; (2)
-    wallet_is_safe_to_book() — the very first real check, hard stop (return)
-    on an unsafe result, no code path below this reaches the network; (3) parse/
-    validate the amount — hard stop on failure, before any booking call;
-    (4) book_slot() — the actual bookingTransactions call; (5) interpret
-    statusCode — ONLY an exact "10" match counts as success, every other
-    value (wrong code, missing, null, wrong type, or a code we've never
-    seen) is a failure needing investigation, never assumed safe.
+    Known pattern: "insufficient" appears in the message (case-
+    insensitive) -> PARKED. This is the only pattern actually confirmed
+    against the live API.
+
+    Everything else is inferred, conservatively: a non-empty paymentRef is
+    treated as concrete evidence a real payment was processed (the field
+    name implies exactly that), so PAID requires BOTH the absence of
+    "insufficient" text AND a real-looking paymentRef. A "10" response
+    that matches neither known pattern — no "insufficient" text, but also
+    no real paymentRef — defaults to PARKED (the conservative choice, per
+    explicit owner instruction) rather than being silently assumed PAID.
+    The raw message is always kept in the record either way so a human can
+    eyeball it and refine this heuristic once a real PAID example exists.
+    """
+    message_lower = (api_message or "").lower()
+    if "insufficient" in message_lower:
+        return "parked"
+    looks_like_real_payment_ref = isinstance(payment_ref, str) and payment_ref.strip() != ""
+    if looks_like_real_payment_ref:
+        return "paid"
+    return "parked"
+
+
+def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessid):
+    """The auto-book decision-and-record logic for one starred slot that
+    just opened. Always writes an outcome into autobook_attempts[k] before
+    returning — including on every abort path — so the caller's "already
+    attempted" check (in run_check_pass) is guaranteed to see this slot on
+    the next poll regardless of outcome.
+
+    As of 2026-10-07, the wallet-balance pre-check guard has been removed
+    from this path by deliberate owner decision — see the dated note at
+    the top of WALLET_GUARD_SAFETY.md before reintroducing it. Starred
+    slots go straight to book_slot() every time, unconditionally.
+
+    Call order: (1) re-check not already attempted — belt-and-suspenders
+    on top of the caller's own check; (2) confirm MEMBER_MOBILE is
+    configured — hard stop ("failed") if not, since book_slot() needs it
+    for customer/createdBy and a blank value should never silently reach
+    the real API; (3) parse/validate the amount — hard stop on failure,
+    before any booking call; (4) book_slot() — the actual
+    bookingTransactions call, no guard in front of it; (5) interpret the
+    response into exactly one of three outcomes: "failed" for anything
+    other than an exact "10" statusCode match, a network/malformed-
+    response error, or an exception during the call; "parked" or "paid"
+    for a "10" response, distinguished by classify_paid_or_parked().
     """
     if k in autobook_attempts:
         log(f"      ⚠ {k} already has a recorded auto-book attempt ({autobook_attempts[k].get('outcome')}) — this should have been filtered before calling attempt_autobook; not re-attempting")
@@ -294,14 +344,13 @@ def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessi
 
     attempted_at = datetime.now(TZ).isoformat()
 
-    is_safe, guard_reason = wallet_is_safe_to_book(member_mobile, phpsessid)
-    if not is_safe:
-        log(f"      ⛔ auto-book HARD-STOPPED for {k}: {guard_reason}, no booking call made")
+    if not member_mobile:
+        log(f"      ⛔ auto-book aborted for {k}: MEMBER_MOBILE not configured, no booking call made")
         autobook_attempts[k] = {
-            "outcome": "guard_abort",
+            "outcome": "failed",
             "statusCode": None,
             "bookingRef": None,
-            "message": guard_reason,
+            "message": "MEMBER_MOBILE not configured",
             "attempted_at": attempted_at,
         }
         return autobook_attempts[k]
@@ -310,21 +359,21 @@ def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessi
     if amount is None:
         log(f"      ⛔ auto-book aborted for {k}: could not parse a valid amount from stadiumtimePrice={slot.get('stadiumtimePrice')!r}, no booking call made")
         autobook_attempts[k] = {
-            "outcome": "invalid_amount",
+            "outcome": "failed",
             "statusCode": None,
             "bookingRef": None,
-            "message": None,
+            "message": "could not determine a valid price for this slot",
             "attempted_at": attempted_at,
         }
         return autobook_attempts[k]
 
-    log(f"      → attempting auto-book for {k} (amount {amount})")
+    log(f"      → attempting auto-book for {k} (amount {amount}) — no wallet guard, booking fires unconditionally")
     data, err = book_slot(member_mobile, phpsessid, slot["stadiumtimeId"], target["date"], amount)
 
     if err:
         log(f"      ⛔ auto-book call failed for {k}: {err}")
         autobook_attempts[k] = {
-            "outcome": "call_failed",
+            "outcome": "failed",
             "statusCode": None,
             "bookingRef": None,
             "message": err,
@@ -334,55 +383,47 @@ def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessi
 
     status_code = data.get("statusCode")
     booking_ref = data.get("bookingRef")
-    message = data.get("message")
+    api_message = data.get("message")
 
-    if status_code == EXPECTED_SUCCESS_STATUS_CODE:
-        log(f"      ✅ auto-book parked into pending payment for {k}: bookingRef={booking_ref!r}")
-        outcome = "parked"
-    else:
+    if status_code != EXPECTED_SUCCESS_STATUS_CODE:
         # Anything other than an exact "10" match is a failure — including a
         # status code we've never seen before. No assumption that "not an
         # error" means success.
-        log(f"      ⛔ auto-book returned unexpected statusCode={status_code!r} for {k} (message={message!r}) — treating as failure, needs investigation")
-        outcome = "unexpected_status"
+        log(f"      ⛔ auto-book returned unexpected statusCode={status_code!r} for {k} (message={api_message!r}) — treating as failed")
+        autobook_attempts[k] = {
+            "outcome": "failed",
+            "statusCode": status_code,
+            "bookingRef": booking_ref,
+            "message": f"booking system returned an unexpected response (statusCode={status_code!r}: {api_message!r})",
+            "attempted_at": attempted_at,
+        }
+        return autobook_attempts[k]
+
+    outcome_kind = classify_paid_or_parked(api_message, data.get("paymentRef"))
+    if outcome_kind == "paid":
+        log(f"      💰 auto-book PAID for {k}: bookingRef={booking_ref!r}, message={api_message!r}")
+    else:
+        log(f"      ✅ auto-book parked into pending payment for {k}: bookingRef={booking_ref!r}")
 
     autobook_attempts[k] = {
-        "outcome": outcome,
+        "outcome": outcome_kind,
         "statusCode": status_code,
         "bookingRef": booking_ref,
-        "message": message,
+        "message": api_message,
         "attempted_at": attempted_at,
     }
     return autobook_attempts[k]
 
 
 def autobook_failure_reason(outcome):
-    """Human-readable, outcome-specific explanation for the failure email
-    (Section 5). Never collapses distinct causes into one generic
-    "something went wrong" line when autobook_attempts already recorded
-    which one happened — guard_abort reuses wallet_is_safe_to_book()'s own
-    specific reason text (e.g. "wallet balance is '50.00', not exactly
-    \"0.00\"" vs "could not read wallet balance (network: ...)" — those are
-    different problems and read as different sentences), unexpected_status
-    surfaces the actual statusCode and message so it's actionable rather
-    than mysterious, and every outcome kind gets distinct text — including
-    a fallback for any future outcome kind this function doesn't know about
-    yet, so an email is never silently blank or misleading.
+    """Human-readable explanation for the failure email. attempt_autobook()
+    composes a specific, cause-matching message directly into
+    outcome["message"] at record time (missing MEMBER_MOBILE, an
+    unparseable price, a network/malformed-response error, an exception
+    during the call, or an unexpected statusCode) — this just surfaces it,
+    with a fallback for the case where message is somehow empty.
     """
-    kind = outcome.get("outcome")
-    if kind == "guard_abort":
-        return outcome.get("message") or "the wallet balance safety guard failed for an unrecorded reason"
-    if kind == "unexpected_status":
-        code = outcome.get("statusCode")
-        msg = outcome.get("message")
-        if msg:
-            return f"the booking system returned an unexpected response (statusCode={code!r}: {msg!r})"
-        return f"the booking system returned an unexpected response (statusCode={code!r})"
-    if kind == "call_failed":
-        return f"the booking request itself failed: {outcome.get('message')}"
-    if kind == "invalid_amount":
-        return "could not determine a valid price for this slot"
-    return f"auto-book failed for an unrecognized reason ({kind!r}) — needs investigation"
+    return outcome.get("message") or "auto-book failed for an unrecognized reason — needs investigation"
 
 
 def find_open_slots(slots, target, loc_id):
@@ -481,6 +522,7 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
     }
 
     new_alerts = []
+    autobook_paid = []
     autobook_successes = []
     autobook_failures = []
     currently_open = set()
@@ -515,12 +557,14 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
                         # the same pass — each call is real-money-adjacent
                         # (spec Section 7).
                         outcome = attempt_autobook(k, target, s, autobook_attempts, member_mobile, phpsessid)
-                        if outcome["outcome"] == "parked":
-                            # Replaces the generic email for this slot, does
-                            # NOT also add it to new_alerts — one email per
-                            # slot, not two, for a successful auto-book.
-                            autobook_successes.append({**alert_info, "bookingRef": outcome["bookingRef"]})
-                        else:
+                        # Replaces the generic email for this slot in every
+                        # case below, does NOT also add it to new_alerts —
+                        # one email per slot, not two.
+                        if outcome["outcome"] == "paid":
+                            autobook_paid.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message")})
+                        elif outcome["outcome"] == "parked":
+                            autobook_successes.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message")})
+                        else:  # "failed"
                             autobook_failures.append({**alert_info, "reason": autobook_failure_reason(outcome)})
                     else:
                         # Unstarred slot, OR a starred slot whose attempt was
@@ -575,6 +619,42 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
     else:
         log("  no new openings this iteration")
 
+    if autobook_paid:
+        log(f"💰 {len(autobook_paid)} starred slot(s) auto-booked AND PAID")
+        lines = [
+            f"🎾 {len(autobook_paid)} starred slot(s) just got booked AND PAID automatically "
+            "— no pending-payment step needed, this one's done:\n"
+        ]
+        by_target = {}
+        for a in autobook_paid:
+            by_target.setdefault(a["target"], []).append(a)
+        for tname, items in by_target.items():
+            lines.append(f"• {tname}")
+            for a in items:
+                price = a["price"].rstrip("0").rstrip(".") if a["price"] else "?"
+                lines.append(
+                    f"    {a['date']} {a['time']} — {a['loc']} / {a['court']} (฿{price}) "
+                    f"— bookingRef: {a['bookingRef']}"
+                )
+                if a.get("message"):
+                    lines.append(f"      (booking system said: {a['message']})")
+            lines.append("")
+        lines.append(
+            "This was inferred from the booking response, not a confirmed-working pattern "
+            "(we'd never seen a real paid response before) — worth a quick glance at "
+            f"{BOOKING_URL} to confirm it looks right."
+        )
+        body = "\n".join(lines)
+        try:
+            send_email(
+                "🎾 Your starred slot is booked and PAID",
+                body,
+                email_user, email_pass, email_to,
+            )
+            log("✉ auto-book paid email sent")
+        except Exception as e:
+            log(f"⚠ auto-book paid email failed: {e}")
+
     if autobook_successes:
         log(f"✅ {len(autobook_successes)} starred slot(s) auto-booked into pending payment")
         lines = [
@@ -592,6 +672,19 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
                     f"    {a['date']} {a['time']} — {a['loc']} / {a['court']} (฿{price}) "
                     f"— bookingRef: {a['bookingRef']}"
                 )
+                # Confirmed "insufficient fund" case: unchanged, no extra
+                # line. Ambiguous "10"-but-unrecognized-message case that
+                # defaulted to parked (classify_paid_or_parked()'s
+                # conservative fallback): surface the raw message so it's
+                # not silently indistinguishable from a confirmed parked
+                # response — per explicit instruction, never just assumed.
+                msg = a.get("message") or ""
+                if msg and "insufficient" not in msg.lower():
+                    lines.append(
+                        f"      (booking system said: {msg!r} — didn't match the known "
+                        "insufficient-fund pattern, defaulted to parked as the safer "
+                        "assumption; worth a glance to confirm)"
+                    )
             lines.append("")
         lines.append(f"Complete payment via \"รายการรอชำระ\" (pending payment) on: {BOOKING_URL}")
         body = "\n".join(lines)
@@ -640,12 +733,11 @@ def main():
     phpsessid = os.environ.get("PHPSESSID", "").strip()
     email_user = os.environ.get("EMAIL_USER", "").strip()
     email_pass = os.environ.get("EMAIL_APP_PASSWORD", "").strip()
-    # Optional, unlike the three below: get_wallet_balance()/
-    # wallet_is_safe_to_book() already fail closed on an empty
-    # member_mobile (guard_abort, logged, recorded), so a not-yet-configured
-    # MEMBER_MOBILE secret only disables auto-booking for starred slots —
-    # it must never be able to take down the notify-only path for everyone
-    # else by exiting here.
+    # Optional, unlike the three below: attempt_autobook() already fails
+    # closed on an empty member_mobile ("failed" outcome, logged, recorded,
+    # no booking call made), so a not-yet-configured MEMBER_MOBILE secret
+    # only disables auto-booking for starred slots — it must never be able
+    # to take down the notify-only path for everyone else by exiting here.
     member_mobile = os.environ.get("MEMBER_MOBILE", "").strip()
 
     missing = [k for k, v in {
@@ -657,7 +749,7 @@ def main():
         log(f"ERROR: missing env vars: {', '.join(missing)}")
         sys.exit(1)
     if not member_mobile:
-        log("  MEMBER_MOBILE not set — starred slots will be logged as guard_abort, not auto-booked")
+        log("  MEMBER_MOBILE not set — starred slots will fail immediately, not auto-booked")
 
     config = load_config()
     email_to = config.get("email_to") or email_user

@@ -1,5 +1,44 @@
 # Wallet balance guard — safety design & verification
 
+> ## ⚠ DISABLED as of 2026-10-07 — read this before restoring it
+>
+> `wallet_is_safe_to_book()` / `get_wallet_balance()` are **no longer called
+> anywhere** in the starred-slot auto-book path (`attempt_autobook()` in
+> `monitor.py`). This was a **deliberate decision by the repo owner**, made
+> with full understanding of the tradeoff — not a bug, not an oversight,
+> and not something to "fix" by wiring the call back in.
+>
+> **Why:** the guard did exactly what it was designed to do — fail closed
+> on any read ambiguity — but in production that meant a genuinely wanted,
+> starred slot got missed because the *guard's own read* failed (an
+> expired `PHPSESSID` producing an HTTP 401 on `getMemberInfo`), not
+> because the wallet was ever actually non-zero. This happened twice,
+> confirmed in `state.json`'s `autobook_attempts` history: two
+> `guard_abort` entries, both `"could not read wallet balance (http
+> 401)"`, 2026-10-05 and 2026-10-07 — the first of which cost a real slot
+> the owner wanted.
+>
+> **The owner's stated reasoning:** he only stars slots he genuinely
+> wants, so there is no scenario where an automatic booking — paid or
+> parked — on a starred slot is unwanted. The guard exists to prevent an
+> *accidental* real payment on a slot nobody meant to book; once that
+> scenario is defined away by how the feature is actually used, the
+> guard only costs availability without buying any protection that
+> matters to him.
+>
+> **What changed:** starred slots now go straight to `bookingTransactions`
+> every time, unconditionally — see the commit that disabled this for the
+> exact diff and its test coverage. The response is classified into
+> `paid` / `parked` / `failed` instead of the old `parked` / `guard_abort`
+> / `unexpected_status` / `call_failed` / `invalid_amount` five-way split.
+>
+> **The functions below are kept, not deleted** — dead code, in case an
+> opt-in version of this guard is ever wanted again. Everything past this
+> note describes the guard as it worked **while it was active**: accurate
+> history, and still-valid reasoning about *how to build a fail-closed
+> guard* if one is ever reintroduced. It is **not** a description of
+> current behavior.
+
 `get_wallet_balance()` and `wallet_is_safe_to_book()` in `monitor.py` exist to
 answer one question, correctly, every single time: is it safe to fire the
 `bookingTransactions` call for a starred slot right now?
