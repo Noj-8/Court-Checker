@@ -18,11 +18,11 @@
         },
         {
           "time": "19:00",
-          "autoBook": true
+          "autoBook": false
         },
         {
           "time": "20:00",
-          "autoBook": true
+          "autoBook": false
         },
         {
           "time": "21:00",
