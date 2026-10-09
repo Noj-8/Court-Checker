@@ -1,7 +1,15 @@
 {
   "known_open": {},
-  "last_check": "2026-10-09T12:53:28.806563+07:00",
+  "last_check": "2026-10-09T12:58:24.700755+07:00",
   "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
-  "autobook_attempts": {}
+  "autobook_attempts": {
+    "2026-10-11|LOC001|North-3|11:00": {
+      "outcome": "failed",
+      "statusCode": "00",
+      "bookingRef": "SPORTS-202610200064",
+      "message": "booking system returned an unexpected response (statusCode='00': 'Success')",
+      "attempted_at": "2026-10-09T12:56:19.189049+07:00"
+    }
+  }
 }
