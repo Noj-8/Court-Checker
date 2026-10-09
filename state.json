@@ -1,6 +1,6 @@
 {
   "known_open": {},
-  "last_check": "2026-10-09T17:23:24.703405+07:00",
+  "last_check": "2026-10-09T17:28:28.231168+07:00",
   "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
@@ -17,6 +17,13 @@
       "bookingRef": null,
       "message": "booking system returned an unexpected response (statusCode='99': '\u0e44\u0e21\u0e48\u0e2a\u0e32\u0e21\u0e32\u0e23\u0e16\u0e17\u0e33\u0e23\u0e32\u0e22\u0e01\u0e32\u0e23\u0e44\u0e14\u0e49 \u0e2a\u0e19\u0e32\u0e21\u0e17\u0e35\u0e48\u0e40\u0e25\u0e37\u0e2d\u0e01\u0e16\u0e39\u0e01\u0e08\u0e2d\u0e07\u0e41\u0e25\u0e49\u0e27')",
       "attempted_at": "2026-10-09T13:05:18.124353+07:00"
+    },
+    "2026-10-11|LOC001|North-2|18:00": {
+      "outcome": "parked",
+      "statusCode": "10",
+      "bookingRef": "SPORTS-202610200182",
+      "message": "Insufficient fund | 500.00 THB",
+      "attempted_at": "2026-10-09T17:25:20.521526+07:00"
     }
   }
 }
