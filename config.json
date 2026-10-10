@@ -66,23 +66,6 @@
           "autoBook": false
         }
       ]
-    },
-    {
-      "name": "Sun",
-      "date": "2026-10-11",
-      "locations": [
-        "LOC002"
-      ],
-      "times": [
-        {
-          "time": "11:00",
-          "autoBook": true
-        },
-        {
-          "time": "12:00",
-          "autoBook": true
-        }
-      ]
     }
   ]
 }
