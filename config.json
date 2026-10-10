@@ -4,29 +4,12 @@
       "name": "Sun",
       "date": "2026-10-11",
       "locations": [
-        "LOC001",
-        "LOC002"
+        "LOC001"
       ],
       "times": [
         {
-          "time": "13:00",
-          "autoBook": false
-        },
-        {
-          "time": "14:00",
-          "autoBook": false
-        },
-        {
-          "time": "15:00",
-          "autoBook": false
-        },
-        {
-          "time": "16:00",
-          "autoBook": false
-        },
-        {
-          "time": "17:00",
-          "autoBook": false
+          "time": "12:00",
+          "autoBook": true
         }
       ]
     },
