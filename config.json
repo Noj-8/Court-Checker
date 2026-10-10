@@ -94,6 +94,10 @@
         {
           "time": "11:00",
           "autoBook": true
+        },
+        {
+          "time": "12:00",
+          "autoBook": true
         }
       ]
     }
