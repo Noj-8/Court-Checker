@@ -51,6 +51,29 @@
 > history, and still-valid reasoning about *how to build a fail-closed
 > guard* if one is ever reintroduced. It is **not** a description of
 > current behavior.
+>
+> **Update, 2026-10-11 — two confirmed `statusCode` values, not one.**
+> `attempt_autobook()` originally only recognized `statusCode "10"` as a
+> success at all; everything else, including a genuinely successful
+> booking, fell through to `failed`. That's exactly what happened in
+> production: two real bookings came back as `statusCode "00"` /
+> `message "Success"` — confirmed actually honored by Crystal Sports —
+> and Court Checker emailed a FAILED notice telling the owner to book
+> manually anyway.
+>
+> | `statusCode` | Meaning | First confirmed |
+> |---|---|---|
+> | `"10"` | **Parked** — `"Insufficient fund \| ... THB"`, slot held in pending payment | Original spec (HAR-captured), repeatedly confirmed since |
+> | `"00"` | **Paid** — `"Success"`, a real booking actually went through | 2026-10-09 (`SPORTS-202610200064`) and 2026-10-10 (`SPORTS-202610200362`) |
+> | anything else | **Failed** — never widen this to "not an explicit error" | e.g. `"99"`, confirmed as "court already booked by someone else" |
+>
+> `classify_paid_or_parked()` now treats `statusCode` as the primary
+> signal for exactly these two known-good values — see its docstring and
+> `test_monitor.py` for the full detail and the regression tests for this
+> specific miss. If a *third* `statusCode` is ever observed, do not guess
+> at what it means from the message text alone; add it to this table with
+> the date and the real example once confirmed, the same way these two
+> were.
 
 `get_wallet_balance()` and `wallet_is_safe_to_book()` in `monitor.py` exist to
 answer one question, correctly, every single time: is it safe to fire the

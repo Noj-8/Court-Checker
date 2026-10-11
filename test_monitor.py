@@ -70,40 +70,54 @@ def run_check_pass(config, slots, booking_response_fn):
 
 
 class TestClassifyPaidOrParked(unittest.TestCase):
-    """The heuristic itself, in isolation."""
+    """The classifier, in isolation. statusCode is the PRIMARY signal as
+    of 2026-10-11 — "10" always parked, "00" always paid, confirmed from
+    real production traffic — with the old message/paymentRef heuristic
+    now only a secondary sanity check that can flag a mismatch without
+    overriding the statusCode-based outcome."""
 
-    def test_confirmed_insufficient_fund_pattern_is_parked(self):
-        self.assertEqual(
-            monitor.classify_paid_or_parked("Insufficient fund | 500.00 THB", ""),
-            "parked",
-        )
+    def test_statuscode_10_is_parked_even_with_no_message(self):
+        outcome, warning = monitor.classify_paid_or_parked(monitor.PARKED_STATUS_CODE, "Insufficient fund | 500.00 THB", "")
+        self.assertEqual(outcome, "parked")
+        self.assertIsNone(warning)
 
-    def test_real_looking_payment_ref_with_no_insufficient_text_is_paid(self):
-        self.assertEqual(
-            monitor.classify_paid_or_parked("Payment successful", "PAYREF-ABC123"),
-            "paid",
-        )
+    def test_statuscode_00_is_paid_confirmed_production_example(self):
+        # The real regression: two production responses came back as
+        # statusCode "00" / message "Success" and were misclassified as
+        # FAILED because "00" wasn't a recognized success code at all.
+        outcome, warning = monitor.classify_paid_or_parked(monitor.PAID_STATUS_CODE, "Success", "")
+        self.assertEqual(outcome, "paid")
+        self.assertIsNone(warning)
 
-    def test_ambiguous_no_insufficient_text_no_real_ref_defaults_to_parked(self):
-        self.assertEqual(
-            monitor.classify_paid_or_parked("Transaction processed", ""),
-            "parked",
-        )
+    def test_statuscode_is_primary_even_when_message_text_disagrees(self):
+        # "00" with no recognizable paid-style message still PAID, because
+        # statusCode is now the primary signal -- but the mismatch is
+        # still surfaced as a warning, not silently dropped.
+        outcome, warning = monitor.classify_paid_or_parked(monitor.PAID_STATUS_CODE, "Insufficient fund | 500.00 THB", "")
+        self.assertEqual(outcome, "paid")
+        self.assertIsNotNone(warning)
+        self.assertIn("insufficient", warning.lower())
 
-    def test_empty_message_and_empty_ref_defaults_to_parked(self):
-        self.assertEqual(monitor.classify_paid_or_parked("", ""), "parked")
-        self.assertEqual(monitor.classify_paid_or_parked(None, None), "parked")
+        # "10" with a real-looking paymentRef and no insufficient-fund
+        # text still PARKED, same reasoning, same warning behavior.
+        outcome2, warning2 = monitor.classify_paid_or_parked(monitor.PARKED_STATUS_CODE, "Payment successful", "PAYREF-REAL-123")
+        self.assertEqual(outcome2, "parked")
+        self.assertIsNotNone(warning2)
 
-    def test_placeholder_payment_refs_do_not_count_as_real(self):
+    def test_statuscode_10_or_00_with_agreeing_heuristic_has_no_warning(self):
+        outcome, warning = monitor.classify_paid_or_parked(monitor.PAID_STATUS_CODE, "Success", "PAYREF-REAL-123")
+        self.assertEqual(outcome, "paid")
+        self.assertIsNone(warning)
+
+    def test_placeholder_payment_refs_do_not_flag_a_mismatch_on_parked(self):
         # Regression: an /ultrareview finding caught that "any non-empty
-        # string" was too weak a check — placeholders must be rejected.
+        # string" was too weak a check — placeholders must not even
+        # register as "looks real" for the secondary heuristic.
         for placeholder in ["0", "-", "N/A", "n/a", "None", "null", "", "   "]:
             with self.subTest(placeholder=placeholder):
-                self.assertEqual(
-                    monitor.classify_paid_or_parked("some other text", placeholder),
-                    "parked",
-                    f"placeholder paymentRef {placeholder!r} must not be treated as real",
-                )
+                outcome, warning = monitor.classify_paid_or_parked(monitor.PARKED_STATUS_CODE, "some other text", placeholder)
+                self.assertEqual(outcome, "parked")
+                self.assertIsNone(warning, f"placeholder paymentRef {placeholder!r} must not trigger a mismatch warning")
 
     def test_non_string_message_does_not_crash(self):
         # Regression: an /ultrareview finding caught that a non-string
@@ -113,15 +127,41 @@ class TestClassifyPaidOrParked(unittest.TestCase):
         # double-booking risk the original wallet guard existed to
         # prevent, reintroduced through a different door.
         try:
-            result = monitor.classify_paid_or_parked(12345, "PAYREF-ABC123")
+            result, _warning = monitor.classify_paid_or_parked(monitor.PAID_STATUS_CODE, 12345, "PAYREF-ABC123")
         except AttributeError:
             self.fail("classify_paid_or_parked() must never raise — it runs after the real booking call")
         self.assertIn(result, ("paid", "parked"))
 
         try:
-            monitor.classify_paid_or_parked(["unexpected", "shape"], "")
+            monitor.classify_paid_or_parked(monitor.PARKED_STATUS_CODE, ["unexpected", "shape"], "")
         except AttributeError:
             self.fail("classify_paid_or_parked() must never raise on a non-string message")
+
+    def test_unrecognized_statuscode_defaults_to_parked_not_raise(self):
+        # Defensive only -- attempt_autobook() never actually calls this
+        # function except for statusCode in KNOWN_SUCCESS_STATUS_CODES,
+        # but this function must not raise on a contract violation either.
+        outcome, _warning = monitor.classify_paid_or_parked("77", "whatever", "")
+        self.assertEqual(outcome, "parked")
+
+    def test_mismatch_warning_names_the_real_statuscode_not_a_hardcoded_one(self):
+        # Regression: an /ultrareview finding caught that the "parked"
+        # mismatch-warning text hardcoded PARKED_STATUS_CODE ("10")
+        # instead of the actual status_code argument -- so the defensive
+        # fallback branch (an unrecognized code, defaulting to parked)
+        # produced a warning falsely claiming "statusCode '10' (confirmed
+        # parked)" even when the real code was something else entirely.
+        outcome, warning = monitor.classify_paid_or_parked("77", "some unrelated text", "PAYREF-REAL-123")
+        self.assertEqual(outcome, "parked")
+        self.assertIn("'77'", warning)
+        self.assertNotIn("'10'", warning)
+        self.assertIn("not a recognized success code", warning)
+
+        # And the real confirmed-"10" case still says so accurately.
+        outcome2, warning2 = monitor.classify_paid_or_parked(monitor.PARKED_STATUS_CODE, "some unrelated text", "PAYREF-REAL-123")
+        self.assertEqual(outcome2, "parked")
+        self.assertIn("'10'", warning2)
+        self.assertIn("confirmed parked", warning2)
 
 
 class TestAttemptAutobookNoWalletGuard(unittest.TestCase):
@@ -132,7 +172,7 @@ class TestAttemptAutobookNoWalletGuard(unittest.TestCase):
     def test_guard_functions_are_never_called_paid_path(self):
         self._assert_guard_never_called(
             lambda url, kwargs: FakeResp(200, {
-                "statusCode": "10", "message": "Payment successful",
+                "statusCode": "00", "message": "Success",
                 "bookingRef": "SPORTS-PAID", "paymentRef": "PAYREF-1",
             }),
             expected_outcome="paid",
@@ -165,7 +205,7 @@ class TestAttemptAutobookNoWalletGuard(unittest.TestCase):
 
     def test_member_info_url_never_hit_across_any_outcome(self):
         for booking_response_fn in [
-            lambda url, kwargs: FakeResp(200, {"statusCode": "10", "message": "Payment successful", "bookingRef": "R", "paymentRef": "REF1"}),
+            lambda url, kwargs: FakeResp(200, {"statusCode": "00", "message": "Success", "bookingRef": "R", "paymentRef": "REF1"}),
             lambda url, kwargs: FakeResp(200, {"statusCode": "10", "message": "Insufficient fund", "bookingRef": "R", "paymentRef": ""}),
             lambda url, kwargs: FakeResp(500, None),
         ]:
@@ -178,17 +218,21 @@ class TestEmailRouting(unittest.TestCase):
     """The three-way outcome split and what each produces in the inbox."""
 
     def test_paid_produces_distinct_email_with_raw_message_no_generic_email(self):
+        # statusCode "00" is the confirmed-paid signal (real production
+        # regression, see test_statuscode_00_is_paid_confirmed_production_example).
         config = make_config("2026-10-20", "20:00")
         booking_fn = lambda url, kwargs: FakeResp(200, {
-            "statusCode": "10", "message": "Payment successful",
+            "statusCode": "00", "message": "Success",
             "bookingRef": "SPORTS-PAID-1", "paymentRef": "PAYREF-1",
         })
         state, sent, _ = run_check_pass(config, [make_slot("20:00")], booking_fn)
 
         self.assertEqual(len(sent), 1)
         self.assertIn("PAID", sent[0]["subject"])
+        self.assertIn("🟢", sent[0]["subject"])
         self.assertIn("SPORTS-PAID-1", sent[0]["body"])
-        self.assertIn("Payment successful", sent[0]["body"])  # raw message included
+        self.assertIn("Success", sent[0]["body"])  # raw message included
+        self.assertEqual(state["autobook_attempts"]["2026-10-20|LOC001|North-3|20:00"]["outcome"], "paid")
 
     def test_confirmed_parked_email_unchanged_no_extra_line(self):
         config = make_config("2026-10-20", "20:00")
@@ -200,32 +244,38 @@ class TestEmailRouting(unittest.TestCase):
 
         self.assertEqual(len(sent), 1)
         self.assertIn("already in payment pending", sent[0]["subject"])
+        self.assertIn("🟡", sent[0]["subject"])
         self.assertNotIn("booking system said", sent[0]["body"])
 
-    def test_ambiguous_parked_shows_raw_message_not_silently_paid(self):
+    def test_statuscode_trusted_over_message_text_mismatch_still_warns(self):
+        # statusCode "10" is confirmed-parked and is trusted even when the
+        # message doesn't say "insufficient" and paymentRef looks real --
+        # but that disagreement is still surfaced as a warning, not
+        # silently dropped and not allowed to flip the outcome to paid.
         config = make_config("2026-10-20", "20:00")
         booking_fn = lambda url, kwargs: FakeResp(200, {
             "statusCode": "10", "message": "Transaction processed",
-            "bookingRef": "SPORTS-AMBIG-1", "paymentRef": "",
+            "bookingRef": "SPORTS-AMBIG-1", "paymentRef": "PAYREF-REAL-123",
         })
         state, sent, _ = run_check_pass(config, [make_slot("20:00")], booking_fn)
 
+        self.assertEqual(state["autobook_attempts"]["2026-10-20|LOC001|North-3|20:00"]["outcome"], "parked")
         self.assertEqual(len(sent), 1)
         self.assertIn("already in payment pending", sent[0]["subject"])
-        self.assertIn("Transaction processed", sent[0]["body"])
-        self.assertIn("didn't match the known insufficient-fund pattern", sent[0]["body"])
+        self.assertIn("worth a second look", sent[0]["body"])
 
-    def test_ambiguous_empty_message_shows_warning_regression(self):
-        # Regression for the /ultrareview finding: the warning used to be
-        # gated on a truthy message, so it never fired for the empty-
-        # message case — exactly the case it exists to flag.
+    def test_confirmed_statuscode_with_empty_message_shows_no_warning(self):
+        # As of the statusCode-primary redesign, an empty/missing message
+        # on a CONFIRMED statusCode is no longer ambiguous -- statusCode
+        # alone is trusted, so no mismatch warning should appear.
         config = make_config("2026-10-20", "20:00")
         booking_fn = lambda url, kwargs: FakeResp(200, {
             "statusCode": "10", "message": "", "bookingRef": "R", "paymentRef": "",
         })
         _, sent, _ = run_check_pass(config, [make_slot("20:00")], booking_fn)
         self.assertEqual(len(sent), 1)
-        self.assertIn("no message was returned", sent[0]["body"])
+        self.assertNotIn("worth a second look", sent[0]["body"])
+        self.assertNotIn("booking system said", sent[0]["body"])
 
     def test_failed_shows_real_reason_not_wallet_wording(self):
         config = make_config("2026-10-20", "20:00")
@@ -236,6 +286,7 @@ class TestEmailRouting(unittest.TestCase):
         _, sent, _ = run_check_pass(config, [make_slot("20:00")], raise_timeout)
         self.assertEqual(len(sent), 1)
         self.assertIn("failed", sent[0]["subject"])
+        self.assertIn("🔴", sent[0]["subject"])
         self.assertIn("timed out talking to booking endpoint", sent[0]["body"])
         self.assertNotIn("wallet balance", sent[0]["body"].lower())
 

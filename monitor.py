@@ -49,7 +49,16 @@ BOOKING_TX_URL = (
 )
 BOOKING_URL = "https://crystalsports-booking.kegroup.co.th/booking.php"
 SAFE_WALLET_BALANCE = "0.00"
-EXPECTED_SUCCESS_STATUS_CODE = "10"  # the ONLY statusCode meaning the booking call produced a real outcome (paid or parked) — anything else is a failure
+# Two confirmed-distinct statusCodes from real production traffic — see
+# WALLET_GUARD_SAFETY.md for the exact observed examples and dates.
+# "10": confirmed since the original spec (HAR-captured) — "Insufficient
+#       fund" response, slot parked into pending payment.
+# "00": confirmed 2026-10-09 and 2026-10-10 — message "Success", a real
+#       booking actually went through. Missing this cost two real
+#       bookings being misreported as FAILED before it was caught.
+PARKED_STATUS_CODE = "10"
+PAID_STATUS_CODE = "00"
+KNOWN_SUCCESS_STATUS_CODES = (PARKED_STATUS_CODE, PAID_STATUS_CODE)  # anything else is FAILED — never widen this to "not an explicit error"
 BOOKED_STATUS = "1"
 TZ = ZoneInfo("Asia/Bangkok")
 
@@ -303,43 +312,79 @@ def _looks_like_real_payment_ref(payment_ref):
     return cleaned.lower() not in PLACEHOLDER_PAYMENT_REFS
 
 
-def classify_paid_or_parked(api_message, payment_ref):
-    """Distinguish a genuine payment success from the insufficient-fund
-    parking response, given a bookingTransactions response that already
-    came back with statusCode "10". As of 2026-10-07, the ONLY confirmed-
-    working pattern ever observed from the real API is the parking one
-    ("Insufficient fund | ... THB") — a real PAID response has never been
-    observed, so this is a best-effort heuristic, not a verified contract.
+def classify_paid_or_parked(status_code, api_message, payment_ref):
+    """Classify a bookingTransactions response that already came back
+    with statusCode in KNOWN_SUCCESS_STATUS_CODES into "paid" or "parked".
 
-    Known pattern: "insufficient" appears in the message (case-
-    insensitive) -> PARKED. This is the only pattern actually confirmed
-    against the live API. api_message is coerced to str before this check
-    — the API's message field is unconfirmed shape, and a non-string
-    truthy value (a number, say) must never crash this function: it runs
-    AFTER book_slot() has already fired the real HTTP call, so an uncaught
-    exception here would skip the autobook_attempts write (and, via
-    main()'s per-iteration try/except, skip save_state() for the whole
-    pass) — leaving a slot that was genuinely just booked for real looking
-    unattempted on the next poll. That's the exact double-booking failure
-    mode the original wallet guard existed to prevent, reintroduced
-    through a different door — this function must not raise, period.
+    As of 2026-10-11: statusCode is now the PRIMARY signal, not a
+    message/paymentRef guess — we have two confirmed-distinct codes from
+    real production traffic. "10" has repeatedly meant parked/
+    insufficient-fund since the original spec; "00" was confirmed paid
+    twice on 2026-10-09 and 2026-10-10 (message "Success" both times).
+    Before this, classification ran primarily off the message text, which
+    is how two real "00"/"Success" paid bookings got misclassified as
+    FAILED entirely (statusCode "00" didn't match the old single known-
+    good code "10" at all) — see WALLET_GUARD_SAFETY.md.
 
-    Everything else is inferred, conservatively: a real-looking paymentRef
-    (see _looks_like_real_payment_ref()) is treated as concrete evidence a
-    real payment was processed, so PAID requires BOTH the absence of
-    "insufficient" text AND a real-looking paymentRef. A "10" response
-    that matches neither known pattern — no "insufficient" text, but also
-    no real paymentRef — defaults to PARKED (the conservative choice, per
-    explicit owner instruction) rather than being silently assumed PAID.
-    The raw message is always kept in the record either way so a human can
-    eyeball it and refine this heuristic once a real PAID example exists.
+    The old message/paymentRef heuristic still runs, but only as a
+    secondary sanity check now: if it disagrees with what statusCode
+    says, that's returned as a mismatch warning (surfaced in the outcome
+    record and the email) rather than silently overriding the
+    statusCode-based classification or being thrown away. statusCode is
+    the stronger, now-twice-confirmed signal; a mismatch is still worth a
+    human's attention, not grounds to override it.
+
+    api_message is coerced to str before any text check — the API's
+    message field is unconfirmed shape, and a non-string truthy value
+    must never crash this function: it runs AFTER book_slot() has already
+    fired the real HTTP call, so an uncaught exception here would skip
+    the autobook_attempts write entirely (and, via main()'s per-iteration
+    try/except, skip save_state() for the whole pass) — leaving a slot
+    that was genuinely just booked for real looking unattempted on the
+    next poll. That's the exact double-booking failure mode the original
+    wallet guard existed to prevent, reintroduced through a different
+    door — this function must not raise, period, and must not raise on
+    an unrecognized status_code either (defaults to "parked", the
+    conservative choice, rather than raising on a contract violation from
+    its own caller).
+
+    Returns (outcome, mismatch_warning_or_None).
     """
+    if status_code == PAID_STATUS_CODE:
+        outcome = "paid"
+    else:
+        outcome = "parked"  # PARKED_STATUS_CODE, or defensively anything else
+
     message_lower = str(api_message or "").lower()
-    if "insufficient" in message_lower:
-        return "parked"
-    if _looks_like_real_payment_ref(payment_ref):
-        return "paid"
-    return "parked"
+    heuristic_says_parked = "insufficient" in message_lower
+    heuristic_says_paid = _looks_like_real_payment_ref(payment_ref) and not heuristic_says_parked
+
+    mismatch = None
+    if outcome == "paid" and heuristic_says_parked:
+        # outcome == "paid" only ever happens when status_code ==
+        # PAID_STATUS_CODE exactly (no defensive fallback leads here), but
+        # using the actual status_code rather than the constant is still
+        # strictly safer than assuming that invariant holds forever.
+        mismatch = (
+            f"statusCode {status_code!r} (treated as paid) but the message mentions "
+            "insufficient funds — worth a second look"
+        )
+    elif outcome == "parked" and heuristic_says_paid:
+        # outcome == "parked" is reached BOTH for the real confirmed "10"
+        # case AND the defensive fallback for an unrecognized status_code
+        # (see the if/else above) — the message must say which actually
+        # happened, not hardcode "10" regardless. A bug exactly like this
+        # (hardcoding a constant instead of the real value in user-facing
+        # text) is the same class of mistake this whole file exists to
+        # avoid in the booking response itself.
+        confirmed = status_code == PARKED_STATUS_CODE
+        basis = "confirmed parked" if confirmed else "not a recognized success code, defaulted to parked"
+        mismatch = (
+            f"statusCode {status_code!r} ({basis}) but paymentRef {payment_ref!r} "
+            "looks real and the message doesn't mention insufficient funds — worth a second look"
+        )
+
+    return outcome, mismatch
 
 
 def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessid):
@@ -362,9 +407,11 @@ def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessi
     before any booking call; (4) book_slot() — the actual
     bookingTransactions call, no guard in front of it; (5) interpret the
     response into exactly one of three outcomes: "failed" for anything
-    other than an exact "10" statusCode match, a network/malformed-
-    response error, or an exception during the call; "parked" or "paid"
-    for a "10" response, distinguished by classify_paid_or_parked().
+    other than a statusCode in KNOWN_SUCCESS_STATUS_CODES ("10" or "00" —
+    see WALLET_GUARD_SAFETY.md for how both were confirmed), a network/
+    malformed-response error, or an exception during the call; "parked"
+    or "paid" for a confirmed-success statusCode, distinguished by
+    classify_paid_or_parked().
     """
     if k in autobook_attempts:
         log(f"      ⚠ {k} already has a recorded auto-book attempt ({autobook_attempts[k].get('outcome')}) — this should have been filtered before calling attempt_autobook; not re-attempting")
@@ -413,10 +460,11 @@ def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessi
     booking_ref = data.get("bookingRef")
     api_message = data.get("message")
 
-    if status_code != EXPECTED_SUCCESS_STATUS_CODE:
-        # Anything other than an exact "10" match is a failure — including a
-        # status code we've never seen before. No assumption that "not an
-        # error" means success.
+    if status_code not in KNOWN_SUCCESS_STATUS_CODES:
+        # Anything other than a confirmed success code is a failure —
+        # including a status code we've never seen before. No assumption
+        # that "not an explicit error" means success. Only "10" and "00"
+        # get success treatment — see KNOWN_SUCCESS_STATUS_CODES.
         log(f"      ⛔ auto-book returned unexpected statusCode={status_code!r} for {k} (message={api_message!r}) — treating as failed")
         autobook_attempts[k] = {
             "outcome": "failed",
@@ -427,17 +475,20 @@ def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessi
         }
         return autobook_attempts[k]
 
-    outcome_kind = classify_paid_or_parked(api_message, data.get("paymentRef"))
+    outcome_kind, classification_warning = classify_paid_or_parked(status_code, api_message, data.get("paymentRef"))
     if outcome_kind == "paid":
         log(f"      💰 auto-book PAID for {k}: bookingRef={booking_ref!r}, message={api_message!r}")
     else:
         log(f"      ✅ auto-book parked into pending payment for {k}: bookingRef={booking_ref!r}")
+    if classification_warning:
+        log(f"      ⚠ classification mismatch for {k}: {classification_warning}")
 
     autobook_attempts[k] = {
         "outcome": outcome_kind,
         "statusCode": status_code,
         "bookingRef": booking_ref,
         "message": api_message,
+        "classification_warning": classification_warning,
         "attempted_at": attempted_at,
     }
     return autobook_attempts[k]
@@ -589,9 +640,9 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
                         # case below, does NOT also add it to new_alerts —
                         # one email per slot, not two.
                         if outcome["outcome"] == "paid":
-                            autobook_paid.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message")})
+                            autobook_paid.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message"), "classification_warning": outcome.get("classification_warning")})
                         elif outcome["outcome"] == "parked":
-                            autobook_successes.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message")})
+                            autobook_successes.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message"), "classification_warning": outcome.get("classification_warning")})
                         else:  # "failed"
                             autobook_failures.append({**alert_info, "reason": autobook_failure_reason(outcome)})
                     else:
@@ -666,16 +717,18 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
                 )
                 if a.get("message"):
                     lines.append(f"      (booking system said: {a['message']})")
+                # Statuscode "00" is now a confirmed-paid signal (observed
+                # production 2026-10-09/10), not an inference — but the
+                # message/paymentRef secondary check can still disagree,
+                # and that's worth surfacing rather than hiding.
+                if a.get("classification_warning"):
+                    lines.append(f"      ⚠ {a['classification_warning']}")
             lines.append("")
-        lines.append(
-            "This was inferred from the booking response, not a confirmed-working pattern "
-            "(we'd never seen a real paid response before) — worth a quick glance at "
-            f"{BOOKING_URL} to confirm it looks right."
-        )
+        lines.append(f"Confirmed via statusCode \"{PAID_STATUS_CODE}\" — a glance at {BOOKING_URL} is still worth it.")
         body = "\n".join(lines)
         try:
             send_email(
-                "🎾 Your starred slot is booked and PAID",
+                "🟢 Your starred slot is booked and PAID",
                 body,
                 email_user, email_pass, email_to,
             )
@@ -700,30 +753,20 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
                     f"    {a['date']} {a['time']} — {a['loc']} / {a['court']} (฿{price}) "
                     f"— bookingRef: {a['bookingRef']}"
                 )
-                # Confirmed "insufficient fund" case: unchanged, no extra
-                # line. Ambiguous "10"-but-unrecognized-message case that
-                # defaulted to parked (classify_paid_or_parked()'s
-                # conservative fallback) — INCLUDING an empty/missing
-                # message, which is itself the ambiguous case, not a reason
-                # to skip the warning: surface it so it's never silently
-                # indistinguishable from a confirmed parked response, per
-                # explicit instruction. str(...) guards the same
-                # non-string-message crash risk classify_paid_or_parked()
-                # had — a[\"message\"] is the same unconfirmed-shape field.
-                msg = str(a.get("message") or "")
-                if "insufficient" not in msg.lower():
-                    shown = repr(msg) if msg else "no message was returned"
-                    lines.append(
-                        f"      (booking system said: {shown} — didn't match the known "
-                        "insufficient-fund pattern, defaulted to parked as the safer "
-                        "assumption; worth a glance to confirm)"
-                    )
+                # statusCode "10" is now the confirmed-parked signal — no
+                # extra line for the normal case. classification_warning
+                # fires only when the message/paymentRef secondary check
+                # disagrees with that (e.g. doesn't mention insufficient
+                # funds), which is worth a human's attention even though
+                # statusCode is trusted over it.
+                if a.get("classification_warning"):
+                    lines.append(f"      ⚠ {a['classification_warning']}")
             lines.append("")
         lines.append(f"Complete payment via \"รายการรอชำระ\" (pending payment) on: {BOOKING_URL}")
         body = "\n".join(lines)
         try:
             send_email(
-                "🎾 Your starred slot is already in payment pending",
+                "🟡 Your starred slot is already in payment pending",
                 body,
                 email_user, email_pass, email_to,
             )
@@ -753,7 +796,7 @@ def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pa
         body = "\n".join(lines)
         try:
             send_email(
-                "🎾 Tried to auto-book your starred slot but it failed",
+                "🔴 Tried to auto-book your starred slot but it failed",
                 body,
                 email_user, email_pass, email_to,
             )
