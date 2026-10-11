@@ -1,7 +1,9 @@
 {
-  "known_open": {},
-  "last_check": "2026-10-11T17:23:28.293951+07:00",
-  "currently_open_count": 0,
+  "known_open": {
+    "2026-10-13|LOC001|South-1|18:00": true
+  },
+  "last_check": "2026-10-11T17:28:21.754538+07:00",
+  "currently_open_count": 1,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
     "2026-10-11|LOC001|North-3|11:00": {
@@ -31,6 +33,14 @@
       "bookingRef": "SPORTS-202610200362",
       "message": "booking system returned an unexpected response (statusCode='00': 'Success')",
       "attempted_at": "2026-10-10T12:57:21.910653+07:00"
+    },
+    "2026-10-13|LOC001|South-1|18:00": {
+      "outcome": "paid",
+      "statusCode": "00",
+      "bookingRef": "SPORTS-202610200666",
+      "message": "Success",
+      "classification_warning": null,
+      "attempted_at": "2026-10-11T17:28:20.396238+07:00"
     }
   }
 }
