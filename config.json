@@ -20,23 +20,6 @@
           "autoBook": true
         }
       ]
-    },
-    {
-      "name": "Tue",
-      "date": "2026-10-13",
-      "locations": [
-        "LOC001"
-      ],
-      "times": [
-        {
-          "time": "17:00",
-          "autoBook": true
-        },
-        {
-          "time": "19:00",
-          "autoBook": true
-        }
-      ]
     }
   ]
 }
