@@ -1,6 +1,6 @@
 {
   "known_open": {},
-  "last_check": "2026-10-12T07:33:28.748266+07:00",
+  "last_check": "2026-10-12T07:38:24.720708+07:00",
   "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
@@ -11,6 +11,14 @@
       "message": "Success",
       "classification_warning": null,
       "attempted_at": "2026-10-11T17:28:20.396238+07:00"
+    },
+    "2026-10-13|LOC001|Center-2|17:00": {
+      "outcome": "parked",
+      "statusCode": "10",
+      "bookingRef": "SPORTS-202610200763",
+      "message": "Insufficient fund | 500.00 THB",
+      "classification_warning": null,
+      "attempted_at": "2026-10-12T07:37:19.049224+07:00"
     }
   }
 }
