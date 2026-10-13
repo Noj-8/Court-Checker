@@ -1,35 +1,6 @@
 {
   "targets": [
     {
-      "name": "Tue G",
-      "date": "2026-10-13",
-      "locations": [
-        "LOC002"
-      ],
-      "times": [
-        {
-          "time": "13:00",
-          "autoBook": false
-        },
-        {
-          "time": "14:00",
-          "autoBook": false
-        },
-        {
-          "time": "15:00",
-          "autoBook": false
-        },
-        {
-          "time": "16:00",
-          "autoBook": false
-        },
-        {
-          "time": "17:00",
-          "autoBook": false
-        }
-      ]
-    },
-    {
       "name": "Thu",
       "date": "2026-10-15",
       "locations": [
