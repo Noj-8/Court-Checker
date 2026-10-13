@@ -4,16 +4,11 @@
       "name": "Thu",
       "date": "2026-10-15",
       "locations": [
-        "LOC001",
-        "LOC002"
+        "LOC001"
       ],
       "times": [
         {
           "time": "20:00",
-          "autoBook": true
-        },
-        {
-          "time": "21:00",
           "autoBook": true
         }
       ]
