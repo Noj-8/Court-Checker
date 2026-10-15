@@ -17,14 +17,9 @@
       "name": "Sat.",
       "date": "2026-10-17",
       "locations": [
-        "LOC001",
-        "LOC002"
+        "LOC001"
       ],
       "times": [
-        {
-          "time": "17:00",
-          "autoBook": true
-        },
         {
           "time": "18:00",
           "autoBook": true
