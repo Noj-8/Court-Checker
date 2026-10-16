@@ -8,10 +8,6 @@
       ],
       "times": [
         {
-          "time": "18:00",
-          "autoBook": true
-        },
-        {
           "time": "19:00",
           "autoBook": true
         },
