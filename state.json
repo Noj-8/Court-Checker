@@ -1,7 +1,9 @@
 {
-  "known_open": {},
-  "last_check": "2026-10-20T15:43:24.906918+07:00",
-  "currently_open_count": 0,
+  "known_open": {
+    "2026-10-21|LOC002|G North-3|20:00": true
+  },
+  "last_check": "2026-10-20T15:48:28.428092+07:00",
+  "currently_open_count": 1,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
     "2026-10-21|LOC002|G Center-2|21:00": {
@@ -35,6 +37,14 @@
       "message": "Insufficient fund | 500.00 THB",
       "classification_warning": null,
       "attempted_at": "2026-10-20T15:10:20.342506+07:00"
+    },
+    "2026-10-21|LOC002|G North-3|20:00": {
+      "outcome": "parked",
+      "statusCode": "10",
+      "bookingRef": "SPORTS-202610203775",
+      "message": "Insufficient fund | 500.00 THB",
+      "classification_warning": null,
+      "attempted_at": "2026-10-20T15:48:26.995606+07:00"
     }
   }
 }
