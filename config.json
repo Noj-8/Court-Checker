@@ -1,19 +1,6 @@
 {
   "targets": [
     {
-      "name": "Wed",
-      "date": "2026-10-21",
-      "locations": [
-        "LOC002"
-      ],
-      "times": [
-        {
-          "time": "21:00",
-          "autoBook": false
-        }
-      ]
-    },
-    {
       "name": "Thu",
       "date": "2026-10-22",
       "locations": [
