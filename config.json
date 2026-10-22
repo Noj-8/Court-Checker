@@ -1,27 +1,6 @@
 {
   "targets": [
     {
-      "name": "Fri (G)",
-      "date": "2026-10-23",
-      "locations": [
-        "LOC002"
-      ],
-      "times": [
-        {
-          "time": "09:00",
-          "autoBook": true
-        },
-        {
-          "time": "10:00",
-          "autoBook": true
-        },
-        {
-          "time": "11:00",
-          "autoBook": true
-        }
-      ]
-    },
-    {
       "name": "Sat",
       "date": "2026-10-24",
       "locations": [
