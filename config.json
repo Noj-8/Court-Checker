@@ -21,28 +21,6 @@
           "autoBook": true
         }
       ]
-    },
-    {
-      "name": "Sun",
-      "date": "2026-10-25",
-      "locations": [
-        "LOC001",
-        "LOC002"
-      ],
-      "times": [
-        {
-          "time": "10:00",
-          "autoBook": true
-        },
-        {
-          "time": "11:00",
-          "autoBook": true
-        },
-        {
-          "time": "12:00",
-          "autoBook": true
-        }
-      ]
     }
   ]
 }
