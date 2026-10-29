@@ -1,24 +1,7 @@
 {
   "known_open": {},
-  "last_check": "2026-10-29T23:58:23.988927+07:00",
+  "last_check": "2026-10-30T00:03:36.116627+07:00",
   "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
-  "autobook_attempts": {
-    "2026-10-29|LOC001|Center-1|21:00": {
-      "outcome": "paid",
-      "statusCode": "00",
-      "bookingRef": "SPORTS-202610205132",
-      "message": "Success",
-      "classification_warning": null,
-      "attempted_at": "2026-10-27T23:21:24.264841+07:00"
-    },
-    "2026-10-29|LOC001|Center-1|20:00": {
-      "outcome": "paid",
-      "statusCode": "00",
-      "bookingRef": "SPORTS-202610205251",
-      "message": "Success",
-      "classification_warning": null,
-      "attempted_at": "2026-10-28T14:46:23.107719+07:00"
-    }
-  }
+  "autobook_attempts": {}
 }
