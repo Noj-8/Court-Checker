@@ -4,8 +4,7 @@
       "name": "Sun",
       "date": "2026-11-01",
       "locations": [
-        "LOC001",
-        "LOC002"
+        "LOC001"
       ],
       "times": [
         {
