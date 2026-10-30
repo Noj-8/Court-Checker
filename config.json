@@ -9,52 +9,8 @@
       ],
       "times": [
         {
-          "time": "10:00",
-          "autoBook": true
-        },
-        {
-          "time": "11:00",
-          "autoBook": true
-        },
-        {
-          "time": "12:00",
-          "autoBook": true
-        },
-        {
-          "time": "13:00",
-          "autoBook": true
-        },
-        {
-          "time": "14:00",
-          "autoBook": true
-        },
-        {
-          "time": "15:00",
-          "autoBook": true
-        },
-        {
-          "time": "16:00",
-          "autoBook": true
-        },
-        {
-          "time": "17:00",
-          "autoBook": true
-        },
-        {
           "time": "18:00",
-          "autoBook": true
-        },
-        {
-          "time": "19:00",
-          "autoBook": true
-        },
-        {
-          "time": "20:00",
-          "autoBook": true
-        },
-        {
-          "time": "21:00",
-          "autoBook": true
+          "autoBook": false
         }
       ]
     }
