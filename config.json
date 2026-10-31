@@ -9,11 +9,11 @@
       "times": [
         {
           "time": "15:00",
-          "autoBook": true
+          "autoBook": false
         },
         {
           "time": "18:00",
-          "autoBook": true
+          "autoBook": false
         }
       ]
     }
