@@ -1,7 +1,16 @@
 {
   "known_open": {},
-  "last_check": "2026-11-04T12:03:38.596070+07:00",
+  "last_check": "2026-11-04T12:08:27.534307+07:00",
   "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
-  "autobook_attempts": {}
+  "autobook_attempts": {
+    "2026-11-05|LOC001|Center-1|20:00": {
+      "outcome": "parked",
+      "statusCode": "10",
+      "bookingRef": "SPORTS-202611206594",
+      "message": "Insufficient fund | 500.00 THB",
+      "classification_warning": null,
+      "attempted_at": "2026-11-04T12:05:18.453178+07:00"
+    }
+  }
 }
