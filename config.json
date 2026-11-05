@@ -9,28 +9,20 @@
       ],
       "times": [
         {
-          "time": "09:00",
-          "autoBook": false
-        },
-        {
           "time": "10:00",
-          "autoBook": false
-        },
-        {
-          "time": "11:00",
-          "autoBook": false
+          "autoBook": true
         },
         {
           "time": "17:00",
-          "autoBook": false
+          "autoBook": true
         },
         {
           "time": "18:00",
-          "autoBook": false
+          "autoBook": true
         },
         {
           "time": "19:00",
-          "autoBook": false
+          "autoBook": true
         }
       ]
     },
