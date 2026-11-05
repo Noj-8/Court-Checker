@@ -44,7 +44,7 @@
         },
         {
           "time": "16:00",
-          "autoBook": false
+          "autoBook": true
         },
         {
           "time": "17:00",
