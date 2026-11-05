@@ -13,6 +13,10 @@
           "autoBook": true
         },
         {
+          "time": "16:00",
+          "autoBook": false
+        },
+        {
           "time": "17:00",
           "autoBook": true
         },
@@ -22,7 +26,7 @@
         },
         {
           "time": "19:00",
-          "autoBook": true
+          "autoBook": false
         }
       ]
     },
