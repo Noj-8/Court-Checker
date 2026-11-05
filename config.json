@@ -51,6 +51,40 @@
           "autoBook": false
         }
       ]
+    },
+    {
+      "name": "Sun",
+      "date": "2026-11-08",
+      "locations": [
+        "LOC001",
+        "LOC002"
+      ],
+      "times": [
+        {
+          "time": "09:00",
+          "autoBook": false
+        },
+        {
+          "time": "10:00",
+          "autoBook": false
+        },
+        {
+          "time": "11:00",
+          "autoBook": false
+        },
+        {
+          "time": "17:00",
+          "autoBook": false
+        },
+        {
+          "time": "18:00",
+          "autoBook": false
+        },
+        {
+          "time": "19:00",
+          "autoBook": false
+        }
+      ]
     }
   ]
 }
