@@ -1,6 +1,6 @@
 {
   "known_open": {},
-  "last_check": "2026-11-05T22:33:30.065704+07:00",
+  "last_check": "2026-11-05T22:38:27.331469+07:00",
   "currently_open_count": 0,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
@@ -19,6 +19,14 @@
       "message": "Success",
       "classification_warning": null,
       "attempted_at": "2026-11-04T12:18:30.696559+07:00"
+    },
+    "2026-11-07|LOC002|G South-1|10:00": {
+      "outcome": "paid",
+      "statusCode": "00",
+      "bookingRef": "SPORTS-202611208043",
+      "message": "Success",
+      "classification_warning": null,
+      "attempted_at": "2026-11-05T22:37:22.472567+07:00"
     }
   }
 }
