@@ -3,11 +3,10 @@
     "2026-11-12|LOC001|North-2|23:00": true,
     "2026-11-12|LOC001|North-3|23:00": true,
     "2026-11-12|LOC001|Center-1|23:00": true,
-    "2026-11-12|LOC002|G Center-2|23:00": true,
     "2026-11-12|LOC002|G South-1|23:00": true
   },
-  "last_check": "2026-11-10T20:18:24.868968+07:00",
-  "currently_open_count": 5,
+  "last_check": "2026-11-10T20:26:47.358445+07:00",
+  "currently_open_count": 4,
   "last_session_alert": 1789004744.0297656,
   "autobook_attempts": {
     "2026-11-12|LOC002|G South-1|22:00": {
