@@ -1,0 +1,38 @@
+name: Probe new booking site
+
+# Manual-only, read-only check of whether the new Crystal Sports site
+# (2026-11-11) shows the availability grid to an automated client from a
+# GitHub Actions runner. Never scheduled, never triggered by push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read               # read-only probe — nothing is committed back
+
+concurrency:
+  group: probe-new-site        # separate from tennis-monitor
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run probe
+        env:
+          CS_AUTH: ${{ secrets.CS_AUTH }}
+          CS_DID: ${{ secrets.CS_DID }}
+          CS_MEMBER: ${{ secrets.CS_MEMBER }}
+        run: python probe_new_site.py
