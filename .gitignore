@@ -25,3 +25,8 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# The bot's own Crystal Sports login session (live cookies) — never commit.
+# The .tmp pattern covers the atomic-write temp file next to it.
+.bot_session.json
+.bot_session.*.tmp
