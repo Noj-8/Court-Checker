@@ -10,10 +10,11 @@ in a cookie jar that is rewritten after every single response, and
 requests are strictly sequential.
 
   Cookie jar:  .bot_session.json next to this script (gitignored, mode
-               600). Seeded ONCE from CS_AUTH / CS_DID / CS_MEMBER (sent
-               as cs_auth, cs.did, cs.member) if it doesn't exist; once it
-               exists the env vars are ignored. Rewritten atomically (temp
-               file, fsync, rename) right after every response.
+               600). Seeded ONCE from CS_DID / CS_MEMBER (required) and
+               CS_AUTH (optional) — sent as cs.did, cs.member, cs_auth — if
+               it doesn't exist; once it exists the env vars are ignored.
+               Rewritten atomically (temp file, fsync, rename) right after
+               every response.
   Requests:    each round GETs /booking?date=<tomorrow>&loc=<LOC>&time=0&sel=
                for LOC001 then LOC002, redirects NOT followed. Also sends
                .AspNetCore.Culture=c=en|uic=en and reports whether the page
@@ -22,7 +23,7 @@ requests are strictly sequential.
                rounds (default 300). --repeat 12 --interval 300 = one hour.
   Exit code:   0  grid parsed for both locations in every round
                1  at least one location/round returned no grid
-               2  no jar file yet and a seed env var is missing
+               2  no jar file yet and CS_DID or CS_MEMBER is missing
                3  stopped on a login redirect (session no longer valid)
                4  the jar file couldn't be read or written
 
@@ -64,6 +65,7 @@ USER_AGENT = (
 JAR_FILE = Path(__file__).resolve().parent / ".bot_session.json"
 JAR_VERSION = 1
 SEED_ENV = {"cs_auth": "CS_AUTH", "cs.did": "CS_DID", "cs.member": "CS_MEMBER"}
+OPTIONAL_SEED = {"cs_auth"}
 CULTURE_COOKIE = {".AspNetCore.Culture": "c=en|uic=en"}
 
 # Calibrated against the live site on 2026-11-11: with no cookies,
@@ -168,15 +170,19 @@ def save_jar(path, session):
 
 def seed_session(session):
     values = {name: os.environ.get(env, "").strip() for name, env in SEED_ENV.items()}
-    missing = [env for name, env in SEED_ENV.items() if not values[name]]
+    missing = [env for name, env in SEED_ENV.items() if not values[name] and name not in OPTIONAL_SEED]
     if missing:
-        return missing
+        return missing, []
+    absent = []
     for name, value in values.items():
+        if not value:
+            absent.append(name)
+            continue
         # Explicit host + "/" so the server's first rotation (a host-only
         # cookie on path /) REPLACES this entry instead of sitting beside it.
         session.cookies.set_cookie(create_cookie(name, value, domain=HOST, path="/", secure=True))
         remember_secret(value)
-    return []
+    return [], absent
 
 
 def cookie_values(session):
@@ -186,6 +192,33 @@ def cookie_values(session):
             dupes.add(c.name)
         values[c.name] = c.value
     return values, dupes
+
+
+def cookie_expiries(session):
+    return {c.name: c.expires for c in session.cookies}
+
+
+def fmt_duration(seconds):
+    seconds = int(seconds)
+    sign = "-" if seconds < 0 else ""
+    days, rem = divmod(abs(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    return f"{sign}{days}d {hours}h {rem // 60}m" if days else f"{sign}{hours}h {rem // 60}m"
+
+
+def describe_expiry(expires, previous=None):
+    """Expiry only, never the value. `expires` is what requests parsed from
+    the Set-Cookie (Expires, or Max-Age converted to a time). `previous` is
+    omitted when unknown — e.g. a seeded cookie, whose browser-side expiry
+    was never copied — rather than shown as if it were a session cookie."""
+    if expires is None:
+        return "expires=session (no Expires/Max-Age)"
+    text = (f"expires={datetime.fromtimestamp(expires, TZ).isoformat(timespec='seconds')} "
+            f"(in {fmt_duration(expires - time.time())}")
+    if previous is not None:
+        delta = expires - previous
+        text += f"; {'+' if delta >= 0 else '-'}{fmt_duration(abs(delta))} vs previous"
+    return text + ")"
 
 
 def merge_set_cookies(session, resp):
@@ -309,6 +342,7 @@ def probe_once(session, jar_path, loc, date):
     result = {"loc": loc, "status": None, "ok": False, "login": False, "changes": [],
               "jar_error": None, "error": None, "page": None, "diag": []}
     before, _ = cookie_values(session)
+    before_exp = cookie_expiries(session)
     try:
         resp = probe_get(session, params)
     except requests.RequestException as e:
@@ -318,6 +352,7 @@ def probe_once(session, jar_path, loc, date):
     # Persist first, before parsing or printing anything about the response.
     merge_set_cookies(session, resp)
     after, dupes = cookie_values(session)
+    after_exp = cookie_expiries(session)
     result["changes"] = diff_cookies(before, after)
     try:
         save_jar(jar_path, session)
@@ -327,9 +362,10 @@ def probe_once(session, jar_path, loc, date):
 
     for kind, name, old, new in result["changes"]:
         if kind == "ROTATED":
-            say(f"[{stamp()}] ROTATED {name}: {fingerprint(old)} -> {fingerprint(new)}")
+            say(f"[{stamp()}] ROTATED {name}: {fingerprint(old)} -> {fingerprint(new)} | "
+                f"{describe_expiry(after_exp.get(name), before_exp.get(name))}")
         elif kind == "NEW":
-            say(f"[{stamp()}] NEW {name}: {fingerprint(new)}")
+            say(f"[{stamp()}] NEW {name}: {fingerprint(new)} | {describe_expiry(after_exp.get(name))}")
         else:
             say(f"[{stamp()}] REMOVED {name}: was {fingerprint(old)}")
     for name in sorted(dupes):
@@ -417,7 +453,7 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None):
         if set_env:
             say(f"  {', '.join(set_env)} set but IGNORED — the jar exists, so it is the only source of cookies.")
     else:
-        missing = seed_session(session)
+        missing, absent = seed_session(session)
         if missing:
             say(f"ERROR: no {jar_path.name} yet and {', '.join(missing)} missing — nothing seeded, no requests sent.")
             return EXIT_NO_SEED
@@ -426,15 +462,14 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None):
         except OSError as e:
             say(f"ERROR: couldn't create {jar_path.name} ({type(e).__name__}: {e}) — no requests sent.")
             return EXIT_JAR
-        say(f"Seeded {jar_path.name} from CS_AUTH/CS_DID/CS_MEMBER (mode 0o600). "
-            "From now on the env vars are ignored.")
+        say(f"Seeded {jar_path.name} from env vars (mode 0o600). From now on the env vars are ignored.")
+        for name in absent:
+            say(f"  {name} absent (not seeded)")
 
     say("Cookies in jar (values never printed):")
     names, _ = cookie_values(session)
     for name in sorted(names):
         say(f"  {name} {fingerprint(names[name])}")
-    if "cs_auth" not in names:
-        say("  WARNING: no cs_auth in the jar — expect a login redirect.")
     say()
 
     all_ok = True

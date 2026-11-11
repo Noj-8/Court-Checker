@@ -8,6 +8,7 @@ generation run for real — only the network is replaced. Every test uses
 a throwaway temp dir, never the real .bot_session.json.
 """
 import contextlib
+import email.utils
 import http.client
 import importlib.util
 import io
@@ -15,8 +16,10 @@ import json
 import os
 import stat
 import tempfile
+import time
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -162,6 +165,7 @@ class TestRotationPersists(ProbeTestCase):
         self.assertEqual(self.jar_cookies()["cs.member"], MEMBER_NEW)
         self.assertEqual(stat.S_IMODE(self.jar.stat().st_mode), 0o600)
         self.assertIn(f"ROTATED cs.member: {probe.fingerprint(SEED['CS_MEMBER'])} -> {probe.fingerprint(MEMBER_NEW)}", out)
+        self.assertIn("expires=session (no Expires/Max-Age)", out)
         self.assertIn("rotations=1", out)
         self.assert_no_secret_leak(out, MEMBER_NEW)
         self.assert_no_temp_files()
@@ -188,6 +192,45 @@ class TestRotationPersists(ProbeTestCase):
         self.assertNotIn(".AspNetCore.Culture", self.jar_cookies(), "culture cookie must not be stored in the jar")
         self.assertIn("lang=en thai=no", out)
         self.assertIn("open: 20:00(2) 22:00(1)", out)
+
+
+class TestRotationExpiry(ProbeTestCase):
+    """Each rotation logs the new cookie's expiry (never its value), and
+    once a previous expiry is known, how far the rotation moved it."""
+
+    def test_expires_logged_on_each_rotation_with_delta_once_known(self):
+        # Relative to now, never hardcoded — a fixed date would eventually
+        # pass and http.cookiejar would silently treat the cookie as deleted.
+        now = int(time.time())
+        exp1, exp2 = now + 30 * 86400, now + 31 * 86400
+        second_value = "MEMBER_newer_value_5555"
+        script = [
+            ok(set_cookies=[f"cs.member={MEMBER_NEW}; expires={email.utils.formatdate(exp1, usegmt=True)}; path=/; secure"]),
+            ok(set_cookies=[f"cs.member={second_value}; expires={email.utils.formatdate(exp2, usegmt=True)}; path=/; secure"]),
+        ]
+        code, out, adapter, _ = self.run_probe(script, env=SEED)
+        self.assertEqual(code, probe.EXIT_OK)
+
+        rotations = [line for line in out.splitlines() if "ROTATED cs.member" in line]
+        self.assertEqual(len(rotations), 2)
+        iso = lambda ts: datetime.fromtimestamp(ts, probe.TZ).isoformat(timespec="seconds")
+        # First rotation replaces a seeded cookie: its old expiry was never
+        # known, so no "vs previous" is claimed.
+        self.assertIn(f"expires={iso(exp1)}", rotations[0])
+        self.assertNotIn("vs previous", rotations[0])
+        # Second rotation: lifetime moved forward by exactly a day.
+        self.assertIn(f"expires={iso(exp2)}", rotations[1])
+        self.assertIn("+1d 0h 0m vs previous", rotations[1])
+        stored = {c["name"]: c["expires"] for c in json.loads(self.jar.read_text())["cookies"]}
+        self.assertEqual(stored["cs.member"], exp2, "the new expiry must be persisted in the jar too")
+        self.assert_no_secret_leak(out, MEMBER_NEW, second_value)
+
+    def test_max_age_is_reported_as_an_expiry_time(self):
+        code, out, adapter, _ = self.run_probe(
+            [ok(set_cookies=[f"cs.member={MEMBER_NEW}; max-age=3600; path=/; secure"]), ok()], env=SEED)
+        self.assertEqual(code, probe.EXIT_OK)
+        rotation = next(line for line in out.splitlines() if "ROTATED cs.member" in line)
+        self.assertRegex(rotation, r"expires=\S+ \(in (0h 59m|1h 0m)\)")
 
 
 class TestAtomicWrite(ProbeTestCase):
@@ -280,11 +323,38 @@ class TestStopsOnLoginRedirect(ProbeTestCase):
 
 
 class TestSeedingRules(ProbeTestCase):
-    def test_missing_seed_env_sends_nothing_and_creates_nothing(self):
-        code, out, adapter, _ = self.run_probe([ok()], env={"CS_AUTH": SEED["CS_AUTH"]})
-        self.assertEqual(code, probe.EXIT_NO_SEED)
-        self.assertEqual(adapter.sent, [])
-        self.assertFalse(self.jar.exists())
+    def test_missing_required_seed_env_sends_nothing_and_creates_nothing(self):
+        for env, should_name in [({"CS_AUTH": SEED["CS_AUTH"]}, ["CS_DID", "CS_MEMBER"]),
+                                 ({"CS_AUTH": SEED["CS_AUTH"], "CS_DID": SEED["CS_DID"]}, ["CS_MEMBER"]),
+                                 ({"CS_AUTH": SEED["CS_AUTH"], "CS_MEMBER": SEED["CS_MEMBER"]}, ["CS_DID"])]:
+            with self.subTest(env=sorted(env)):
+                code, out, adapter, _ = self.run_probe([ok()], env=env)
+                self.assertEqual(code, probe.EXIT_NO_SEED)
+                self.assertEqual(adapter.sent, [])
+                self.assertFalse(self.jar.exists())
+                error = next(line for line in out.splitlines() if line.startswith("ERROR"))
+                for name in should_name:
+                    self.assertIn(name, error)
+                self.assertNotIn("CS_AUTH", error, "CS_AUTH is optional and must never be reported missing")
+
+    def test_cs_auth_is_optional(self):
+        env = {"CS_DID": SEED["CS_DID"], "CS_MEMBER": SEED["CS_MEMBER"]}
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env=env)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertIn("cs_auth absent (not seeded)", out)
+        self.assertNotIn("cs_auth", self.jar_cookies())
+        self.assertEqual(set(self.jar_cookies()), {"cs.did", "cs.member"})
+        sent_names = [n for n, _ in adapter.sent[0]["cookies"]]
+        self.assertNotIn("cs_auth", sent_names)
+        self.assertIn("cs.did", sent_names)
+        self.assertIn("cs.member", sent_names)
+        self.assert_no_secret_leak(out)
+
+    def test_cs_auth_seeded_when_present(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertNotIn("absent (not seeded)", out)
+        self.assertEqual(self.jar_cookies()["cs_auth"], SEED["CS_AUTH"])
 
     def test_existing_jar_wins_and_env_vars_are_ignored(self):
         s = requests.Session()
