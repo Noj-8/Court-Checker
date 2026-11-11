@@ -18,9 +18,13 @@ Hard rules, enforced in probe_get() rather than just by convention: GET
 only, path /booking only (never /booking/review or /booking/confirm),
 never follow a redirect, never print a cookie value. Every line of
 output goes through say(), which redacts the cookie values (raw and
-URL-encoded) in case the server ever echoes one back.
+URL-encoded) in case the server ever echoes one back. Each cookie's
+length and the first 8 hex chars of its SHA-256 are printed instead, so
+a Mac run and a GitHub Actions run can be checked for using the same
+values without revealing them.
 """
 
+import hashlib
 import os
 import re
 import sys
@@ -213,9 +217,14 @@ def main():
     values = {name: os.environ.get(env, "").strip() for name, env in COOKIE_ENV.items()}
     _secrets.extend(v for v in values.values() if v)
 
-    say("Cookie env vars (values never printed):")
+    say("Cookie env vars (values never printed — length and SHA-256 prefix only):")
     for name, env in COOKIE_ENV.items():
-        say(f"  {env:<10} -> {name:<10} {'present' if values[name] else 'MISSING'}")
+        value = values[name]
+        if value:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+            say(f"  {name} len={len(value)} sha256={digest}  (from {env})")
+        else:
+            say(f"  {name} MISSING  (from {env})")
     missing = [COOKIE_ENV[n] for n, v in values.items() if not v]
     if missing:
         say(f"ERROR: missing {', '.join(missing)} — no requests sent.")
