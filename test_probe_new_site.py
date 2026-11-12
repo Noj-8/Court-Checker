@@ -25,6 +25,11 @@ from unittest import mock
 
 import requests
 
+try:
+    from cryptography.fernet import Fernet
+except ImportError:  # only the encrypted-jar tests need it
+    Fernet = None
+
 REPO = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("probe_new_site", REPO / "probe_new_site.py")
 probe = importlib.util.module_from_spec(_spec)
@@ -113,6 +118,7 @@ class ProbeTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
         self.jar = self.dir / ".bot_session.json"
+        self.enc = self.dir / "bot_session.enc"
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -125,7 +131,8 @@ class ProbeTestCase(unittest.TestCase):
         with mock.patch.dict(os.environ, env or {}, clear=True), \
              mock.patch.object(probe.time, "sleep") as sleep, \
              contextlib.redirect_stdout(out):
-            code = probe.run(repeat=repeat, interval=0, jar_path=self.jar, session=session)
+            code = probe.run(repeat=repeat, interval=0, jar_path=self.jar, session=session,
+                             enc_path=self.enc)
         return code, out.getvalue(), adapter, sleep
 
     def jar_cookies(self):
@@ -376,6 +383,131 @@ class TestSeedingRules(ProbeTestCase):
         self.assertEqual(code, probe.EXIT_JAR)
         self.assertEqual(adapter.sent, [])
         self.assertEqual(self.jar.read_text(), "{not json")
+
+
+def session_with(cookies):
+    s = requests.Session()
+    for name, value in cookies.items():
+        s.cookies.set_cookie(probe.create_cookie(name, value, domain=probe.HOST, path="/", secure=True))
+    return s
+
+
+SEEDED = {"cs.did": SEED["CS_DID"], "cs.member": SEED["CS_MEMBER"]}
+ROTATE = f"cs.member={MEMBER_NEW}; path=/; secure; httponly"
+
+
+@unittest.skipIf(Fernet is None, "cryptography not installed")
+class TestEncryptedJar(ProbeTestCase):
+    """BOT_JAR_KEY set: the jar is bot_session.enc, ciphertext only."""
+
+    def setUp(self):
+        super().setUp()
+        self.key = Fernet.generate_key().decode()
+
+    def enc_cookies(self, key=None):
+        s = requests.Session()
+        probe.load_jar(self.enc, s, Fernet((key or self.key).encode()))
+        return {c.name: c.value for c in s.cookies}
+
+    def test_round_trip_and_rotation_persist_encrypted(self):
+        probe.save_jar(self.enc, session_with(SEEDED), Fernet(self.key.encode()))
+        raw = self.enc.read_bytes()
+        for needle in list(SEEDED.values()) + ["cs.member", "cookies"]:
+            self.assertNotIn(needle.encode(), raw)
+        self.assertEqual(self.enc_cookies(), SEEDED)
+
+        code, out, adapter, _ = self.run_probe([ok(set_cookies=[ROTATE]), ok()],
+                                               env={"BOT_JAR_KEY": self.key})
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertIn(("cs.member", MEMBER_NEW), adapter.sent[1]["cookies"])
+        self.assertEqual(self.enc_cookies()["cs.member"], MEMBER_NEW)
+        self.assertIn(f"BOT_JAR_KEY set ({probe.fingerprint(self.key)})", out)
+        self.assertIn("ROTATED cs.member", out)
+        self.assert_no_secret_leak(out, MEMBER_NEW, self.key)
+        self.assertFalse(self.jar.exists())
+        self.assert_no_temp_files()
+
+    def test_wrong_or_invalid_key_fails_cleanly_without_overwriting(self):
+        probe.save_jar(self.enc, session_with(SEEDED), Fernet(self.key.encode()))
+        before = self.enc.read_bytes()
+        for label, key in [("wrong key", Fernet.generate_key().decode()), ("not a key", "not-a-fernet-key")]:
+            with self.subTest(label):
+                code, out, adapter, _ = self.run_probe([ok()], env={**SEED, "BOT_JAR_KEY": key})
+                self.assertEqual(code, probe.EXIT_JAR)
+                self.assertEqual(adapter.sent, [], "no request may be sent without a readable jar")
+                self.assertEqual(self.enc.read_bytes(), before)
+                self.assertFalse(self.jar.exists(), "must not fall back to seeding a plaintext jar")
+                self.assertIn("BOT_JAR_KEY", out)
+                self.assert_no_secret_leak(out, key)
+                self.assert_no_temp_files()
+
+    def test_no_plaintext_ever_written_when_key_is_set(self):
+        written = []
+        real_fdopen = os.fdopen
+
+        class Recorder:
+            def __init__(self, f):
+                self._f = f
+
+            def write(self, data):
+                written.append(bytes(data))
+                return self._f.write(data)
+
+            def __getattr__(self, name):
+                return getattr(self._f, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._f.__exit__(*exc)
+
+        with mock.patch.object(probe.os, "fdopen", lambda *a, **k: Recorder(real_fdopen(*a, **k))):
+            # Seeds from env (write 1), then a rotation (write 2), then no change (no write).
+            code, out, _, _ = self.run_probe([ok(set_cookies=[ROTATE]), ok()],
+                                             env={**SEED, "BOT_JAR_KEY": self.key})
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual(len(written), 2, "expected exactly the seed write and the rotation write")
+        for data in written:
+            for needle in list(SEED.values()) + [MEMBER_NEW, "cs.member", '"cookies"']:
+                self.assertNotIn(needle.encode(), data, "plaintext reached the disk")
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["bot_session.enc"])
+        self.assertEqual(self.enc_cookies()["cs.member"], MEMBER_NEW)
+
+    def test_unchanged_cookies_leave_the_file_byte_identical(self):
+        # So "bot_session.enc changed in git" means "a cookie changed".
+        probe.save_jar(self.enc, session_with(SEEDED), Fernet(self.key.encode()))
+        before = self.enc.read_bytes()
+        code, _, _, _ = self.run_probe([ok(), ok()], env={"BOT_JAR_KEY": self.key})
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual(self.enc.read_bytes(), before)
+
+    def test_actions_without_key_refuses_and_writes_nothing(self):
+        code, out, adapter, _ = self.run_probe([ok()], env={**SEED, "GITHUB_ACTIONS": "true"})
+        self.assertEqual(code, probe.EXIT_JAR)
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+
+class TestHandedOff(ProbeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.handed = self.dir / ".bot_session.json.handed-off-20261112-230000"
+        self.handed.write_text("{}")
+
+    def test_handed_off_file_blocks_the_mac_run(self):
+        code, out, adapter, _ = self.run_probe([ok()], env=SEED)
+        self.assertEqual(code, probe.EXIT_HANDED_OFF)
+        self.assertEqual(adapter.sent, [])
+        self.assertFalse(self.jar.exists(), "must not seed a new jar over a handed-off session")
+        self.assertIn("handed off", out)
+        self.assertIn(self.handed.name, out)
+
+    def test_a_fresh_jar_beside_it_runs_normally(self):
+        probe.save_jar(self.jar, session_with(SEEDED))
+        code, _, adapter, _ = self.run_probe([ok(), ok()], env={})
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual(len(adapter.sent), 2)
 
 
 if __name__ == "__main__":

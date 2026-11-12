@@ -1,25 +1,32 @@
 name: Probe new booking site
 
-# Manual-only, read-only check of whether the new Crystal Sports site
-# (2026-11-11) shows the availability grid to an automated client from a
-# GitHub Actions runner. Never scheduled, never triggered by push.
+# Manual-only, read-only probe of the new Crystal Sports site (2026-11-11),
+# running on the bot's own session, handed off from the Mac by
+# seal_session.py. The session lives in bot_session.enc (Fernet, key in the
+# BOT_JAR_KEY secret); the site rotates cs.member every ~15 min and a
+# superseded copy kills the session, so every change is committed back.
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read               # read-only probe — nothing is committed back
+  contents: write              # to commit the rotated bot_session.enc
 
 concurrency:
-  group: probe-new-site        # separate from tennis-monitor
+  group: bot-session           # one holder of the session at a time
   cancel-in-progress: false
 
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          # The branch tip at checkout time, not the SHA the run was queued
+          # at — a run queued behind another must see its rotated jar.
+          ref: main
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -28,11 +35,50 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt "cryptography>=42"
 
       - name: Run probe
         env:
-          CS_AUTH: ${{ secrets.CS_AUTH }}
-          CS_DID: ${{ secrets.CS_DID }}
-          CS_MEMBER: ${{ secrets.CS_MEMBER }}
-        run: python probe_new_site.py
+          BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
+        run: |
+          if [ -z "$BOT_JAR_KEY" ]; then
+            echo "::error::BOT_JAR_KEY secret is not set."
+            exit 1
+          fi
+          python probe_new_site.py --repeat 4 --interval 300
+
+      - name: Save rotated bot session
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain -- bot_session.enc)" ]; then
+            echo "bot_session.enc unchanged (no cookie changed) — nothing to commit."
+            exit 0
+          fi
+          git config user.name "court-checker-bot"
+          git config user.email "court-checker-bot@users.noreply.github.com"
+          git add bot_session.enc
+          git commit -q -m "Update bot session (encrypted jar) [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push -q origin HEAD:main; then
+              echo "Pushed bot_session.enc (attempt $attempt)."
+              exit 0
+            fi
+            [ "$attempt" -eq 5 ] && break
+            echo "Push attempt $attempt failed; rebasing onto origin/main."
+            if ! git pull -q --rebase origin main; then
+              git rebase --abort || true
+              echo "Rebase conflict on bot_session.enc — something else changed it."
+              break
+            fi
+            sleep $((attempt * 2))
+          done
+          echo "::error title=Bot session likely lost::A cookie rotated during this run but bot_session.enc could not be pushed. The copy in the repo is now superseded and presenting it kills the session. The bot session is likely lost and needs reseeding: fresh private-window login, seed on the Mac, git rm bot_session.enc, rerun seal_session.py, update BOT_JAR_KEY."
+          exit 1
+
+      - name: Check no plaintext jar on the runner
+        if: always()
+        run: |
+          if ls -A | grep -q '^\.bot_session\.json'; then
+            echo "::error::A plaintext .bot_session.json* file exists on the runner — this should never happen."
+            exit 1
+          fi

@@ -30,3 +30,5 @@ __pycache__/
 # The .tmp pattern covers the atomic-write temp file next to it.
 .bot_session.json
 .bot_session.*.tmp
+# The Mac's copy after seal_session.py handed the session to GitHub Actions.
+.bot_session.json.handed-off-*

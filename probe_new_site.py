@@ -15,6 +15,16 @@ requests are strictly sequential.
                it doesn't exist; once it exists the env vars are ignored.
                Rewritten atomically (temp file, fsync, rename) right after
                every response.
+  Encrypted:   if BOT_JAR_KEY is set (GitHub Actions), the jar is
+               bot_session.enc instead — the same JSON, Fernet-encrypted
+               in memory, so plaintext never touches disk. It is rewritten
+               (atomically) only when the cookies actually changed, because
+               Fernet output differs on every call and git would otherwise
+               see a change every run. In Actions without BOT_JAR_KEY the
+               probe refuses to run at all.
+  Handed off:  if .bot_session.json is gone but a
+               .bot_session.json.handed-off-<ts> exists (seal_session.py
+               moved the session to Actions), the Mac probe refuses to run.
   Requests:    each round GETs /booking?date=<tomorrow>&loc=<LOC>&time=0&sel=
                for LOC001 then LOC002, redirects NOT followed. Also sends
                .AspNetCore.Culture=c=en|uic=en and reports whether the page
@@ -25,7 +35,9 @@ requests are strictly sequential.
                1  at least one location/round returned no grid
                2  no jar file yet and CS_DID or CS_MEMBER is missing
                3  stopped on a login redirect (session no longer valid)
-               4  the jar file couldn't be read or written
+               4  the jar file couldn't be read or written (incl. a wrong or
+                  invalid BOT_JAR_KEY, or Actions without BOT_JAR_KEY)
+               5  the session was handed off to GitHub Actions
 
 Hard rules, enforced in code: GET only, /booking only (never
 /booking/review or /booking/confirm), never follow a redirect, stop on
@@ -64,6 +76,8 @@ USER_AGENT = (
 )
 JAR_FILE = Path(__file__).resolve().parent / ".bot_session.json"
 JAR_VERSION = 1
+ENC_FILE = Path(__file__).resolve().parent / "bot_session.enc"
+JAR_KEY_ENV = "BOT_JAR_KEY"
 SEED_ENV = {"cs_auth": "CS_AUTH", "cs.did": "CS_DID", "cs.member": "CS_MEMBER"}
 OPTIONAL_SEED = {"cs_auth"}
 CULTURE_COOKIE = {".AspNetCore.Culture": "c=en|uic=en"}
@@ -80,7 +94,7 @@ CHALLENGE_BODY_MARKERS = (
 THAI_CHARS = re.compile(f"[{chr(0x0E00)}-{chr(0x0E7F)}]")  # the Thai Unicode block
 FIRST_INT = re.compile(r"\d+")  # str pattern: also matches Thai digits, which int() accepts
 
-EXIT_OK, EXIT_NO_GRID, EXIT_NO_SEED, EXIT_LOGIN, EXIT_JAR = 0, 1, 2, 3, 4
+EXIT_OK, EXIT_NO_GRID, EXIT_NO_SEED, EXIT_LOGIN, EXIT_JAR, EXIT_HANDED_OFF = 0, 1, 2, 3, 4, 5
 
 _secrets = set()
 
@@ -124,9 +138,31 @@ def jar_records(session):
     ]
 
 
-def load_jar(path, session):
+def make_fernet(key):
     try:
-        data = json.loads(Path(path).read_text())
+        from cryptography.fernet import Fernet
+    except ImportError:
+        raise JarError(f"{JAR_KEY_ENV} is set but the cryptography package isn't installed") from None
+    try:
+        return Fernet(key.strip().encode("ascii"))
+    except (ValueError, TypeError, UnicodeEncodeError):  # binascii.Error is a ValueError
+        raise JarError(f"{JAR_KEY_ENV} isn't a valid Fernet key (expected 44 url-safe base64 chars)") from None
+
+
+def handed_off_files(jar_path):
+    jar_path = Path(jar_path)
+    return sorted(jar_path.parent.glob(f"{jar_path.name}.handed-off-*"))
+
+
+def load_jar(path, session, fernet=None):
+    try:
+        raw = Path(path).read_bytes()
+        if fernet is not None:
+            try:
+                raw = fernet.decrypt(raw)
+            except Exception:  # cryptography's InvalidToken carries no message
+                raise JarError(f"can't decrypt — wrong {JAR_KEY_ENV}, or the file is corrupted") from None
+        data = json.loads(raw)
         if data.get("version") != JAR_VERSION or not isinstance(data.get("cookies"), list):
             raise JarError(f"unexpected format (version={data.get('version')!r})")
         for r in data["cookies"]:
@@ -139,19 +175,31 @@ def load_jar(path, session):
         raise JarError(f"{type(e).__name__}: {e}") from None
 
 
-def save_jar(path, session):
+def save_jar(path, session, fernet=None):
     """Write the jar atomically: a crash or failed write at any point leaves
-    the previous file intact, never a half-written one."""
+    the previous file intact, never a half-written one. With `fernet`, the
+    bytes written are ciphertext only, and an unchanged jar isn't rewritten
+    (returns False) so bot_session.enc changes in git only on a real cookie
+    change."""
     path = Path(path)
-    payload = json.dumps({
-        "version": JAR_VERSION, "host": HOST, "updated_at": stamp(),
-        "cookies": jar_records(session),
-    }, indent=2) + "\n"
+    records = jar_records(session)
+    if fernet is not None and path.exists():
+        try:
+            if json.loads(fernet.decrypt(path.read_bytes()))["cookies"] == records:
+                return False
+        except Exception:  # unreadable with this key: fall through and rewrite it
+            pass
+    data = (json.dumps({
+        "version": JAR_VERSION, "host": HOST, "updated_at": stamp(), "cookies": records,
+    }, indent=2) + "\n").encode("utf-8")
+    if fernet is not None:
+        data = fernet.encrypt(data)  # in memory; only the ciphertext reaches the disk
+    # Same temp prefix for both files, so .gitignore's .bot_session.*.tmp covers it.
     fd, tmp = tempfile.mkstemp(prefix=".bot_session.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "wb") as f:
             os.fchmod(f.fileno(), 0o600)
-            f.write(payload)
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -166,6 +214,7 @@ def save_jar(path, session):
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+    return True
 
 
 def seed_session(session):
@@ -337,7 +386,7 @@ def probe_get(session, params):
     return session.get(url, params=params, cookies=CULTURE_COOKIE, allow_redirects=False, timeout=20)
 
 
-def probe_once(session, jar_path, loc, date):
+def probe_once(session, jar_path, loc, date, fernet=None):
     params = {"date": date, "loc": loc, "time": "0", "sel": ""}
     result = {"loc": loc, "status": None, "ok": False, "login": False, "changes": [],
               "jar_error": None, "error": None, "page": None, "diag": []}
@@ -355,7 +404,7 @@ def probe_once(session, jar_path, loc, date):
     after_exp = cookie_expiries(session)
     result["changes"] = diff_cookies(before, after)
     try:
-        save_jar(jar_path, session)
+        save_jar(jar_path, session, fernet)
     except OSError as e:
         result["jar_error"] = f"{type(e).__name__}: {e}"
         return result
@@ -431,18 +480,41 @@ def summary_line(rnd, repeat, result):
     return line
 
 
-def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None):
+def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FILE):
     session = session or requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
     })
-    jar_path = Path(jar_path)
+    key = os.environ.get(JAR_KEY_ENV, "").strip()
+    fernet = None
+    if key:
+        remember_secret(key)
+        try:
+            fernet = make_fernet(key)
+        except JarError as e:
+            say(f"ERROR: {e}. No requests sent.")
+            return EXIT_JAR
+        jar_path = Path(enc_path)
+        say(f"{JAR_KEY_ENV} set ({fingerprint(key)}): encrypted jar {jar_path.name}, never written in plaintext.")
+    elif os.environ.get("GITHUB_ACTIONS") == "true":
+        say(f"ERROR: running in GitHub Actions without {JAR_KEY_ENV} — refusing, so the session is never")
+        say("written to the runner's disk in plaintext. No requests sent.")
+        return EXIT_JAR
+    else:
+        jar_path = Path(jar_path)
+        handed = handed_off_files(jar_path)
+        if handed and not jar_path.exists():
+            say(f"ERROR: no {jar_path.name}, only {handed[-1].name} — this session was handed off to")
+            say("GitHub Actions (bot_session.enc). Running it here too would present a superseded cs.member")
+            say("and kill it. No requests sent. For a separate Mac session: log in fresh in a private window,")
+            say("move the handed-off file out of this folder, and reseed.")
+            return EXIT_HANDED_OFF
 
     if jar_path.exists():
         try:
-            load_jar(jar_path, session)
+            load_jar(jar_path, session, fernet)
         except JarError as e:
             say(f"ERROR: {jar_path.name} exists but couldn't be read ({e}).")
             say("Not falling back to CS_AUTH/CS_DID/CS_MEMBER — they may be superseded cookies,")
@@ -458,7 +530,7 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None):
             say(f"ERROR: no {jar_path.name} yet and {', '.join(missing)} missing — nothing seeded, no requests sent.")
             return EXIT_NO_SEED
         try:
-            save_jar(jar_path, session)
+            save_jar(jar_path, session, fernet)
         except OSError as e:
             say(f"ERROR: couldn't create {jar_path.name} ({type(e).__name__}: {e}) — no requests sent.")
             return EXIT_JAR
@@ -476,7 +548,7 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None):
     for rnd in range(1, repeat + 1):
         date = (datetime.now(TZ) + timedelta(days=1)).date().isoformat()
         for loc in LOCATIONS:
-            result = probe_once(session, jar_path, loc, date)
+            result = probe_once(session, jar_path, loc, date, fernet)
             if result["jar_error"]:
                 say(f"[{stamp()}] round {rnd}/{repeat} {loc}: FAILED TO WRITE {jar_path.name} "
                     f"({result['jar_error']}).")
