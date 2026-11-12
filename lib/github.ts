@@ -1,5 +1,4 @@
 import { Octokit } from "@octokit/rest"
-import sealedbox from "tweetnacl-sealedbox-js"
 
 function octo() {
   const token = process.env.GITHUB_TOKEN
@@ -39,27 +38,5 @@ export async function putFile(path: string, content: string, message: string): P
     message,
     content: Buffer.from(content, "utf-8").toString("base64"),
     sha: existing?.sha,
-  })
-}
-
-export async function updateSecret(name: string, value: string): Promise<void> {
-  const { owner, repo } = repoConfig()
-
-  // 1. Fetch the repo's public key (base64-encoded X25519 key)
-  const { data: pubKey } = await octo().actions.getRepoPublicKey({ owner, repo })
-
-  // 2. Encrypt the secret value with libsodium-compatible sealed box
-  const messageBytes = Buffer.from(value, "utf-8")
-  const keyBytes = Buffer.from(pubKey.key, "base64")
-  const encrypted = sealedbox.seal(messageBytes, keyBytes)
-  const encryptedBase64 = Buffer.from(encrypted).toString("base64")
-
-  // 3. Upload
-  await octo().actions.createOrUpdateRepoSecret({
-    owner,
-    repo,
-    secret_name: name,
-    encrypted_value: encryptedBase64,
-    key_id: pubKey.key_id,
   })
 }

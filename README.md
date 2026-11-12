@@ -1,171 +1,177 @@
-# Tennis monitor — Phase 1 (cloud setup)
+# Court Checker — tennis court monitor for Crystal Sports Bangkok
 
-GitHub Actions starts the monitor every 5 minutes; each run polls 4 times at
-60-second intervals for effective ~60s polling, so your Mac doesn't need to
-be on. Phase 2 will add the pretty web UI on top.
+Watches the Crystal Sports booking site for the court times you care about and
+emails you the moment one opens up. Runs entirely in the cloud: a Python
+monitor on GitHub Actions, plus a small web dashboard on Vercel for editing
+targets (see [DEPLOY.md](DEPLOY.md)).
 
-(Why every 5 min + 4 inner polls instead of just `* * * * *`? GitHub Actions has
-a documented 5-minute minimum cron interval and skips schedules during high load,
-so the loop-inside-each-run pattern is the standard workaround.)
+Crystal Sports replaced its booking site on **11 Nov 2026** with a
+server-rendered ASP.NET Core site. Everything below describes the new setup;
+the old `api_helper.php` / `PHPSESSID` flow is gone.
 
----
-
-## What you'll do (about 10 minutes)
-
-1. Create a GitHub account (skip if you have one)
-2. Create a new public repo and upload these files
-3. Set 3 secrets in the repo
-4. Trigger a test run — verify it works
-5. Wait. The cron takes over from there.
+> **Auto-book is paused.** `AUTOBOOK_ENABLED = False` in `monitor.py` while it's
+> rebuilt for the new site. Starred times (★ in the dashboard) still get the
+> normal "slot open" email, with a note to book manually.
 
 ---
 
-## Step 1 — GitHub account
+## How it works
 
-If you don't have one, sign up at <https://github.com/signup>. Free is fine.
+```
+cron-job.org ──(every ~5 min: workflow_dispatch)──▶ GitHub Actions: monitor.yml
+                                                        │
+                                                        ▼
+                                  monitor.py  (4 passes, 60 s apart)
+                                    │  GET /booking?date=…&loc=LOC001|LOC002&time=0&sel=
+                                    │  on the bot's OWN login session (bot_session.enc)
+                                    ▼
+                         slot opened? ──▶ email (Gmail)
+                                    │
+                                    ▼
+                commit state.json + bot_session.enc back to the repo (one commit)
+```
 
-## Step 2 — Create a public repo and upload files
+- **The trigger.** cron-job.org calls GitHub's `workflow_dispatch` API for
+  `monitor.yml` roughly every 5 minutes, because GitHub's own schedule is often
+  late or skipped. `monitor.yml` also keeps its `*/5` schedule as a fallback.
+  Runs never overlap: `monitor.yml` and `probe.yml` share the concurrency group
+  `tennis-monitor`.
+- **The bot session.** The site rotates the `cs.member` cookie about every 15
+  minutes, and presenting a superseded copy kills the login. So the monitor uses
+  its own dedicated session, not your browser's. It lives in
+  **`bot_session.enc`**, a Fernet-encrypted cookie jar committed to the repo.
+  The key is the **`BOT_JAR_KEY`** repo secret. Every response that changes a
+  cookie is saved to the jar before anything else happens, and the workflow
+  commits and pushes the jar after every run. Plaintext never touches the
+  runner's disk.
+- **Reading the page.** The page is parsed the same way in Thai and English:
+  - A slot is open when its `a.slot` has no `is-disabled` class and its free
+    count isn't 0.
+  - A date shows as "not open yet" when the page has no slot grid and says when
+    booking opens (e.g. "Booking opens 21:00" or "เปิดจอง 21:00 น.").
+  - Anything else is logged and skipped as an unexpected page.
+- **No double emails.** `state.json` remembers which times are already open
+  (`known_open`, keys `date|loc|any|HH:MM`), so you get one email per opening.
+  The grid works per time slot, not per court.
 
-1. Go to <https://github.com/new>
-2. **Repository name**: anything you like (`tennis-monitor` is fine)
-3. **Public** (important — public repos get unlimited free Actions minutes; private would burn through the free tier in a week)
-4. Don't tick "Add a README" — leave the repo empty
-5. Click **Create repository**
+## Emails you can get
 
-On the empty repo page, you'll see a link "uploading an existing file". Click it.
+| Subject | Meaning | What to do |
+|---|---|---|
+| 🎾 N tennis slot(s) open | A watched time just opened | Book it (link in the email) |
+| 🔴 Bot session expired — reseed needed | The site sent the bot to its login page | [Reseed](#reseeding-the-bot-session) |
+| 🔴 Bot session likely lost — reseed needed | A rotated cookie couldn't be saved or pushed | [Reseed](#reseeding-the-bot-session) |
+| 🔴 Monitor can't read the booking site | No page has been readable for 30 min (site down, network, or the page changed) | Usually nothing; it clears itself on the next good read |
 
-Now drag and drop **all the files in this folder, preserving the folder structure**. Specifically:
+Each 🔴 email is sent **once**. After a session email, the monitor sends no
+requests until the jar changes, so later runs are quiet. They exit 0, and the
+dashboard shows the session as "Needs reseed".
 
-- `monitor.py`
-- `config.json`
-- `state.json`
-- `requirements.txt`
-- `README.md` (this file)
-- `.github/workflows/monitor.yml`
+## Secrets (repo → Settings → Secrets and variables → Actions)
 
-GitHub's drag-and-drop accepts folders, so you can drop the whole `tennis-monitor-cloud` folder contents at once. **It's important that `monitor.yml` ends up at `.github/workflows/monitor.yml` in the repo** — without that exact path, Actions won't see it.
+| Name | What |
+|---|---|
+| `BOT_JAR_KEY` | The Fernet key for `bot_session.enc`. It's created by `seal_session.py`, which copies it to the clipboard without ever printing it. |
+| `EMAIL_USER` | The Gmail address the alerts are sent from (and to, unless `email_to` is set in `config.json`) |
+| `EMAIL_APP_PASSWORD` | A Gmail app password for that address |
 
-If drag-drop doesn't preserve the `.github/workflows/` folder, do this instead:
-1. Upload the loose files (`monitor.py`, `config.json`, etc.) to the root
-2. Click **Add file → Create new file**
-3. In the filename box, type: `.github/workflows/monitor.yml` — the slashes auto-create folders
-4. Paste the contents of `monitor.yml`
-5. Click **Commit changes**
+`PHPSESSID` and `MEMBER_MOBILE` from the old site aren't used any more and can
+be deleted.
 
-Click the green **Commit changes** button to save everything.
+## Reseeding the bot session
 
-## Step 3 — Set 3 secrets
+Do this when you get a "reseed needed" email. The steps are also on the
+dashboard under **Bot session**. On the Mac, in `court-checker-live`:
 
-In your repo:
-
-1. Click **Settings** (top of the repo page)
-2. In the sidebar: **Secrets and variables → Actions**
-3. Click **New repository secret** and add three, one at a time:
-
-| Name | Value |
-|------|-------|
-| `PHPSESSID` | The long cookie value (currently `68sj0h1vppr8i7qc2tpg915n5f`, but get a fresh one from your browser) |
-| `EMAIL_USER` | `nojnoj2000@gmail.com` |
-| `EMAIL_APP_PASSWORD` | The 16-character Gmail app password (no spaces) |
-
-These are encrypted at rest and never shown again — that's why GitHub shows them as `***` in logs.
-
-## Step 4 — Run a test
-
-GitHub doesn't run scheduled workflows on a brand-new repo until you manually trigger one. So:
-
-1. Click the **Actions** tab in your repo
-2. If GitHub asks "I understand my workflows, go ahead and enable them" — click it
-3. In the sidebar, click **Tennis monitor**
-4. Click the **Run workflow** dropdown on the right → green **Run workflow** button
-5. Wait ~30 seconds, then refresh. You should see a new run with a green checkmark.
-
-   Note: the run takes ~3-4 minutes total (4 polls × 60s sleeps). It's normal
-   for the run to be "in progress" for a while — that's the loop, not a hang.
-
-6. Click into the run, expand the "Run monitor" step, you should see something like:
-
+1. Open an **Incognito** window and log in to
+   <https://crystalsports-booking.kegroup.co.th>. Don't use your everyday browser
+   session: if you share it with the bot, the first rotation kills one of them.
+2. Delete the old session:
+   ```bash
+   git pull --rebase && git rm -q bot_session.enc && rm -f .bot_session.json.handed-off-*
    ```
-   [2026-05-08 19:30:00] Running 4 check pass(es), 60s apart
-   [2026-05-08 19:30:00] --- iteration 1/4 ---
-   [2026-05-08 19:30:00]   → Crystal Sports / 2026-05-10
-   [2026-05-08 19:30:01]   → Crystal Sports G / 2026-05-10
-   [2026-05-08 19:30:02]   currently open across watchlist: 0
-   [2026-05-08 19:30:02]   no new openings this iteration
-   [2026-05-08 19:30:02]   sleeping 60s before next iteration...
-   [2026-05-08 19:31:02] --- iteration 2/4 ---
-   ...
-   [2026-05-08 19:33:05] Done.
+3. In DevTools → Application → Cookies, copy `cs.did` and run
+   `export CS_DID="$(pbpaste)"`. Then copy `cs.member` **last** and run
+   `export CS_MEMBER="$(pbpaste)"`. The values never appear in chat or in shell
+   history.
+4. Close the Incognito window. **Don't log out.**
+5. Seed the jar and check it once:
+   ```bash
+   python3 probe_new_site.py; unset CS_DID CS_MEMBER
+   ```
+6. `python3 seal_session.py`: encrypts the jar into `bot_session.enc`, puts a
+   **new** key on the clipboard, and renames the plaintext jar to
+   `.bot_session.json.handed-off-<time>`. After that the Mac refuses to use it.
+7. Paste the key into `BOT_JAR_KEY` **before copying anything else**:
+   ```bash
+   pbpaste | gh secret set BOT_JAR_KEY; pbcopy </dev/null
+   ```
+   You can also use GitHub → Settings → Secrets and variables → Actions →
+   `BOT_JAR_KEY` → Update.
+8. ```bash
+   git add bot_session.enc && git commit -m "Reseed bot session" && git push
    ```
 
-If you see ❌ red X instead, click into it — the error will be in the log. Common ones:
-- "missing env vars" → a secret name is wrong (must be exact: `PHPSESSID`, `EMAIL_USER`, `EMAIL_APP_PASSWORD`)
-- "session expired" email → cookie needs refresh
-- "Authentication failed" on email → app password wrong
+The next run picks it up. When a run reads a page, the "Needs reseed" status
+clears. Once that first run has gone green, delete the
+`.bot_session.json.handed-off-*` file. It's a superseded plaintext copy.
 
-## Step 5 — That's it
+`seal_session.py` needs `pip3 install cryptography` on the Mac.
 
-The cron now runs every 5 minutes automatically. You'll get an email when any slot you've configured opens up. Same as your Mac was doing, just without the Mac.
+## Editing targets
 
----
-
-## Editing your targets
-
-Targets live in `config.json`. To edit:
-
-1. On GitHub, click `config.json` → click the pencil icon (top right of the file viewer) to edit
-2. Change the JSON
-3. **Commit changes** at the bottom
-4. Next scheduled run (within 5 min) picks up the new config
-
-Each target has:
-- `name`: shown in alert emails
-- `date`: `"YYYY-MM-DD"`
-- `locations`: `["LOC001"]` (Crystal Sports), `["LOC002"]` (Crystal Sports G), or `["LOC001", "LOC002"]` (either)
-- `times`: list of strings like `["20:00", "21:00"]` — must be `HH:00` format
-
-Example for adding a new target:
+Use the dashboard (see [DEPLOY.md](DEPLOY.md)), or edit `config.json` directly:
 
 ```json
 {
   "targets": [
     {
-      "name": "Sunday 7am-9pm — Either court",
-      "date": "2026-05-10",
+      "name": "Fri evening",
+      "date": "2026-11-20",
       "locations": ["LOC001", "LOC002"],
-      "times": ["07:00", "08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"]
-    },
-    {
-      "name": "Tuesday evening",
-      "date": "2026-05-12",
-      "locations": ["LOC001"],
-      "times": ["18:00", "19:00", "20:00"]
+      "times": [{"time": "20:00", "autoBook": false}, {"time": "21:00", "autoBook": true}]
     }
   ]
 }
 ```
 
-## When PHPSESSID expires
+- `locations`: `LOC001` = Crystal Sports, `LOC002` = Crystal Sports G.
+- `times`: `HH:00`, from 06:00 to 23:00 (the grid's 18 slots). Plain strings
+  like `"20:00"` are also accepted.
+- `autoBook` is the ★ star. It's kept for when auto-book returns, and for now
+  just adds the "book manually" note to the email.
 
-You'll get an email titled "Tennis monitor: session expired". To refresh:
+Past dates are ignored automatically.
 
-1. Log in to <https://crystalsports-booking.kegroup.co.th/booking.php>
-2. DevTools → Application → Cookies → copy `PHPSESSID` value
-3. In your repo: Settings → Secrets and variables → Actions
-4. Click `PHPSESSID` → Update → paste new value → Update secret
-5. Next scheduled run uses the new cookie
+## The probe (`probe_new_site.py` / `probe.yml`)
+
+The probe is a read-only diagnostic: it makes GET `/booking` requests only,
+prints cookie fingerprints and never values, and logs rotations with their
+expiry times. **Pause the cron-job.org job before you run `probe.yml`.** It
+shares the `tennis-monitor` group, so it would otherwise sit queued behind the
+monitor (GitHub can cancel a queued run) and stop monitor checks while it runs.
 
 ## Stopping the monitor
 
-If you want to pause it (e.g. you've got nothing to watch):
-
-- **Empty the targets list** in `config.json`: `{"targets": []}`. The action keeps running but does nothing.
-- **Or** disable the workflow: Actions tab → Tennis monitor → ⋯ menu → Disable workflow.
+Pause the job on cron-job.org, and disable the workflow under Actions → Tennis
+monitor → ⋯ → Disable workflow, which also stops the `*/5` fallback schedule.
+Emptying the targets list (`{"targets": []}`) also works: the monitor then sends
+no requests.
 
 ## What's in the repo
 
-- `monitor.py` — the Python script that does one check pass and exits
-- `config.json` — your targets (edit this to add/change watch slots)
-- `state.json` — auto-managed; tracks already-alerted slots so you don't get spam
-- `requirements.txt` — Python deps (just `requests`)
-- `.github/workflows/monitor.yml` — the cron schedule + workflow steps
+| File | What |
+|---|---|
+| `monitor.py` | The monitor: check passes, emails, state |
+| `bot_session.py` | The bot's session: encrypted jar, cookie rotation, the single guarded GET |
+| `booking_page.py` | Grid parser (Thai and English) and login-page detector |
+| `probe_new_site.py` | Read-only diagnostic probe |
+| `seal_session.py` | One-time Mac → Actions handoff (encrypts the jar, makes `BOT_JAR_KEY`) |
+| `bot_session.enc` | The encrypted bot session (committed by the workflow after rotations) |
+| `config.json` | Your targets |
+| `state.json` | Monitor state: open slots, last check, session and site-read alerts |
+| `.github/workflows/monitor.yml` | The monitor job |
+| `.github/workflows/probe.yml` | The manual probe job |
+| `test_*.py` | Tests: `python3 -m unittest test_monitor test_probe_new_site test_seal_session` |
+| `app/`, `lib/` | The dashboard (Next.js, see [DEPLOY.md](DEPLOY.md)) |
+| `WALLET_GUARD_SAFETY.md` | History: the old site's auto-book wallet guard |

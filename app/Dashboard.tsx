@@ -1,9 +1,13 @@
 "use client"
 
 import { useState, useEffect, useMemo } from "react"
+import type { ReactNode } from "react"
 import { signOut } from "next-auth/react"
 import type { Config, State, Target, LocId, TimeSlot } from "@/lib/types"
 import { LOCATIONS, ALL_TIMES } from "@/lib/types"
+
+const BOOKING_URL = "https://crystalsports-booking.kegroup.co.th/booking"
+const STALE_AFTER_MINUTES = 10
 
 type Props = {
   initialConfig: Config
@@ -17,7 +21,6 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
   const [state, setState] = useState<State>(initialState)
   const [editingIndex, setEditingIndex] = useState<number | null>(null)
   const [showAdd, setShowAdd] = useState(false)
-  const [showCookie, setShowCookie] = useState(false)
   const [savingMsg, setSavingMsg] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(loadError)
   const [now, setNow] = useState(() => Date.now())
@@ -49,7 +52,7 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
     ? formatTimeAgo(state.last_check, now)
     : "never"
   const status = state.last_check
-    ? minutesSince(state.last_check, now) < 10
+    ? minutesSince(state.last_check, now) < STALE_AFTER_MINUTES
       ? "active"
       : "stale"
     : "stale"
@@ -169,7 +172,7 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
         {/* STATS */}
         <section className="grid grid-cols-3 gap-3 mb-10">
           <Stat label="Targets watching" value={activeTargets.length} />
-          <Stat label="Currently open" value={currentlyOpen} accent={currentlyOpen > 0} />
+          <Stat label="Open time slots" value={currentlyOpen} accent={currentlyOpen > 0} />
           <Stat
             label="Total time slots"
             value={activeTargets.reduce(
@@ -197,6 +200,11 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
               </button>
             )}
           </div>
+
+          <p className="mb-5 px-4 py-3 bg-amberlight border border-amber/20 rounded-lg text-sm text-amber leading-relaxed">
+            Auto-book is paused while it's rebuilt for the new Crystal Sports site. Starred slots send a
+            normal alert — book manually.
+          </p>
 
           {/* ADD FORM */}
           {showAdd && (
@@ -276,34 +284,13 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
           )}
         </section>
 
-        {/* COOKIE REFRESH */}
-        <section className="mt-16 pt-8 border-t border-line">
-          <h2 className="font-display text-xl font-medium tracking-tight mb-2">
-            Session cookie
-          </h2>
-          <p className="text-sm text-ink2 leading-relaxed mb-4">
-            The monitor uses your browser's <code className="font-mono text-xs bg-line/40 px-1.5 py-0.5 rounded">PHPSESSID</code> cookie to read court availability.
-            It expires periodically — when it does, you'll get an email and need to refresh it here.
-          </p>
-          {!showCookie ? (
-            <button
-              onClick={() => setShowCookie(true)}
-              className="text-sm font-medium text-court hover:text-courtdark"
-            >
-              Update PHPSESSID →
-            </button>
-          ) : (
-            <CookieRefreshForm
-              onCancel={() => setShowCookie(false)}
-              onError={(msg) => setErrorMsg(msg)}
-            />
-          )}
-        </section>
+        {/* BOT SESSION (read-only) */}
+        <BotSessionPanel state={state} now={now} />
 
         <footer className="mt-20 pt-6 border-t border-line text-xs text-ink3 flex items-center justify-between">
-          <span>Cron runs every 5 min · 4 polls per run · ~60s effective</span>
+          <span>Triggered by cron-job.org via GitHub Actions · 4 polls per run</span>
           <a
-            href="https://crystalsports-booking.kegroup.co.th/booking.php"
+            href={BOOKING_URL}
             target="_blank"
             rel="noopener noreferrer"
             className="hover:text-ink2"
@@ -372,7 +359,7 @@ function TargetRow({
                 key={t}
                 className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amberlight text-amber text-[11px] font-medium rounded tabular"
               >
-                ★ {t} auto-book
+                ★ {t} starred (auto-book paused — notify only)
               </span>
             ))}
           </div>
@@ -380,8 +367,11 @@ function TargetRow({
       </div>
       <div className="flex items-center gap-2 shrink-0">
         {openCount > 0 ? (
-          <span className="px-2.5 py-1 bg-courtlight text-court text-xs font-medium rounded-md tabular">
-            {openCount} Open
+          <span
+            className="px-2.5 py-1 bg-courtlight text-court text-xs font-medium rounded-md tabular"
+            title={`${openCount} watched time slot${openCount === 1 ? "" : "s"} open right now`}
+          >
+            {openCount} {openCount === 1 ? "time" : "times"} open
           </span>
         ) : (
           <span className="px-2.5 py-1 bg-line/40 text-ink3 text-xs font-medium rounded-md">
@@ -610,8 +600,12 @@ function TargetForm({
                         ? "bg-amber text-canvas"
                         : "bg-white text-ink3 border border-line hover:border-line2"
                     }`}
-                    aria-label={starred ? `Disable auto-book for ${t}` : `Enable auto-book for ${t}`}
-                    title={starred ? "Auto-book enabled" : "Auto-book disabled — click to star"}
+                    aria-label={starred ? `Unstar ${t}` : `Star ${t}`}
+                    title={
+                      starred
+                        ? "Starred (auto-book paused — notify only)"
+                        : "Not starred — click to star (auto-book paused — notify only)"
+                    }
                   >
                     {starred ? "★" : "☆"}
                   </span>
@@ -622,7 +616,7 @@ function TargetForm({
           })}
         </div>
         <p className="text-xs text-ink3 mt-2">
-          Click a time to include it · click its star to auto-book that slot to pending payment the moment it opens
+          Click a time to include it · click its star to mark it starred (auto-book paused — starred slots get a normal alert)
         </p>
       </div>
 
@@ -649,83 +643,95 @@ function TargetForm({
   )
 }
 
-function CookieRefreshForm({
-  onCancel,
-  onError,
-}: {
-  onCancel: () => void
-  onError: (msg: string) => void
-}) {
-  const [value, setValue] = useState("")
-  const [submitting, setSubmitting] = useState(false)
-  const [success, setSuccess] = useState(false)
+function BotSessionPanel({ state, now }: { state: State; now: number }) {
+  const alert = state.session_alert
+  const mins = state.last_check ? minutesSince(state.last_check, now) : null
+  const stale = mins === null || mins >= STALE_AFTER_MINUTES
 
-  async function submit() {
-    if (!value.trim()) return
-    setSubmitting(true)
-    try {
-      const r = await fetch("/api/cookie", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ value: value.trim() }),
-      })
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}))
-        throw new Error(j.error || `HTTP ${r.status}`)
-      }
-      setSuccess(true)
-      setTimeout(() => {
-        onCancel()
-      }, 2500)
-    } catch (e: any) {
-      onError(e.message || "Failed to update cookie")
-      setSubmitting(false)
-    }
+  let tone: "ok" | "warn" | "bad"
+  let label: string
+  let detail: string
+  if (alert) {
+    tone = "bad"
+    label = "Needs reseed"
+    detail =
+      `${alert.kind === "lost" ? "Session likely lost (a rotated cookie couldn't be saved)" : "Session expired (login redirect)"}` +
+      ` — detected ${formatBangkok(alert.sent_at)} (${formatTimeAgo(alert.sent_at, now)}).` +
+      " The monitor sends no requests until you reseed."
+  } else if (stale) {
+    tone = "warn"
+    label = "Stale"
+    detail = state.last_check
+      ? `No booking page read since ${formatBangkok(state.last_check)} (${formatTimeAgo(state.last_check, now)}).`
+      : "The monitor hasn't recorded a successful check yet."
+    detail += state.unreadable_since
+      ? ` It hasn't been able to read the booking site since ${formatBangkok(state.unreadable_since)}.`
+      : " Check that cron-job.org is running and the Actions runs are green."
+  } else {
+    tone = "ok"
+    label = "OK"
+    detail = `Last booking page read ${formatTimeAgo(state.last_check as string, now)}.`
   }
 
-  if (success) {
-    return (
-      <div className="bg-courtlight border border-court/30 rounded-xl p-4 text-sm text-court">
-        ✓ PHPSESSID updated. Next monitor run (within 5 min) will use the new value.
-      </div>
-    )
-  }
+  const pill = {
+    ok: "bg-courtlight text-court",
+    warn: "bg-amberlight text-amber",
+    bad: "bg-claylight text-clay",
+  }[tone]
+  const dot = { ok: "bg-court", warn: "bg-amber", bad: "bg-clay" }[tone]
 
   return (
-    <div className="bg-white border border-line rounded-xl p-5 space-y-3">
-      <p className="text-xs text-ink3 leading-relaxed">
-        Log in to the booking site, then DevTools → Application → Cookies → copy the value of <code className="font-mono bg-line/40 px-1 py-0.5 rounded">PHPSESSID</code> and paste below.
-      </p>
-      <input
-        type="text"
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        placeholder="68sj0h1vppr8i7qc2tpg915n5f"
-        className="w-full px-3 py-2 border border-line rounded-md bg-canvas focus:border-court focus:bg-white text-ink placeholder:text-ink3 font-mono text-sm tabular transition-colors"
-        spellCheck={false}
-        autoComplete="off"
-      />
-      <div className="flex items-center justify-end gap-2">
-        <button
-          onClick={onCancel}
-          className="px-4 py-2 text-sm text-ink2 hover:text-ink rounded-md transition-colors"
-        >
-          Cancel
-        </button>
-        <button
-          onClick={submit}
-          disabled={!value.trim() || submitting}
-          className={`px-5 py-2 text-sm font-medium rounded-md transition-colors ${
-            value.trim() && !submitting
-              ? "bg-court text-canvas hover:bg-courtdark"
-              : "bg-line/60 text-ink3 cursor-not-allowed"
-          }`}
-        >
-          {submitting ? "Updating…" : "Update cookie"}
-        </button>
+    <section className="mt-16 pt-8 border-t border-line">
+      <div className="flex items-center gap-3 mb-2">
+        <h2 className="font-display text-xl font-medium tracking-tight">Bot session</h2>
+        <span className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-medium ${pill}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${dot}`} />
+          {label}
+        </span>
       </div>
-    </div>
+      <p className="text-sm text-ink2 leading-relaxed mb-4">
+        The monitor logs in with its own Crystal Sports session, kept encrypted in{" "}
+        <Code>bot_session.enc</Code> (key: the <Code>BOT_JAR_KEY</Code> secret). {detail}
+      </p>
+      <details className="bg-white border border-line rounded-xl px-5 py-4 text-sm text-ink2" open={tone === "bad"}>
+        <summary className="cursor-pointer font-medium text-ink">Reseed steps (on the Mac)</summary>
+        <ol className="mt-3 space-y-2.5 list-decimal pl-5 leading-relaxed">
+          <li>
+            Open an <strong>Incognito</strong> window and log in to the booking site. Don't use your everyday
+            browser session.
+          </li>
+          <li>
+            In <Code>court-checker-live</Code>, delete the old session:{" "}
+            <Code>git pull --rebase &amp;&amp; git rm -q bot_session.enc &amp;&amp; rm -f .bot_session.json.handed-off-*</Code>
+          </li>
+          <li>
+            DevTools → Application → Cookies: copy <Code>cs.did</Code>, then run{" "}
+            <Code>export CS_DID="$(pbpaste)"</Code>; copy <Code>cs.member</Code> <em>last</em>, then run{" "}
+            <Code>export CS_MEMBER="$(pbpaste)"</Code>.
+          </li>
+          <li>Close the Incognito window — don't log out.</li>
+          <li>
+            Seed and check it once: <Code>python3 probe_new_site.py; unset CS_DID CS_MEMBER</Code>
+          </li>
+          <li>
+            <Code>python3 seal_session.py</Code> — encrypts the session and puts a new key on the clipboard.
+          </li>
+          <li>
+            Paste the key into the <Code>BOT_JAR_KEY</Code> secret <strong>before copying anything else</strong>:{" "}
+            <Code>pbpaste | gh secret set BOT_JAR_KEY; pbcopy &lt;/dev/null</Code> (or GitHub → Settings →
+            Secrets and variables → Actions).
+          </li>
+          <li>
+            <Code>git add bot_session.enc &amp;&amp; git commit -m "Reseed bot session" &amp;&amp; git push</Code>
+          </li>
+        </ol>
+      </details>
+    </section>
   )
+}
+
+function Code({ children }: { children: ReactNode }) {
+  return <code className="font-mono text-xs bg-line/40 px-1.5 py-0.5 rounded break-all">{children}</code>
 }
 
 // ============================================================================
@@ -735,6 +741,18 @@ function CookieRefreshForm({
 function minutesSince(iso: string, now: number): number {
   const t = new Date(iso).getTime()
   return Math.floor((now - t) / 60000)
+}
+
+function formatBangkok(iso: string): string {
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return iso
+  return d.toLocaleString("en-GB", {
+    timeZone: "Asia/Bangkok",
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
 }
 
 function formatTimeAgo(iso: string, now: number): string {

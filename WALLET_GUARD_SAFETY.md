@@ -1,5 +1,15 @@
 # Wallet balance guard — safety design & verification
 
+> ## 🗄 Historical document (note added 2026-11-12)
+>
+> This describes the **old** Crystal Sports site's API (`api_helper.php`:
+> `getMemberInfo`, `bookingTransactions`, `walletBalance`) and the auto-book
+> wallet guard built on it. Crystal Sports replaced the site on 2026-11-11.
+> The code described here was **removed from `monitor.py` on 2026-11-12**.
+> Auto-book is paused (`AUTOBOOK_ENABLED = False`) until it is rebuilt for the
+> new site. This file is kept unchanged below as history. Nothing in it applies
+> to the current code.
+
 > ## ⚠ DISABLED as of 2026-10-07 — read this before restoring it
 >
 > `wallet_is_safe_to_book()` / `get_wallet_balance()` are **no longer called
