@@ -1,12 +1,7 @@
 {
-  "known_open": {
-    "2026-11-12|LOC001|North-2|23:00": true,
-    "2026-11-12|LOC001|North-3|23:00": true,
-    "2026-11-12|LOC001|Center-1|23:00": true
-  },
-  "last_check": "2026-11-12T20:33:38.750253+07:00",
+  "known_open": {},
+  "last_check": "2026-11-12T22:46:42.271521+07:00",
   "currently_open_count": 0,
-  "last_session_alert": 1794330325.6324685,
   "autobook_attempts": {
     "2026-11-12|LOC002|G South-1|22:00": {
       "outcome": "parked",
