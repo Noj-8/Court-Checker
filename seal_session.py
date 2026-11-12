@@ -25,63 +25,63 @@ from pathlib import Path
 import requests
 from cryptography.fernet import Fernet
 
-import probe_new_site as probe
+import bot_session as bs
 
 
 def pbcopy(data):
     subprocess.run(["pbcopy"], input=data, check=True)
 
 
-def seal(jar_path=probe.JAR_FILE, enc_path=probe.ENC_FILE, clipboard=pbcopy):
+def seal(jar_path=bs.JAR_FILE, enc_path=bs.ENC_FILE, clipboard=pbcopy):
     jar_path, enc_path = Path(jar_path), Path(enc_path)
-    say = probe.say
+    say = bs.say
 
     if enc_path.exists():
         say(f"ERROR: {enc_path.name} already exists — a session may already be handed off to Actions.")
         say("Nothing changed. To replace it on purpose, delete it yourself first (git rm), then rerun.")
         return 1
     if not jar_path.exists():
-        handed = probe.handed_off_files(jar_path)
+        handed = bs.handed_off_files(jar_path)
         say(f"ERROR: no {jar_path.name} to seal"
             + (f" — already handed off ({handed[-1].name})." if handed else "."))
         return 1
 
     session = requests.Session()
     try:
-        probe.load_jar(jar_path, session)
-    except probe.JarError as e:
+        bs.load_jar(jar_path, session)
+    except bs.JarError as e:
         say(f"ERROR: couldn't read {jar_path.name} ({e}). Nothing changed.")
         return 1
-    values, dupes = probe.cookie_values(session)
-    missing = [n for n in probe.SEED_ENV if n not in probe.OPTIONAL_SEED and n not in values]
+    values, dupes = bs.cookie_values(session)
+    missing = [n for n in bs.SEED_ENV if n not in bs.OPTIONAL_SEED and n not in values]
     if missing or dupes:
         say(f"ERROR: {jar_path.name} isn't a usable session (missing: {', '.join(missing) or 'none'}; "
             f"duplicated: {', '.join(sorted(dupes)) or 'none'}). Nothing changed.")
         return 1
 
     key = Fernet.generate_key()
-    probe.remember_secret(key.decode("ascii"))
+    bs.remember_secret(key.decode("ascii"))
     fernet = Fernet(key)
     try:
-        probe.save_jar(enc_path, session, fernet)
+        bs.save_jar(enc_path, session, fernet)
         check = requests.Session()
-        probe.load_jar(enc_path, check, fernet)
-        if probe.jar_records(check) != probe.jar_records(session):
-            raise probe.JarError("decrypted copy doesn't match the plaintext jar")
+        bs.load_jar(enc_path, check, fernet)
+        if bs.jar_records(check) != bs.jar_records(session):
+            raise bs.JarError("decrypted copy doesn't match the plaintext jar")
         clipboard(key)
-    except (OSError, probe.JarError, subprocess.CalledProcessError) as e:
+    except (OSError, bs.JarError, subprocess.CalledProcessError) as e:
         enc_path.unlink(missing_ok=True)  # useless without the key we failed to hand over
         say(f"ERROR: {type(e).__name__}: {e}. Removed {enc_path.name}; {jar_path.name} left as it was.")
         return 1
 
     handed = jar_path.with_name(
-        f"{jar_path.name}.handed-off-{datetime.now(probe.TZ).strftime('%Y%m%d-%H%M%S')}")
+        f"{jar_path.name}.handed-off-{datetime.now(bs.TZ).strftime('%Y%m%d-%H%M%S')}")
     os.replace(jar_path, handed)
 
     say(f"Sealed {len(values)} cookie(s) into {enc_path.name} (values never printed):")
     for name in sorted(values):
-        say(f"  {name} {probe.fingerprint(values[name])}")
-    say(f"  {probe.JAR_KEY_ENV} {probe.fingerprint(key.decode('ascii'))} — on the clipboard, not shown.")
+        say(f"  {name} {bs.fingerprint(values[name])}")
+    say(f"  {bs.JAR_KEY_ENV} {bs.fingerprint(key.decode('ascii'))} — on the clipboard, not shown.")
     say("  The Actions log prints the same fingerprint, so you can check the secret was pasted intact.")
     say(f"  {enc_path.name}: {enc_path.stat().st_size} bytes of ciphertext.")
     say(f"Renamed {jar_path.name} -> {handed.name}; the Mac probe now refuses to run on it.")

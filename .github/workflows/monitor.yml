@@ -6,9 +6,10 @@ on:
   workflow_dispatch:           # allow manual trigger from Actions tab
 
 permissions:
-  contents: write              # so the workflow can commit state.json back
+  contents: write              # to commit state.json and the rotated bot_session.enc back
 
-# Only one run at a time — prevents overlap if a check takes longer than the cron interval
+# One holder of the bot session at a time: probe.yml uses this same group,
+# so the monitor and the probe can never present the session concurrently.
 concurrency:
   group: tennis-monitor
   cancel-in-progress: false
@@ -19,43 +20,84 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          # The branch tip at checkout time, not the SHA the run was queued
+          # at — a run queued behind another must see its rotated jar.
+          ref: main
+          fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt "cryptography>=42"
 
       - name: Run monitor
         env:
-          PHPSESSID: ${{ secrets.PHPSESSID }}
+          BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
-          MEMBER_MOBILE: ${{ secrets.MEMBER_MOBILE }}  # optional — unset secret evaluates to "", monitor.py handles that (guard_abort, notify-only path unaffected)
           LOOP_ITERATIONS: '4'         # 4 polls per run
           LOOP_INTERVAL_SECONDS: '60'  # 60s between polls = ~60s effective polling
-        run: python monitor.py
-
-      - name: Commit state if changed
         run: |
-          if git diff --quiet state.json; then
-            echo "No state changes — skipping commit."
+          if [ -z "$BOT_JAR_KEY" ]; then
+            echo "::error::BOT_JAR_KEY secret is not set."
+            exit 1
+          fi
+          python monitor.py
+
+      - name: Commit state and bot session
+        id: save
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain -- state.json bot_session.enc)" ]; then
+            echo "No state or session changes — skipping commit."
+            exit 0
+          fi
+          jar_changed=false
+          if [ -n "$(git status --porcelain -- bot_session.enc)" ]; then jar_changed=true; fi
+          git config user.name "tennis-monitor[bot]"
+          git config user.email "tennis-monitor@users.noreply.github.com"
+          git add state.json bot_session.enc
+          git commit -q -m "Update state [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push -q origin HEAD:main; then
+              echo "Pushed (attempt $attempt)."
+              exit 0
+            fi
+            [ "$attempt" -eq 5 ] && break
+            echo "Push attempt $attempt failed; rebasing onto origin/main."
+            if ! git pull -q --rebase origin main; then
+              git rebase --abort || true
+              echo "Rebase conflict — something else changed state.json or bot_session.enc."
+              break
+            fi
+            sleep $((attempt * 2))
+          done
+          if [ "$jar_changed" = true ]; then
+            echo "session_lost=true" >> "$GITHUB_OUTPUT"
+            echo "::error title=Bot session likely lost::A cookie rotated during this run but bot_session.enc could not be pushed. The copy in the repo is now superseded and presenting it kills the session — reseed needed (see the email)."
           else
-            git config user.name "tennis-monitor[bot]"
-            git config user.email "tennis-monitor@users.noreply.github.com"
-            git add state.json
-            git commit -m "Update state [skip ci]"
-            # Push, retrying with rebase if something else committed concurrently.
-            # state.json doesn't conflict with config.json edits, so rebase is safe.
-            for i in 1 2 3; do
-              if git push; then
-                break
-              fi
-              echo "Push rejected (try $i/3) — pulling and retrying..."
-              git pull --rebase origin main
-            done
+            echo "::error::state.json could not be pushed (the bot session was unchanged, so it is fine)."
+          fi
+          exit 1
+
+      - name: Email if the bot session was lost
+        if: always() && steps.save.outputs.session_lost == 'true'
+        env:
+          BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python monitor.py --alert-session-lost "bot_session.enc could not be pushed after a cookie rotated"
+
+      - name: Check no plaintext jar on the runner
+        if: always()
+        run: |
+          if ls -A | grep -q '^\.bot_session\.json'; then
+            echo "::error::A plaintext .bot_session.json* file exists on the runner — this should never happen."
+            exit 1
           fi

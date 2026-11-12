@@ -1,87 +1,100 @@
 #!/usr/bin/env python3
 """
-Crystal Sports Tennis Court Monitor — Cloud edition.
+Crystal Sports Tennis Court Monitor — cloud edition, rebuilt for the new
+booking site (live since 2026-11-11; the old api_helper.php API is gone).
 
-Runs N check passes (default 4) with M-second sleeps between them (default 60),
-then exits. Designed for GitHub Actions cron at */5 minutes — the inner loop
-provides effective 60-second polling within each scheduled run.
+NOTIFY-ONLY: AUTOBOOK_ENABLED is False until auto-book is rebuilt for the
+new site (stage 3). Starred slots get the normal "slot open" email plus a
+note to book manually. The monitor never sends a POST.
 
-  Reads config from:    config.json
-  Reads secrets from:   PHPSESSID, EMAIL_USER, EMAIL_APP_PASSWORD env vars
-  Reads loop tuning:    LOOP_ITERATIONS, LOOP_INTERVAL_SECONDS env vars (optional)
-  Reads:                MEMBER_MOBILE env var (optional — required only for
-                         auto-booking starred slots; unset means starred
-                         slots fail closed immediately ("failed" outcome,
-                         no booking call made), notify-only path
-                         is unaffected)
-  Reads/writes state:   state.json
+Runs N check passes (LOOP_ITERATIONS, default 4), LOOP_INTERVAL_SECONDS
+apart (default 60), then exits. Designed for GitHub Actions cron */5.
+
+  Reads config:   config.json — unchanged schema: targets[{name, date,
+                  locations, times[{time, autoBook}]}], optional email_to.
+  Secrets (env):  BOT_JAR_KEY (decrypts bot_session.enc, the bot's own login
+                  session — see bot_session.py), EMAIL_USER,
+                  EMAIL_APP_PASSWORD.
+  Reads/writes:   state.json, bot_session.enc (rewritten after every
+                  response that changes a cookie).
+  Availability:   GET /booking?date=YYYY-MM-DD&loc=LOC00x&time=0&sel= per
+                  (date, location), strictly sequential, through
+                  bot_session.fetch(). Grid first: if slot links are
+                  parsed they decide (the court map's is-locked never
+                  matters); a slot is open iff it lacks "is-disabled" and
+                  its free count isn't 0. No slots + an opens-at marker
+                  ("opens 21:00") = "not open yet"; no slots and no marker
+                  = unexpected page: logged, skipped, no emails, not a
+                  session failure.
+  State:          known_open["date|loc|any|HH:MM"] dedupes "slot open"
+                  emails exactly as before (the grid has no per-court
+                  detail, so the court part of the key is "any").
+                  session_alert dedupes the session email: sent once per
+                  dead jar, cleared by the next successful check.
+  Exit code:      0  ok
+                  1  setup error (missing env var, no/unreadable jar)
+                  3  bot session expired (login redirect) — the run that
+                     detects it. Later runs on the same dead jar send
+                     nothing and exit 0 (the dashboard shows "stale").
+                  4  a rotated cookie couldn't be saved — session likely lost
+
+  python monitor.py --alert-session-lost "REASON"
+                  sends the "session likely lost" email (used by
+                  monitor.yml when bot_session.enc couldn't be pushed) and
+                  exits 4.
 """
 
+import argparse
 import json
 import os
 import smtplib
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import requests
+
+import bot_session
+from bot_session import BASE, BOOKING_PATH, TZ
+from booking_page import parse_page, slot_time
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
 STATE_FILE = ROOT / "state.json"
 
-API_URL = (
-    "https://crystalsports-booking.kegroup.co.th"
-    "/api_helper.php?action=getAvailableStadiums"
-)
-MEMBER_INFO_URL = (
-    "https://crystalsports-booking.kegroup.co.th"
-    "/api_helper.php?action=getMemberInfo"
-)
-BOOKING_TX_URL = (
-    "https://crystalsports-booking.kegroup.co.th"
-    "/api_helper.php?action=bookingTransactions"
-)
-BOOKING_URL = "https://crystalsports-booking.kegroup.co.th/booking.php"
-SAFE_WALLET_BALANCE = "0.00"
-# Two confirmed-distinct statusCodes from real production traffic — see
-# WALLET_GUARD_SAFETY.md for the exact observed examples and dates.
-# "10": confirmed since the original spec (HAR-captured) — "Insufficient
-#       fund" response, slot parked into pending payment.
-# "00": confirmed 2026-10-09 and 2026-10-10 — message "Success", a real
-#       booking actually went through. Missing this cost two real
-#       bookings being misreported as FAILED before it was caught.
-PARKED_STATUS_CODE = "10"
-PAID_STATUS_CODE = "00"
-KNOWN_SUCCESS_STATUS_CODES = (PARKED_STATUS_CODE, PAID_STATUS_CODE)  # anything else is FAILED — never widen this to "not an explicit error"
-BOOKED_STATUS = "1"
-TZ = ZoneInfo("Asia/Bangkok")
+# Stage 3 rebuilds auto-book for the new site. Until then there is no
+# booking code at all: this constant only selects the note in the email,
+# and the monitor refuses to start if it's flipped without that code.
+AUTOBOOK_ENABLED = False
+AUTOBOOK_PAUSED_NOTE = "Auto-book is paused while it's rebuilt for the new site — book manually."
+
+BOOKING_URL = BASE + BOOKING_PATH
+ANY_COURT = "any"  # the court part of a known_open key — the grid is per time, not per court
 
 LOCATIONS = {
     "LOC001": "Crystal Sports",
     "LOC002": "Crystal Sports G",
 }
 
-HEADERS = {
-    "accept": "*/*",
-    "content-type": "application/json; charset=UTF-8",
-    "origin": "https://crystalsports-booking.kegroup.co.th",
-    "referer": BOOKING_URL,
-    "x-requested-with": "XMLHttpRequest",
-    "user-agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-    ),
-}
+EXIT_OK, EXIT_SETUP, EXIT_SESSION, EXIT_JAR = 0, 1, 3, 4
+
+RESEED_STEPS = """To reseed (on the Mac, in court-checker-live):
+  1. Open an Incognito window, log in to {base}, copy cs.did then
+     cs.member (last). Close the window WITHOUT logging out.
+  2. rm -f .bot_session.json.handed-off-*  &&  git pull --rebase  &&  git rm -q bot_session.enc
+  3. export CS_DID="$(pbpaste)"; export CS_MEMBER="$(pbpaste)"   (copy each first)
+     python3 probe_new_site.py; unset CS_DID CS_MEMBER
+  4. python3 seal_session.py            (new key goes to the clipboard)
+  5. Update the BOT_JAR_KEY secret:  pbpaste | gh secret set BOT_JAR_KEY; pbcopy </dev/null
+     (or GitHub → Settings → Secrets and variables → Actions → BOT_JAR_KEY)
+  6. git add bot_session.enc && git commit -m "Reseed bot session" && git push
+The next scheduled run picks it up.""".format(base=BASE)
 
 
 def log(msg):
-    print(f"[{datetime.now(TZ):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+    bot_session.say(f"[{datetime.now(TZ):%Y-%m-%d %H:%M:%S}] {msg}")
 
 
 def normalize_times(times):
@@ -101,7 +114,7 @@ def normalize_times(times):
 def load_config():
     if not CONFIG_FILE.exists():
         log(f"ERROR: {CONFIG_FILE.name} not found")
-        sys.exit(1)
+        sys.exit(EXIT_SETUP)
     config = json.loads(CONFIG_FILE.read_text())
     for target in config.get("targets", []):
         target["times"] = normalize_times(target["times"])
@@ -121,400 +134,6 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def fetch_slots(date, loc_id, phpsessid):
-    try:
-        resp = requests.post(
-            API_URL,
-            headers=HEADERS,
-            cookies={"PHPSESSID": phpsessid},
-            json={"date": date, "locId": loc_id},
-            timeout=20,
-        )
-    except requests.RequestException as e:
-        return None, f"network: {e}"
-    if resp.status_code != 200:
-        return None, f"http {resp.status_code}"
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        return None, "session_expired"
-    if not isinstance(data, list):
-        return None, "session_expired"
-    return data, None
-
-
-def get_wallet_balance(member_mobile, phpsessid):
-    """DEAD CODE as of 2026-10-07 — no longer called anywhere in the
-    starred-slot auto-book path. Kept intentionally, not deleted, in case
-    an opt-in version of the guard is ever reintroduced. See the dated
-    note at the top of WALLET_GUARD_SAFETY.md before "fixing" this back
-    into attempt_autobook() — its removal was a deliberate owner decision,
-    not a bug.
-
-    Fetch the member's current wallet balance via getMemberInfo.
-
-    Mirrors fetch_slots()'s shape exactly: same request pattern, same
-    (value, err) return contract. err is None only when `value` is a
-    validated, trustworthy balance string — every other outcome (network
-    failure, bad status, unparseable body, wrong shape, missing/null/blank
-    field) returns (None, reason). Never raises: any unanticipated
-    exception is itself treated as a failed read, not a crash, so a caller
-    that only checks "was err set" can never be fooled into treating a
-    freak error as a clean result.
-
-    See WALLET_GUARD_SAFETY.md for the full failure-mode test matrix this
-    contract was verified against, and why every branch below fails closed
-    on purpose — do not "simplify" this without reading that first.
-    """
-    if not member_mobile:
-        return None, "missing member_mobile"
-    try:
-        resp = requests.post(
-            MEMBER_INFO_URL,
-            headers=HEADERS,
-            cookies={"PHPSESSID": phpsessid},
-            json={"memberMobile": member_mobile},
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            return None, f"http {resp.status_code}"
-        try:
-            data = resp.json()
-        except json.JSONDecodeError:
-            return None, "session_expired"
-        if not isinstance(data, dict):
-            return None, "session_expired"
-        balance = data.get("walletBalance")
-        if not isinstance(balance, str) or not balance.strip():
-            return None, f"missing/invalid walletBalance in response: {balance!r}"
-        return balance, None
-    except requests.RequestException as e:
-        return None, f"network: {e}"
-    except Exception as e:
-        return None, f"unexpected: {e}"
-
-
-def wallet_is_safe_to_book(member_mobile, phpsessid):
-    """DEAD CODE as of 2026-10-07 — no longer called anywhere in the
-    starred-slot auto-book path. Kept intentionally, not deleted. See the
-    dated note at the top of WALLET_GUARD_SAFETY.md before restoring this
-    call — its removal was a deliberate owner decision, not a bug.
-
-    The Section 6 safety guard. Must be called fresh, immediately before
-    every bookingTransactions attempt — never cached, never skipped.
-
-    Returns (is_safe, reason). is_safe is True only when the balance was
-    read successfully AND is exactly "0.00" — in which case reason is
-    None. Any failure or ambiguity from get_wallet_balance(), or any
-    balance value other than an exact "0.00" match, returns
-    (False, reason) with a human-readable, case-specific explanation —
-    silence or uncertainty is never interpreted as safe to proceed, and
-    callers are never left having to guess which failure occurred (Stage 5
-    uses this to give the guard-abort email accurate text instead of
-    assuming "balance was not zero" when the real cause might have been a
-    failed read that never confirmed the balance either way).
-
-    See WALLET_GUARD_SAFETY.md for the full test matrix.
-    """
-    balance, err = get_wallet_balance(member_mobile, phpsessid)
-    if err:
-        reason = f"could not read wallet balance ({err})"
-        log(f"      ⚠ wallet balance check failed ({err}) — treating as unsafe, will not auto-book")
-        return False, reason
-    if balance != SAFE_WALLET_BALANCE:
-        reason = f"wallet balance is {balance!r}, not exactly \"{SAFE_WALLET_BALANCE}\""
-        log(f"      ⚠ wallet balance is {balance!r}, not exactly \"{SAFE_WALLET_BALANCE}\" — treating as unsafe, will not auto-book")
-        return False, reason
-    return True, None
-
-
-def book_slot(member_mobile, phpsessid, stadiumtime_id, booking_date, amount):
-    """Fire the bookingTransactions call (spec Section 3A) that parks a slot
-    into pending payment. Only ever call this after wallet_is_safe_to_book()
-    has confirmed a fresh zero balance — this function does not check that
-    itself, callers must.
-
-    Mirrors get_wallet_balance()'s shape: (data, err), err is None only for
-    a well-formed JSON dict response. That does NOT mean the booking
-    succeeded — it only means the call completed and can be interpreted.
-    statusCode interpretation happens in the caller (attempt_autobook), the
-    same way find_open_slots() does interpretation on top of fetch_slots()'s
-    raw validated data. Uses the same blanket except-Exception fail-closed
-    shape as get_wallet_balance(), for the same reason: this is a
-    money-adjacent call, so an uncaught exception must never propagate past
-    this boundary into an ambiguous state.
-    """
-    try:
-        resp = requests.post(
-            BOOKING_TX_URL,
-            headers=HEADERS,
-            cookies={"PHPSESSID": phpsessid},
-            json={
-                "customer": member_mobile,
-                "createdBy": member_mobile,
-                "paymentType": "WALLET",
-                "transaction": [
-                    {
-                        "transactionCode": "COURT",
-                        "coachMemberId": 0,
-                        "stadiumtimeId": stadiumtime_id,
-                        "bookingDate": booking_date,
-                        "amount": amount,
-                    }
-                ],
-            },
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            return None, f"http {resp.status_code}"
-        try:
-            data = resp.json()
-        except json.JSONDecodeError:
-            return None, "session_expired"
-        if not isinstance(data, dict):
-            return None, "session_expired"
-        return data, None
-    except requests.RequestException as e:
-        return None, f"network: {e}"
-    except Exception as e:
-        return None, f"unexpected: {e}"
-
-
-def format_amount(raw_price):
-    """Normalize a stadiumtimePrice value (e.g. "500.0000", as returned by
-    getAvailableStadiums) to the 2-decimal string format bookingTransactions
-    expects (e.g. "500.00"), matching the confirmed HAR-captured contract.
-    Returns None if the value can't be parsed as a valid amount — this feeds
-    a money-moving call, so an unparseable price must abort, never guess."""
-    try:
-        return str(Decimal(str(raw_price)).quantize(Decimal("0.01")))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-
-
-PLACEHOLDER_PAYMENT_REFS = {"0", "-", "n/a", "na", "none", "null", "-1"}
-
-
-def _looks_like_real_payment_ref(payment_ref):
-    """A non-empty string alone isn't enough proof of a real payment — a
-    placeholder value (e.g. "0", "-", "N/A") on an otherwise-parked
-    response would pass that check and misclassify it as PAID. This
-    narrows it to "non-empty AND not a known placeholder." Still a
-    heuristic, not a verified contract — we have zero confirmed examples
-    of what a real paymentRef looks like either — but excluding obvious
-    placeholders is strictly safer than accepting any non-empty string.
-    """
-    if not isinstance(payment_ref, str):
-        return False
-    cleaned = payment_ref.strip()
-    if not cleaned:
-        return False
-    return cleaned.lower() not in PLACEHOLDER_PAYMENT_REFS
-
-
-def classify_paid_or_parked(status_code, api_message, payment_ref):
-    """Classify a bookingTransactions response that already came back
-    with statusCode in KNOWN_SUCCESS_STATUS_CODES into "paid" or "parked".
-
-    As of 2026-10-11: statusCode is now the PRIMARY signal, not a
-    message/paymentRef guess — we have two confirmed-distinct codes from
-    real production traffic. "10" has repeatedly meant parked/
-    insufficient-fund since the original spec; "00" was confirmed paid
-    twice on 2026-10-09 and 2026-10-10 (message "Success" both times).
-    Before this, classification ran primarily off the message text, which
-    is how two real "00"/"Success" paid bookings got misclassified as
-    FAILED entirely (statusCode "00" didn't match the old single known-
-    good code "10" at all) — see WALLET_GUARD_SAFETY.md.
-
-    The old message/paymentRef heuristic still runs, but only as a
-    secondary sanity check now: if it disagrees with what statusCode
-    says, that's returned as a mismatch warning (surfaced in the outcome
-    record and the email) rather than silently overriding the
-    statusCode-based classification or being thrown away. statusCode is
-    the stronger, now-twice-confirmed signal; a mismatch is still worth a
-    human's attention, not grounds to override it.
-
-    api_message is coerced to str before any text check — the API's
-    message field is unconfirmed shape, and a non-string truthy value
-    must never crash this function: it runs AFTER book_slot() has already
-    fired the real HTTP call, so an uncaught exception here would skip
-    the autobook_attempts write entirely (and, via main()'s per-iteration
-    try/except, skip save_state() for the whole pass) — leaving a slot
-    that was genuinely just booked for real looking unattempted on the
-    next poll. That's the exact double-booking failure mode the original
-    wallet guard existed to prevent, reintroduced through a different
-    door — this function must not raise, period, and must not raise on
-    an unrecognized status_code either (defaults to "parked", the
-    conservative choice, rather than raising on a contract violation from
-    its own caller).
-
-    Returns (outcome, mismatch_warning_or_None).
-    """
-    if status_code == PAID_STATUS_CODE:
-        outcome = "paid"
-    else:
-        outcome = "parked"  # PARKED_STATUS_CODE, or defensively anything else
-
-    message_lower = str(api_message or "").lower()
-    heuristic_says_parked = "insufficient" in message_lower
-    heuristic_says_paid = _looks_like_real_payment_ref(payment_ref) and not heuristic_says_parked
-
-    mismatch = None
-    if outcome == "paid" and heuristic_says_parked:
-        # outcome == "paid" only ever happens when status_code ==
-        # PAID_STATUS_CODE exactly (no defensive fallback leads here), but
-        # using the actual status_code rather than the constant is still
-        # strictly safer than assuming that invariant holds forever.
-        mismatch = (
-            f"statusCode {status_code!r} (treated as paid) but the message mentions "
-            "insufficient funds — worth a second look"
-        )
-    elif outcome == "parked" and heuristic_says_paid:
-        # outcome == "parked" is reached BOTH for the real confirmed "10"
-        # case AND the defensive fallback for an unrecognized status_code
-        # (see the if/else above) — the message must say which actually
-        # happened, not hardcode "10" regardless. A bug exactly like this
-        # (hardcoding a constant instead of the real value in user-facing
-        # text) is the same class of mistake this whole file exists to
-        # avoid in the booking response itself.
-        confirmed = status_code == PARKED_STATUS_CODE
-        basis = "confirmed parked" if confirmed else "not a recognized success code, defaulted to parked"
-        mismatch = (
-            f"statusCode {status_code!r} ({basis}) but paymentRef {payment_ref!r} "
-            "looks real and the message doesn't mention insufficient funds — worth a second look"
-        )
-
-    return outcome, mismatch
-
-
-def attempt_autobook(k, target, slot, autobook_attempts, member_mobile, phpsessid):
-    """The auto-book decision-and-record logic for one starred slot that
-    just opened. Always writes an outcome into autobook_attempts[k] before
-    returning — including on every abort path — so the caller's "already
-    attempted" check (in run_check_pass) is guaranteed to see this slot on
-    the next poll regardless of outcome.
-
-    As of 2026-10-07, the wallet-balance pre-check guard has been removed
-    from this path by deliberate owner decision — see the dated note at
-    the top of WALLET_GUARD_SAFETY.md before reintroducing it. Starred
-    slots go straight to book_slot() every time, unconditionally.
-
-    Call order: (1) re-check not already attempted — belt-and-suspenders
-    on top of the caller's own check; (2) confirm MEMBER_MOBILE is
-    configured — hard stop ("failed") if not, since book_slot() needs it
-    for customer/createdBy and a blank value should never silently reach
-    the real API; (3) parse/validate the amount — hard stop on failure,
-    before any booking call; (4) book_slot() — the actual
-    bookingTransactions call, no guard in front of it; (5) interpret the
-    response into exactly one of three outcomes: "failed" for anything
-    other than a statusCode in KNOWN_SUCCESS_STATUS_CODES ("10" or "00" —
-    see WALLET_GUARD_SAFETY.md for how both were confirmed), a network/
-    malformed-response error, or an exception during the call; "parked"
-    or "paid" for a confirmed-success statusCode, distinguished by
-    classify_paid_or_parked().
-    """
-    if k in autobook_attempts:
-        log(f"      ⚠ {k} already has a recorded auto-book attempt ({autobook_attempts[k].get('outcome')}) — this should have been filtered before calling attempt_autobook; not re-attempting")
-        return autobook_attempts[k]
-
-    attempted_at = datetime.now(TZ).isoformat()
-
-    if not member_mobile:
-        log(f"      ⛔ auto-book aborted for {k}: MEMBER_MOBILE not configured, no booking call made")
-        autobook_attempts[k] = {
-            "outcome": "failed",
-            "statusCode": None,
-            "bookingRef": None,
-            "message": "MEMBER_MOBILE not configured",
-            "attempted_at": attempted_at,
-        }
-        return autobook_attempts[k]
-
-    amount = format_amount(slot.get("stadiumtimePrice"))
-    if amount is None:
-        log(f"      ⛔ auto-book aborted for {k}: could not parse a valid amount from stadiumtimePrice={slot.get('stadiumtimePrice')!r}, no booking call made")
-        autobook_attempts[k] = {
-            "outcome": "failed",
-            "statusCode": None,
-            "bookingRef": None,
-            "message": "could not determine a valid price for this slot",
-            "attempted_at": attempted_at,
-        }
-        return autobook_attempts[k]
-
-    log(f"      → attempting auto-book for {k} (amount {amount}) — no wallet guard, booking fires unconditionally")
-    data, err = book_slot(member_mobile, phpsessid, slot["stadiumtimeId"], target["date"], amount)
-
-    if err:
-        log(f"      ⛔ auto-book call failed for {k}: {err}")
-        autobook_attempts[k] = {
-            "outcome": "failed",
-            "statusCode": None,
-            "bookingRef": None,
-            "message": err,
-            "attempted_at": attempted_at,
-        }
-        return autobook_attempts[k]
-
-    status_code = data.get("statusCode")
-    booking_ref = data.get("bookingRef")
-    api_message = data.get("message")
-
-    if status_code not in KNOWN_SUCCESS_STATUS_CODES:
-        # Anything other than a confirmed success code is a failure —
-        # including a status code we've never seen before. No assumption
-        # that "not an explicit error" means success. Only "10" and "00"
-        # get success treatment — see KNOWN_SUCCESS_STATUS_CODES.
-        log(f"      ⛔ auto-book returned unexpected statusCode={status_code!r} for {k} (message={api_message!r}) — treating as failed")
-        autobook_attempts[k] = {
-            "outcome": "failed",
-            "statusCode": status_code,
-            "bookingRef": booking_ref,
-            "message": f"booking system returned an unexpected response (statusCode={status_code!r}: {api_message!r})",
-            "attempted_at": attempted_at,
-        }
-        return autobook_attempts[k]
-
-    outcome_kind, classification_warning = classify_paid_or_parked(status_code, api_message, data.get("paymentRef"))
-    if outcome_kind == "paid":
-        log(f"      💰 auto-book PAID for {k}: bookingRef={booking_ref!r}, message={api_message!r}")
-    else:
-        log(f"      ✅ auto-book parked into pending payment for {k}: bookingRef={booking_ref!r}")
-    if classification_warning:
-        log(f"      ⚠ classification mismatch for {k}: {classification_warning}")
-
-    autobook_attempts[k] = {
-        "outcome": outcome_kind,
-        "statusCode": status_code,
-        "bookingRef": booking_ref,
-        "message": api_message,
-        "classification_warning": classification_warning,
-        "attempted_at": attempted_at,
-    }
-    return autobook_attempts[k]
-
-
-def autobook_failure_reason(outcome):
-    """Human-readable explanation for the failure email. attempt_autobook()
-    composes a specific, cause-matching message directly into
-    outcome["message"] at record time (missing MEMBER_MOBILE, an
-    unparseable price, a network/malformed-response error, an exception
-    during the call, or an unexpected statusCode) — this just surfaces it,
-    with a fallback for the case where message is somehow empty.
-    """
-    return outcome.get("message") or "auto-book failed for an unrecognized reason — needs investigation"
-
-
-def find_open_slots(slots, target, loc_id):
-    times = {t["time"] for t in target["times"]}
-    return [
-        s for s in slots
-        if s.get("locId") == loc_id
-        and s.get("timeName") in times
-        and str(s.get("reservestatus")) != BOOKED_STATUS
-    ]
-
-
 def send_email(subject, body, smtp_user, smtp_pass, to_addr):
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -531,325 +150,263 @@ def slot_key(date, loc_id, court, time_name):
     return f"{date}|{loc_id}|{court}|{time_name}"
 
 
-def run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pass, email_to):
-    """Performs one full check. Mutates `state` in place."""
-    today_str = datetime.now(TZ).date().isoformat()
+def booking_link(date, loc_id):
+    return f"{BOOKING_URL}?date={date}&loc={loc_id}"
 
-    targets = config.get("targets", [])
-    active = [t for t in targets if t["date"] >= today_str]
+
+def fetch_availability(jar, date, loc_id):
+    """One GET of the booking grid. Returns (kind, open_times, info):
+      "ok"            open_times = {"HH:MM": free count or None}
+      "not_open_yet"  open_times = {}; info = opening time if shown
+      "login"         the session is no longer valid — caller must stop
+      "error"         open_times = None; info = reason (network, http, no grid)
+    Raises bot_session.JarSaveError if a response couldn't be persisted."""
+    params = {"date": date, "loc": loc_id, "time": "0", "sel": ""}
+    try:
+        fetched = bot_session.fetch(jar, BOOKING_PATH, params)
+    except requests.RequestException as e:
+        return "error", None, f"network: {e}"
+    resp = fetched.resp
+    if fetched.login:
+        return "login", None, resp.headers.get("Location", "")
+    if resp.status_code != 200:
+        return "error", None, f"http {resp.status_code}"
+    body = resp.text or ""
+    page = parse_page(body)
+    if not page["slots"]:
+        if 'type="password"' in body.lower():
+            # A login form served as a 200 instead of the usual redirect.
+            return "login", None, "login form (200)"
+        if page["not_open_yet"]:
+            return "not_open_yet", {}, page["opens_at"]
+        return "error", None, (f"unexpected page — no slot grid and no opens-at marker "
+                               f"({len(body)} bytes, title {page['title']!r}); skipped")
+    open_times = {}
+    for s in page["slots"]:
+        t = slot_time(s["time"])
+        if t and s["available"] and s["free"] != 0:
+            open_times[t] = s["free"]
+    return "ok", open_times, None
+
+
+def session_alert_email(kind, detail):
+    if kind == "lost":
+        subject = "🔴 Bot session likely lost — reseed needed"
+        lead = ("A cookie rotated but the bot couldn't save it"
+                + (f" ({detail})" if detail else "")
+                + ", so its session is likely lost: the copy it holds is superseded, and the\n"
+                  "site rejects superseded cookies.")
+    else:
+        subject = "🔴 Bot session expired — reseed needed"
+        lead = "The booking site sent the bot to its login page, so its session is no longer valid."
+    body = (f"{lead}\n\nCourt availability checks are stopped until you reseed — no more emails\n"
+            f"about this until then.\n\n{RESEED_STEPS}\n")
+    return subject, body
+
+
+def alert_session(state, kind, detail, jar_fp, email):
+    """Send the session email once per dead jar: not again while the same
+    jar file is on disk. Recorded only if the send succeeds, so a failed
+    send is retried next run."""
+    prev = state.get("session_alert")
+    if prev and prev.get("jar_sha256") == jar_fp:
+        log(f"  session email already sent at {prev.get('sent_at')} for this jar — not resending")
+        return
+    subject, body = session_alert_email(kind, detail)
+    try:
+        send_email(subject, body, *email)
+    except Exception as e:
+        log(f"⚠ session email failed: {e}")
+        return
+    state["session_alert"] = {"kind": kind, "sent_at": datetime.now(TZ).isoformat(), "jar_sha256": jar_fp}
+    log("✉ session email sent")
+
+
+def format_free(free):
+    return "free count not shown" if free is None else f"{free} free"
+
+
+def run_check_pass(state, config, jar, email):
+    """One full check. Mutates `state` in place. Returns "ok", or "login" if
+    the session is no longer valid (stopped at that request, nothing else
+    sent). Raises bot_session.JarSaveError if a response couldn't be saved."""
+    today_str = datetime.now(TZ).date().isoformat()
+    active = [t for t in config.get("targets", []) if t["date"] >= today_str]
     if not active:
         log("  no active (future) targets — nothing to check")
-        return
+        return "ok"
 
-    fetch_keys = set()
-    for t in active:
-        for loc in t["locations"]:
-            fetch_keys.add((t["date"], loc))
+    fetch_keys = sorted({(t["date"], loc) for t in active for loc in t["locations"]})
+    cache = {}  # (date, loc) -> {"HH:MM": free}; only for pages that were read successfully
+    for date, loc in fetch_keys:
+        log(f"  → {LOCATIONS.get(loc, loc)} / {date}")
+        kind, open_times, info = fetch_availability(jar, date, loc)
+        if kind == "login":
+            log(f"      🔴 login redirect ({info}) — bot session expired, stopping")
+            return "login"
+        if kind == "error":
+            log(f"      ⚠ {info}")
+            continue
+        state.pop("session_alert", None)  # the session works: a future failure may email again
+        if kind == "not_open_yet":
+            log("      not open yet" + (f" (opens {info})" if info else ""))
+        else:
+            shown = " ".join(f"{t}({'?' if f is None else f})" for t, f in sorted(open_times.items()))
+            log(f"      open: {shown or 'none'}")
+        cache[(date, loc)] = open_times
 
-    cache = {}
-    session_expired = False
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {
-            executor.submit(fetch_slots, date, loc, phpsessid): (date, loc)
-            for date, loc in sorted(fetch_keys)
-        }
-        for future in as_completed(futures):
-            date, loc = futures[future]
-            data, err = future.result()
-            log(f"  → {LOCATIONS.get(loc, loc)} / {date}")
-            if err == "session_expired":
-                session_expired = True
-                log("      ⚠ session expired")
-            elif err:
-                log(f"      ⚠ {err}")
-            cache[(date, loc)] = data
-
-    if session_expired:
-        last = state.get("last_session_alert", 0)
-        if (time.time() - last) > 6 * 3600:
-            try:
-                send_email(
-                    "🎾 Tennis monitor: session expired",
-                    "Your PHPSESSID has expired and the cloud monitor can't read "
-                    "court availability anymore.\n\n"
-                    "To fix:\n"
-                    f"  1. Log in to {BOOKING_URL}\n"
-                    "  2. DevTools → Application → Cookies → copy PHPSESSID\n"
-                    "  3. Update the PHPSESSID secret in your GitHub repo\n"
-                    "     (Settings → Secrets and variables → Actions → PHPSESSID → Update)\n"
-                    "  4. Next scheduled run will use the new value.\n",
-                    email_user, email_pass, email_to,
-                )
-                state["last_session_alert"] = time.time()
-                log("✉ session-expired email sent")
-            except Exception as e:
-                log(f"⚠ session-expired email failed: {e}")
-        return
-
-    known_open = {
-        k: v for k, v in state.get("known_open", {}).items()
-        if k.split("|", 1)[0] >= today_str
-    }
-    # Deliberately NOT pruned when a slot stops showing as currently open
-    # (unlike known_open above) — an already-recorded attempt, of any
-    # outcome, must permanently block re-attempts for that slot, even if it
-    # flickers open/closed/open again across polls. Only date-based pruning,
-    # since a target for a past date can never be re-detected as open again.
-    autobook_attempts = {
-        k: v for k, v in state.get("autobook_attempts", {}).items()
-        if k.split("|", 1)[0] >= today_str
-    }
-
+    known_open = {k: v for k, v in state.get("known_open", {}).items() if k.split("|", 1)[0] >= today_str}
     new_alerts = []
-    autobook_paid = []
-    autobook_successes = []
-    autobook_failures = []
     currently_open = set()
-
     for target in active:
-        starred_times = {t["time"] for t in target["times"] if t["autoBook"]}
+        starred = {t["time"] for t in target["times"] if t["autoBook"]}
+        wanted = {t["time"] for t in target["times"]}
         for loc in target["locations"]:
-            slots = cache.get((target["date"], loc))
-            if not slots:
-                continue
-            for s in find_open_slots(slots, target, loc):
-                k = slot_key(target["date"], loc, s["stadiumName"], s["timeName"])
+            open_times = cache.get((target["date"], loc)) or {}
+            for t in sorted(wanted & open_times.keys()):
+                k = slot_key(target["date"], loc, ANY_COURT, t)
                 currently_open.add(k)
                 if k not in known_open:
                     known_open[k] = True
-                    alert_info = {
-                        "target": target["name"],
-                        "date": target["date"],
-                        "loc": LOCATIONS.get(loc, loc),
-                        "court": s["stadiumName"],
-                        "time": s["timeName"],
-                        "price": s.get("stadiumtimePrice", ""),
-                    }
-                    is_starred = s["timeName"] in starred_times
+                    new_alerts.append({
+                        "target": target["name"], "date": target["date"], "loc_id": loc,
+                        "loc": LOCATIONS.get(loc, loc), "time": t, "free": open_times[t],
+                        "starred": t in starred,
+                    })
 
-                    if is_starred and k not in autobook_attempts:
-                        # A fresh attempt — this is the ONLY place
-                        # attempt_autobook is ever called, so the resulting
-                        # success/failure email below fires exactly once per
-                        # slot, ever, tied 1:1 to this one call. Sequential,
-                        # not parallel, even if several starred slots open in
-                        # the same pass — each call is real-money-adjacent
-                        # (spec Section 7).
-                        outcome = attempt_autobook(k, target, s, autobook_attempts, member_mobile, phpsessid)
-                        # Replaces the generic email for this slot in every
-                        # case below, does NOT also add it to new_alerts —
-                        # one email per slot, not two.
-                        if outcome["outcome"] == "paid":
-                            autobook_paid.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message"), "classification_warning": outcome.get("classification_warning")})
-                        elif outcome["outcome"] == "parked":
-                            autobook_successes.append({**alert_info, "bookingRef": outcome["bookingRef"], "message": outcome.get("message"), "classification_warning": outcome.get("classification_warning")})
-                        else:  # "failed"
-                            autobook_failures.append({**alert_info, "reason": autobook_failure_reason(outcome)})
-                    else:
-                        # Unstarred slot, OR a starred slot whose attempt was
-                        # already recorded in an earlier pass/run (e.g. it
-                        # reopened after a pending hold expired unpaid) — no
-                        # fresh auto-book decision is being made right now,
-                        # so this falls back to the plain notify email rather
-                        # than re-sending a success/failure email for an old
-                        # outcome.
-                        if is_starred:
-                            log(f"      ⚠ {k} already has a recorded auto-book attempt ({autobook_attempts[k].get('outcome')}) — not re-attempting, falling back to plain notification")
-                        new_alerts.append(alert_info)
-
-    for k in list(known_open.keys()):
+    # A slot that's no longer open (on a page we did read) can alert again
+    # if it reopens. Pages that errored keep their entries untouched.
+    for k in list(known_open):
         d, l = k.split("|", 2)[:2]
-        cached = cache.get((d, l))
-        if (d, l) in fetch_keys and cached is not None and k not in currently_open:
+        if (d, l) in cache and k not in currently_open:
             del known_open[k]
 
     state["known_open"] = known_open
-    state["autobook_attempts"] = autobook_attempts
+    # autobook_attempts belongs to the old site's booking code: never written
+    # now, only pruned by date so it drains away.
+    if "autobook_attempts" in state:
+        state["autobook_attempts"] = {k: v for k, v in state["autobook_attempts"].items()
+                                      if k.split("|", 1)[0] >= today_str}
     state["last_check"] = datetime.now(TZ).isoformat()
     state["currently_open_count"] = len(currently_open)
-
     log(f"  currently open across watchlist: {len(currently_open)}")
 
-    if new_alerts:
-        log(f"🎾 {len(new_alerts)} NEW opening(s) detected")
-        lines = [f"🎾 {len(new_alerts)} tennis slot(s) just opened up:\n"]
-        by_target = {}
-        for a in new_alerts:
-            by_target.setdefault(a["target"], []).append(a)
-        for tname, items in by_target.items():
-            lines.append(f"• {tname}")
-            for a in items:
-                price = a["price"].rstrip("0").rstrip(".") if a["price"] else "?"
-                lines.append(
-                    f"    {a['date']} {a['time']} — {a['loc']} / {a['court']} (฿{price})"
-                )
-            lines.append("")
-        lines.append(f"Book here: {BOOKING_URL}")
-        body = "\n".join(lines)
-        try:
-            send_email(
-                f"🎾 {len(new_alerts)} tennis slot(s) open",
-                body,
-                email_user, email_pass, email_to,
-            )
-            log("✉ alert email sent")
-        except Exception as e:
-            log(f"⚠ alert email failed: {e}")
-    else:
+    if not new_alerts:
         log("  no new openings this iteration")
+        return "ok"
 
-    if autobook_paid:
-        log(f"💰 {len(autobook_paid)} starred slot(s) auto-booked AND PAID")
-        lines = [
-            f"🎾 {len(autobook_paid)} starred slot(s) just got booked AND PAID automatically "
-            "— no pending-payment step needed, this one's done:\n"
-        ]
-        by_target = {}
-        for a in autobook_paid:
-            by_target.setdefault(a["target"], []).append(a)
-        for tname, items in by_target.items():
-            lines.append(f"• {tname}")
-            for a in items:
-                price = a["price"].rstrip("0").rstrip(".") if a["price"] else "?"
-                lines.append(
-                    f"    {a['date']} {a['time']} — {a['loc']} / {a['court']} (฿{price}) "
-                    f"— bookingRef: {a['bookingRef']}"
-                )
-                if a.get("message"):
-                    lines.append(f"      (booking system said: {a['message']})")
-                # Statuscode "00" is now a confirmed-paid signal (observed
-                # production 2026-10-09/10), not an inference — but the
-                # message/paymentRef secondary check can still disagree,
-                # and that's worth surfacing rather than hiding.
-                if a.get("classification_warning"):
-                    lines.append(f"      ⚠ {a['classification_warning']}")
-            lines.append("")
-        lines.append(f"Confirmed via statusCode \"{PAID_STATUS_CODE}\" — a glance at {BOOKING_URL} is still worth it.")
-        body = "\n".join(lines)
-        try:
-            send_email(
-                "🟢 Your starred slot is booked and PAID",
-                body,
-                email_user, email_pass, email_to,
-            )
-            log("✉ auto-book paid email sent")
-        except Exception as e:
-            log(f"⚠ auto-book paid email failed: {e}")
-
-    if autobook_successes:
-        log(f"✅ {len(autobook_successes)} starred slot(s) auto-booked into pending payment")
-        lines = [
-            f"🎾 {len(autobook_successes)} starred slot(s) just got auto-booked into pending "
-            "payment — you have ~15–20 min to complete payment before the hold expires:\n"
-        ]
-        by_target = {}
-        for a in autobook_successes:
-            by_target.setdefault(a["target"], []).append(a)
-        for tname, items in by_target.items():
-            lines.append(f"• {tname}")
-            for a in items:
-                price = a["price"].rstrip("0").rstrip(".") if a["price"] else "?"
-                lines.append(
-                    f"    {a['date']} {a['time']} — {a['loc']} / {a['court']} (฿{price}) "
-                    f"— bookingRef: {a['bookingRef']}"
-                )
-                # statusCode "10" is now the confirmed-parked signal — no
-                # extra line for the normal case. classification_warning
-                # fires only when the message/paymentRef secondary check
-                # disagrees with that (e.g. doesn't mention insufficient
-                # funds), which is worth a human's attention even though
-                # statusCode is trusted over it.
-                if a.get("classification_warning"):
-                    lines.append(f"      ⚠ {a['classification_warning']}")
-            lines.append("")
-        lines.append(f"Complete payment via \"รายการรอชำระ\" (pending payment) on: {BOOKING_URL}")
-        body = "\n".join(lines)
-        try:
-            send_email(
-                "🟡 Your starred slot is already in payment pending",
-                body,
-                email_user, email_pass, email_to,
-            )
-            log("✉ auto-book success email sent")
-        except Exception as e:
-            log(f"⚠ auto-book success email failed: {e}")
-
-    if autobook_failures:
-        log(f"⛔ {len(autobook_failures)} starred slot auto-book attempt(s) failed")
-        lines = [
-            f"⚠ {len(autobook_failures)} starred slot auto-book attempt(s) failed — "
-            "you'll need to book these manually if you still want them:\n"
-        ]
-        by_target = {}
-        for a in autobook_failures:
-            by_target.setdefault(a["target"], []).append(a)
-        for tname, items in by_target.items():
-            lines.append(f"• {tname}")
-            for a in items:
-                price = a["price"].rstrip("0").rstrip(".") if a["price"] else "?"
-                lines.append(
-                    f"    {a['date']} {a['time']} — {a['loc']} / {a['court']} (฿{price})"
-                )
-                lines.append(f"      Reason: {a['reason']}")
-            lines.append("")
-        lines.append(f"Book here: {BOOKING_URL}")
-        body = "\n".join(lines)
-        try:
-            send_email(
-                "🔴 Tried to auto-book your starred slot but it failed",
-                body,
-                email_user, email_pass, email_to,
-            )
-            log("✉ auto-book failure email sent")
-        except Exception as e:
-            log(f"⚠ auto-book failure email failed: {e}")
+    log(f"🎾 {len(new_alerts)} NEW opening(s) detected")
+    lines = [f"🎾 {len(new_alerts)} tennis slot(s) just opened up:\n"]
+    by_target = {}
+    for a in new_alerts:
+        by_target.setdefault(a["target"], []).append(a)
+    for tname, items in by_target.items():
+        lines.append(f"• {tname}")
+        for a in items:
+            lines.append(f"    {a['date']} {a['time']} — {a['loc']} ({format_free(a['free'])})"
+                         + ("  ★" if a["starred"] else ""))
+            if a["starred"] and not AUTOBOOK_ENABLED:
+                lines.append(f"      {AUTOBOOK_PAUSED_NOTE}")
+            lines.append(f"      {booking_link(a['date'], a['loc_id'])}")
+        lines.append("")
+    lines.append(f"Book here: {BOOKING_URL}")
+    try:
+        send_email(f"🎾 {len(new_alerts)} tennis slot(s) open", "\n".join(lines), *email)
+        log("✉ alert email sent")
+    except Exception as e:
+        log(f"⚠ alert email failed: {e}")
+    return "ok"
 
 
-def main():
-    phpsessid = os.environ.get("PHPSESSID", "").strip()
-    email_user = os.environ.get("EMAIL_USER", "").strip()
-    email_pass = os.environ.get("EMAIL_APP_PASSWORD", "").strip()
-    # Optional, unlike the three below: attempt_autobook() already fails
-    # closed on an empty member_mobile ("failed" outcome, logged, recorded,
-    # no booking call made), so a not-yet-configured MEMBER_MOBILE secret
-    # only disables auto-booking for starred slots — it must never be able
-    # to take down the notify-only path for everyone else by exiting here.
-    member_mobile = os.environ.get("MEMBER_MOBILE", "").strip()
-
-    missing = [k for k, v in {
-        "PHPSESSID": phpsessid,
-        "EMAIL_USER": email_user,
-        "EMAIL_APP_PASSWORD": email_pass,
-    }.items() if not v]
+def email_settings(config=None):
+    user = os.environ.get("EMAIL_USER", "").strip()
+    password = os.environ.get("EMAIL_APP_PASSWORD", "").strip()
+    missing = [k for k, v in {"EMAIL_USER": user, "EMAIL_APP_PASSWORD": password}.items() if not v]
     if missing:
         log(f"ERROR: missing env vars: {', '.join(missing)}")
-        sys.exit(1)
-    if not member_mobile:
-        log("  MEMBER_MOBILE not set — starred slots will fail immediately, not auto-booked")
+        return None
+    return user, password, (config or {}).get("email_to") or user
 
+
+def current_jar_path():
+    return bot_session.ENC_FILE if os.environ.get(bot_session.JAR_KEY_ENV, "").strip() else bot_session.JAR_FILE
+
+
+def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None):
+    if AUTOBOOK_ENABLED:
+        log("ERROR: AUTOBOOK_ENABLED is True but there is no auto-book code for the new site yet.")
+        return EXIT_SETUP
     config = load_config()
-    email_to = config.get("email_to") or email_user
-
-    iterations = int(os.environ.get("LOOP_ITERATIONS", "4"))
-    interval = int(os.environ.get("LOOP_INTERVAL_SECONDS", "60"))
-    log(f"Running {iterations} check pass(es), {interval}s apart")
-
+    email = email_settings(config)
+    if email is None:
+        return EXIT_SETUP
     state = load_state()
+    state.pop("last_session_alert", None)  # the PHPSESSID-era throttle, replaced by session_alert
 
+    try:
+        jar = bot_session.open_jar(jar_path, enc_path, session=session, allow_seed=False)
+    except bot_session.SessionOpenError as e:
+        log(f"ERROR: couldn't open the bot session ({e.kind}) — no requests sent.")
+        return EXIT_SETUP
+
+    prev = state.get("session_alert")
+    if prev and prev.get("jar_sha256") == bot_session.file_fingerprint(jar.path):
+        log(f"🔴 bot session marked {prev.get('kind')} at {prev.get('sent_at')} and {jar.path.name} hasn't "
+            "changed since — not sending any requests until it's reseeded (already emailed; exit 0).")
+        save_state(state)
+        return EXIT_OK
+
+    log(f"Running {iterations} check pass(es), {interval}s apart — notify-only, auto-book paused")
     for i in range(iterations):
         log(f"--- iteration {i + 1}/{iterations} ---")
         try:
-            run_check_pass(state, config, phpsessid, member_mobile, email_user, email_pass, email_to)
+            status = run_check_pass(state, config, jar, email)
+        except bot_session.JarSaveError as e:
+            log(f"🔴 couldn't save {jar.path.name} ({e.error}) — "
+                + ("a rotated cookie was NOT saved; the session is likely lost" if e.changes
+                   else "nothing had changed, but stopping rather than risk it"))
+            alert_session(state, "lost", f"saving {jar.path.name} failed: {e.error}",
+                          bot_session.file_fingerprint(jar.path), email)
             save_state(state)
+            return EXIT_JAR
         except Exception as e:
             log(f"⚠ iteration {i + 1} failed: {e}")
-
+            status = "ok"
+        save_state(state)
+        if status == "login":
+            alert_session(state, "expired", None, bot_session.file_fingerprint(jar.path), email)
+            save_state(state)
+            return EXIT_SESSION
         if i < iterations - 1:
             log(f"  sleeping {interval}s before next iteration...")
             time.sleep(interval)
 
     log("Done.")
+    return EXIT_OK
+
+
+def alert_session_lost(reason):
+    """Called by monitor.yml when bot_session.enc couldn't be pushed after
+    a cookie rotated."""
+    email = email_settings(load_config())
+    if email is None:
+        return EXIT_SETUP
+    state = load_state()
+    alert_session(state, "lost", reason, bot_session.file_fingerprint(current_jar_path()), email)
+    save_state(state)
+    return EXIT_JAR
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Crystal Sports court monitor (notify-only).")
+    ap.add_argument("--alert-session-lost", metavar="REASON",
+                    help="send the 'session likely lost' email and exit 4")
+    args = ap.parse_args(argv)
+    if args.alert_session_lost is not None:
+        return alert_session_lost(args.alert_session_lost)
+    return run(iterations=int(os.environ.get("LOOP_ITERATIONS", "4")),
+               interval=int(os.environ.get("LOOP_INTERVAL_SECONDS", "60")))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

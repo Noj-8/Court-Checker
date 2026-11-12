@@ -12,7 +12,7 @@ permissions:
   contents: write              # to commit the rotated bot_session.enc
 
 concurrency:
-  group: bot-session           # one holder of the session at a time
+  group: tennis-monitor        # same group as monitor.yml: one holder of the session at a time
   cancel-in-progress: false
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # The branch tip at checkout time, not the SHA the run was queued
           # at — a run queued behind another must see its rotated jar.
@@ -29,7 +29,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'

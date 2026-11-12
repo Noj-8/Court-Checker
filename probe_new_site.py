@@ -45,387 +45,64 @@ the first login redirect and never retry, never print a cookie value —
 only names and fingerprints (length + first 8 hex chars of SHA-256).
 Every output line also goes through redact() in case the server ever
 echoes a value back.
+
+The session/jar machinery lives in bot_session.py and the page parsing in
+booking_page.py (both shared with monitor.py); the names are re-exported
+here so existing callers and tests keep working.
 """
 
+
 import argparse
-import hashlib
-import json
-import os
-import re
+import os  # noqa: F401 — tests patch probe.os.* (the shared os module bot_session writes through)
 import sys
-import tempfile
 import time
 from datetime import datetime, timedelta
-from html.parser import HTMLParser
-from pathlib import Path
-from urllib.parse import quote, urlsplit
-from zoneinfo import ZoneInfo
 
 import requests
-from requests.cookies import create_cookie
 
-HOST = "crystalsports-booking.kegroup.co.th"
-BASE = f"https://{HOST}"
-BOOKING_PATH = "/booking"
-FORBIDDEN_PATH_FRAGMENTS = ("/booking/review", "/booking/confirm")
-LOCATIONS = {"LOC001": "Crystal Sports", "LOC002": "Crystal Sports G"}
-TZ = ZoneInfo("Asia/Bangkok")
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+import bot_session
+from booking_page import FIRST_INT, THAI_CHARS, PageParser, parse_page  # noqa: F401 (re-exported)
+from bot_session import (  # noqa: F401 (re-exported)
+    BASE, BOOKING_PATH, CULTURE_COOKIE, ENC_FILE, FORBIDDEN_PATH_FRAGMENTS, HOST, JAR_FILE,
+    JAR_KEY_ENV, JAR_VERSION, LOGIN_REDIRECT_MARKERS, OPTIONAL_SEED, SEED_ENV, TZ, USER_AGENT,
+    JarError, JarSaveError, SessionOpenError, _secrets, cookie_expiries, cookie_values,
+    create_cookie, describe_expiry, diff_cookies, fingerprint, fmt_duration, handed_off_files,
+    jar_records, load_jar, make_fernet, merge_set_cookies, redact, remember_secret, save_jar,
+    say, seed_session, stamp,
 )
-JAR_FILE = Path(__file__).resolve().parent / ".bot_session.json"
-JAR_VERSION = 1
-ENC_FILE = Path(__file__).resolve().parent / "bot_session.enc"
-JAR_KEY_ENV = "BOT_JAR_KEY"
-SEED_ENV = {"cs_auth": "CS_AUTH", "cs.did": "CS_DID", "cs.member": "CS_MEMBER"}
-OPTIONAL_SEED = {"cs_auth"}
-CULTURE_COOKIE = {".AspNetCore.Culture": "c=en|uic=en"}
 
-# Calibrated against the live site on 2026-11-11: with no cookies,
-# /booking 302s to /account/login?ReturnUrl=... (served by IIS, no
-# Cloudflare headers seen from a residential IP at the time).
-LOGIN_REDIRECT_MARKERS = ("/account/login", "login", "signin", "sign-in")
+LOCATIONS = {"LOC001": "Crystal Sports", "LOC002": "Crystal Sports G"}
 LOGIN_BODY_MARKERS = ('type="password"', "/account/login", "เข้าสู่ระบบ", "otp")
 CHALLENGE_BODY_MARKERS = (
     "just a moment", "challenge-platform", "cf-turnstile",
     "challenges.cloudflare.com/turnstile",
 )
-THAI_CHARS = re.compile(f"[{chr(0x0E00)}-{chr(0x0E7F)}]")  # the Thai Unicode block
-FIRST_INT = re.compile(r"\d+")  # str pattern: also matches Thai digits, which int() accepts
 
 EXIT_OK, EXIT_NO_GRID, EXIT_NO_SEED, EXIT_LOGIN, EXIT_JAR, EXIT_HANDED_OFF = 0, 1, 2, 3, 4, 5
-
-_secrets = set()
-
-
-def stamp():
-    return datetime.now(TZ).isoformat(timespec="seconds")
+OPEN_ERROR_EXIT = {"jar": EXIT_JAR, "no_seed": EXIT_NO_SEED, "no_jar": EXIT_NO_SEED,
+                   "handed_off": EXIT_HANDED_OFF}
 
 
-def fingerprint(value):
-    return f"len={len(value)} sha256={hashlib.sha256(value.encode('utf-8')).hexdigest()[:8]}"
-
-
-def remember_secret(value):
-    # Very short values would make redaction mangle ordinary output; real
-    # session cookies are far longer than this.
-    if value and len(value) >= 8:
-        _secrets.add(value)
-
-
-def redact(text):
-    text = str(text)
-    for value in sorted(_secrets, key=len, reverse=True):
-        text = text.replace(value, "<redacted>")
-        text = text.replace(quote(value, safe=""), "<redacted>")
-    return text
-
-
-def say(text=""):
-    print(redact(text), flush=True)
-
-
-class JarError(Exception):
-    pass
-
-
-def jar_records(session):
-    return [
-        {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
-         "secure": bool(c.secure), "expires": c.expires}
-        for c in session.cookies
-    ]
-
-
-def make_fernet(key):
-    try:
-        from cryptography.fernet import Fernet
-    except ImportError:
-        raise JarError(f"{JAR_KEY_ENV} is set but the cryptography package isn't installed") from None
-    try:
-        return Fernet(key.strip().encode("ascii"))
-    except (ValueError, TypeError, UnicodeEncodeError):  # binascii.Error is a ValueError
-        raise JarError(f"{JAR_KEY_ENV} isn't a valid Fernet key (expected 44 url-safe base64 chars)") from None
-
-
-def handed_off_files(jar_path):
-    jar_path = Path(jar_path)
-    return sorted(jar_path.parent.glob(f"{jar_path.name}.handed-off-*"))
-
-
-def load_jar(path, session, fernet=None):
-    try:
-        raw = Path(path).read_bytes()
-        if fernet is not None:
-            try:
-                raw = fernet.decrypt(raw)
-            except Exception:  # cryptography's InvalidToken carries no message
-                raise JarError(f"can't decrypt — wrong {JAR_KEY_ENV}, or the file is corrupted") from None
-        data = json.loads(raw)
-        if data.get("version") != JAR_VERSION or not isinstance(data.get("cookies"), list):
-            raise JarError(f"unexpected format (version={data.get('version')!r})")
-        for r in data["cookies"]:
-            session.cookies.set_cookie(create_cookie(
-                r["name"], r["value"], domain=r["domain"], path=r["path"],
-                secure=r["secure"], expires=r["expires"],
-            ))
-            remember_secret(r["value"])
-    except (OSError, ValueError, KeyError, TypeError) as e:
-        raise JarError(f"{type(e).__name__}: {e}") from None
-
-
-def save_jar(path, session, fernet=None):
-    """Write the jar atomically: a crash or failed write at any point leaves
-    the previous file intact, never a half-written one. With `fernet`, the
-    bytes written are ciphertext only, and an unchanged jar isn't rewritten
-    (returns False) so bot_session.enc changes in git only on a real cookie
-    change."""
-    path = Path(path)
-    records = jar_records(session)
-    if fernet is not None and path.exists():
-        try:
-            if json.loads(fernet.decrypt(path.read_bytes()))["cookies"] == records:
-                return False
-        except Exception:  # unreadable with this key: fall through and rewrite it
-            pass
-    data = (json.dumps({
-        "version": JAR_VERSION, "host": HOST, "updated_at": stamp(), "cookies": records,
-    }, indent=2) + "\n").encode("utf-8")
-    if fernet is not None:
-        data = fernet.encrypt(data)  # in memory; only the ciphertext reaches the disk
-    # Same temp prefix for both files, so .gitignore's .bot_session.*.tmp covers it.
-    fd, tmp = tempfile.mkstemp(prefix=".bot_session.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            os.fchmod(f.fileno(), 0o600)
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
-    dir_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-    return True
-
-
-def seed_session(session):
-    values = {name: os.environ.get(env, "").strip() for name, env in SEED_ENV.items()}
-    missing = [env for name, env in SEED_ENV.items() if not values[name] and name not in OPTIONAL_SEED]
-    if missing:
-        return missing, []
-    absent = []
-    for name, value in values.items():
-        if not value:
-            absent.append(name)
-            continue
-        # Explicit host + "/" so the server's first rotation (a host-only
-        # cookie on path /) REPLACES this entry instead of sitting beside it.
-        session.cookies.set_cookie(create_cookie(name, value, domain=HOST, path="/", secure=True))
-        remember_secret(value)
-    return [], absent
-
-
-def cookie_values(session):
-    values, dupes = {}, set()
-    for c in session.cookies:
-        if c.name in values:
-            dupes.add(c.name)
-        values[c.name] = c.value
-    return values, dupes
-
-
-def cookie_expiries(session):
-    return {c.name: c.expires for c in session.cookies}
-
-
-def fmt_duration(seconds):
-    seconds = int(seconds)
-    sign = "-" if seconds < 0 else ""
-    days, rem = divmod(abs(seconds), 86400)
-    hours, rem = divmod(rem, 3600)
-    return f"{sign}{days}d {hours}h {rem // 60}m" if days else f"{sign}{hours}h {rem // 60}m"
-
-
-def describe_expiry(expires, previous=None):
-    """Expiry only, never the value. `expires` is what requests parsed from
-    the Set-Cookie (Expires, or Max-Age converted to a time). `previous` is
-    omitted when unknown — e.g. a seeded cookie, whose browser-side expiry
-    was never copied — rather than shown as if it were a session cookie."""
-    if expires is None:
-        return "expires=session (no Expires/Max-Age)"
-    text = (f"expires={datetime.fromtimestamp(expires, TZ).isoformat(timespec='seconds')} "
-            f"(in {fmt_duration(expires - time.time())}")
-    if previous is not None:
-        delta = expires - previous
-        text += f"; {'+' if delta >= 0 else '-'}{fmt_duration(abs(delta))} vs previous"
-    return text + ")"
-
-
-def merge_set_cookies(session, resp):
-    """requests has already applied resp's Set-Cookie headers to
-    session.cookies (including deletions). If the server just reissued a
-    cookie under a different domain/path than the copy we hold, both would
-    be sent on the next request — and the old one is exactly the
-    superseded value that kills the session. Drop it."""
-    just_set = {}
-    for c in resp.cookies:
-        just_set.setdefault(c.name, set()).add((c.domain, c.path))
-    for c in list(session.cookies):
-        if c.name in just_set and (c.domain, c.path) not in just_set[c.name]:
-            session.cookies.clear(c.domain, c.path, c.name)
-    for c in session.cookies:
-        remember_secret(c.value)
-
-
-def diff_cookies(before, after):
-    changes = []
-    for name in sorted(set(before) | set(after)):
-        old, new = before.get(name), after.get(name)
-        if old == new:
-            continue
-        kind = "NEW" if old is None else "REMOVED" if new is None else "ROTATED"
-        changes.append((kind, name, old, new))
-    return changes
-
-
-class PageParser(HTMLParser):
-    """Collects <html lang>, <title>, and every <a class="slot ..."> with the
-    text of its span.slot-time / span.slot-meta children."""
-
-    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
-            "link", "meta", "param", "source", "track", "wbr"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.lang = ""
-        self.title = ""
-        self.slots = []
-        self._in_title = False
-        self._slot = None
-        self._slot_depth = 0
-        self._field = None
-        self._field_depth = 0
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag == "html":
-            self.lang = attrs.get("lang") or ""
-        if tag == "title":
-            self._in_title = True
-        if tag in self.VOID:
-            return
-        classes = (attrs.get("class") or "").split()
-        if self._slot is None:
-            if tag == "a" and "slot" in classes:
-                self._slot = {"classes": classes, "time": "", "meta": ""}
-                self._slot_depth = 1
-            return
-        self._slot_depth += 1
-        if self._field is None and tag == "span":
-            if "slot-time" in classes:
-                self._field, self._field_depth = "time", self._slot_depth
-            elif "slot-meta" in classes:
-                self._field, self._field_depth = "meta", self._slot_depth
-
-    def handle_endtag(self, tag):
-        if tag == "title":
-            self._in_title = False
-        if tag in self.VOID or self._slot is None:
-            return
-        if self._field is not None and self._slot_depth == self._field_depth:
-            self._field = None
-        self._slot_depth -= 1
-        if self._slot_depth == 0:
-            self.slots.append(self._slot)
-            self._slot = None
-
-    def handle_data(self, data):
-        if self._in_title:
-            self.title += data
-        if self._slot is not None and self._field:
-            self._slot[self._field] += data
-
-
-def parse_page(html):
-    """Language-independent: a slot is available iff its class list lacks
-    "is-disabled", and its free count is the first integer in slot-meta —
-    so "2 free", "ว่าง 2" and "ว่าง ๒" all give 2. Text like "Full" is never
-    relied on."""
-    p = PageParser()
-    p.feed(html)
-    slots = []
-    for s in p.slots:
-        meta = " ".join(s["meta"].split())
-        m = FIRST_INT.search(meta)
-        slots.append({
-            "time": " ".join(s["time"].split()) or "?",
-            "available": "is-disabled" not in s["classes"],
-            "free": int(m.group()) if m else None,
-            "meta": meta,
-        })
-    thai = any(THAI_CHARS.search(s["meta"]) for s in slots) or bool(THAI_CHARS.search(p.title))
-    return {"slots": slots, "lang": p.lang, "thai": thai, "title": " ".join(p.title.split())}
-
-
-def probe_get(session, params):
-    url = BASE + BOOKING_PATH
-    path = urlsplit(url).path
-    if path != BOOKING_PATH or any(f in url for f in FORBIDDEN_PATH_FRAGMENTS):
-        raise RuntimeError(f"refusing to request {path!r} — probe is read-only, /booking only")
-    # The culture cookie goes per-request so it is sent but never stored in
-    # the jar — the jar holds only what the server itself issued.
-    return session.get(url, params=params, cookies=CULTURE_COOKIE, allow_redirects=False, timeout=20)
-
-
-def probe_once(session, jar_path, loc, date, fernet=None):
+def probe_once(jar, loc, date):
     params = {"date": date, "loc": loc, "time": "0", "sel": ""}
     result = {"loc": loc, "status": None, "ok": False, "login": False, "changes": [],
               "jar_error": None, "error": None, "page": None, "diag": []}
-    before, _ = cookie_values(session)
-    before_exp = cookie_expiries(session)
     try:
-        resp = probe_get(session, params)
+        fetched = bot_session.fetch(jar, BOOKING_PATH, params)
     except requests.RequestException as e:
         result["error"] = f"network error: {e}"
         return result
-
-    # Persist first, before parsing or printing anything about the response.
-    merge_set_cookies(session, resp)
-    after, dupes = cookie_values(session)
-    after_exp = cookie_expiries(session)
-    result["changes"] = diff_cookies(before, after)
-    try:
-        save_jar(jar_path, session, fernet)
-    except OSError as e:
-        result["jar_error"] = f"{type(e).__name__}: {e}"
+    except JarSaveError as e:
+        result["jar_error"], result["changes"] = e.error, e.changes
         return result
 
-    for kind, name, old, new in result["changes"]:
-        if kind == "ROTATED":
-            say(f"[{stamp()}] ROTATED {name}: {fingerprint(old)} -> {fingerprint(new)} | "
-                f"{describe_expiry(after_exp.get(name), before_exp.get(name))}")
-        elif kind == "NEW":
-            say(f"[{stamp()}] NEW {name}: {fingerprint(new)} | {describe_expiry(after_exp.get(name))}")
-        else:
-            say(f"[{stamp()}] REMOVED {name}: was {fingerprint(old)}")
-    for name in sorted(dupes):
-        say(f"[{stamp()}] WARNING: jar holds more than one {name} cookie")
-
+    resp = fetched.resp
+    result["changes"] = fetched.changes
     result["status"] = resp.status_code
+    result["login"] = fetched.login
     body = resp.text or ""
     body_lower = body.lower()
     location = resp.headers.get("Location", "")
-    result["login"] = (300 <= resp.status_code < 400
-                       and any(m in location.lower() for m in LOGIN_REDIRECT_MARKERS))
     if resp.status_code == 200:
         result["page"] = parse_page(body)
         result["ok"] = bool(result["page"]["slots"])
@@ -448,7 +125,10 @@ def probe_once(session, jar_path, loc, date, fernet=None):
     elif result["login"]:
         diag.append("verdict:    LOGIN REDIRECT")
     elif result["ok"]:
-        diag.append(f"verdict:    BOOKING PAGE — {len(result['page']['slots'])} slot(s)")
+        diag.append(f"verdict:    BOOKING PAGE — {len(result['page']['slots'])} slot(s)"
+                    + (" (court map is-locked — expected with time=0)" if result["page"]["locked"] else ""))
+    elif result["page"] and result["page"]["not_open_yet"]:
+        diag.append(f"verdict:    NOT OPEN YET — opens {result['page']['opens_at']}")
     elif resp.status_code == 200:
         diag.append("verdict:    200 but no <a class=\"slot\"> elements"
                     + (f" (login-page markers: {', '.join(login_hits)})" if login_hits else ""))
@@ -481,74 +161,18 @@ def summary_line(rnd, repeat, result):
 
 
 def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FILE):
-    session = session or requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
-    })
-    key = os.environ.get(JAR_KEY_ENV, "").strip()
-    fernet = None
-    if key:
-        remember_secret(key)
-        try:
-            fernet = make_fernet(key)
-        except JarError as e:
-            say(f"ERROR: {e}. No requests sent.")
-            return EXIT_JAR
-        jar_path = Path(enc_path)
-        say(f"{JAR_KEY_ENV} set ({fingerprint(key)}): encrypted jar {jar_path.name}, never written in plaintext.")
-    elif os.environ.get("GITHUB_ACTIONS") == "true":
-        say(f"ERROR: running in GitHub Actions without {JAR_KEY_ENV} — refusing, so the session is never")
-        say("written to the runner's disk in plaintext. No requests sent.")
-        return EXIT_JAR
-    else:
-        jar_path = Path(jar_path)
-        handed = handed_off_files(jar_path)
-        if handed and not jar_path.exists():
-            say(f"ERROR: no {jar_path.name}, only {handed[-1].name} — this session was handed off to")
-            say("GitHub Actions (bot_session.enc). Running it here too would present a superseded cs.member")
-            say("and kill it. No requests sent. For a separate Mac session: log in fresh in a private window,")
-            say("move the handed-off file out of this folder, and reseed.")
-            return EXIT_HANDED_OFF
-
-    if jar_path.exists():
-        try:
-            load_jar(jar_path, session, fernet)
-        except JarError as e:
-            say(f"ERROR: {jar_path.name} exists but couldn't be read ({e}).")
-            say("Not falling back to CS_AUTH/CS_DID/CS_MEMBER — they may be superseded cookies,")
-            say("and presenting one kills the session. Fix or delete the file, then reseed from a fresh login.")
-            return EXIT_JAR
-        say(f"Using existing jar {jar_path.name} (mode {oct(jar_path.stat().st_mode & 0o777)}).")
-        set_env = [env for env in SEED_ENV.values() if os.environ.get(env)]
-        if set_env:
-            say(f"  {', '.join(set_env)} set but IGNORED — the jar exists, so it is the only source of cookies.")
-    else:
-        missing, absent = seed_session(session)
-        if missing:
-            say(f"ERROR: no {jar_path.name} yet and {', '.join(missing)} missing — nothing seeded, no requests sent.")
-            return EXIT_NO_SEED
-        try:
-            save_jar(jar_path, session, fernet)
-        except OSError as e:
-            say(f"ERROR: couldn't create {jar_path.name} ({type(e).__name__}: {e}) — no requests sent.")
-            return EXIT_JAR
-        say(f"Seeded {jar_path.name} from env vars (mode 0o600). From now on the env vars are ignored.")
-        for name in absent:
-            say(f"  {name} absent (not seeded)")
-
-    say("Cookies in jar (values never printed):")
-    names, _ = cookie_values(session)
-    for name in sorted(names):
-        say(f"  {name} {fingerprint(names[name])}")
+    try:
+        jar = bot_session.open_jar(jar_path, enc_path, session=session)
+    except SessionOpenError as e:
+        return OPEN_ERROR_EXIT[e.kind]
+    jar_path = jar.path
     say()
 
     all_ok = True
     for rnd in range(1, repeat + 1):
         date = (datetime.now(TZ) + timedelta(days=1)).date().isoformat()
         for loc in LOCATIONS:
-            result = probe_once(session, jar_path, loc, date, fernet)
+            result = probe_once(jar, loc, date)
             if result["jar_error"]:
                 say(f"[{stamp()}] round {rnd}/{repeat} {loc}: FAILED TO WRITE {jar_path.name} "
                     f"({result['jar_error']}).")
