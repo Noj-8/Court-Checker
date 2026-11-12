@@ -39,7 +39,10 @@ apart (default 60), then exits. Designed for GitHub Actions cron */5.
   Exit code:      0  ok
                   1  setup error (missing env var, no/unreadable jar), or
                      the jar couldn't be saved but no cookie had changed
-                     (transient: the copy on disk is current; next run retries)
+                     (transient: the copy on disk is current; next run retries),
+                     or state.json couldn't be written on an otherwise normal run.
+                     A failing state.json write never changes codes 0/3/4 below
+                     on the session paths, and never stops their emails.
                   3  bot session expired (login redirect) — the run that
                      detects it. Later runs on the same dead jar send
                      nothing and exit 0 (the dashboard shows "stale").
@@ -88,6 +91,11 @@ LOCATIONS = {
 EXIT_OK, EXIT_SETUP, EXIT_SESSION, EXIT_JAR = 0, 1, 3, 4
 EXIT_ERROR = 1  # a failed run that needs no reseed
 UNREADABLE_ALERT_AFTER_MINUTES = 30
+# A streak of unreadable passes is only "consecutive" if they keep coming:
+# a longer gap since the last one (runs that exited early, a paused cron,
+# a dead session) starts a new streak instead of resuming a stale one.
+UNREADABLE_STREAK_GAP_MINUTES = 15
+UNREADABLE_STREAK_KEYS = ("unreadable_since", "unreadable_last", "unreadable_passes")
 
 RESEED_STEPS = """To reseed (on the Mac, in court-checker-live):
   1. Open an Incognito window, log in to {base}, copy cs.did then
@@ -143,6 +151,23 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def try_save_state(state):
+    """save_state that never raises: a failing state write must not stop
+    an email from going out or change the exit code a caller intends.
+    Returns False (and logs) on failure."""
+    try:
+        save_state(state)
+        return True
+    except Exception as e:
+        log(f"⚠ couldn't write {STATE_FILE.name}: {type(e).__name__}: {e}")
+        return False
+
+
+def clear_unreadable_streak(state):
+    for k in UNREADABLE_STREAK_KEYS:
+        state.pop(k, None)
+
+
 def send_email(subject, body, smtp_user, smtp_pass, to_addr):
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -190,10 +215,16 @@ def fetch_availability(jar, date, loc_id):
             return "not_open_yet", {}, page["opens_at"]
         return "error", None, (f"unexpected page — no slot grid and no opens-at marker "
                                f"({len(body)} bytes, title {page['title']!r}); skipped")
+    times = [slot_time(s["time"]) for s in page["slots"]]
+    unreadable = [s["time"] for s, t in zip(page["slots"], times) if t is None]
+    if unreadable:
+        return "error", None, (f"unexpected page — slot time(s) not readable unambiguously: "
+                               f"{', '.join(repr(u) for u in unreadable[:5])}; skipped")
+    if len(set(times)) != len(times):
+        return "error", None, "unexpected page — the same slot time appears twice; skipped"
     open_times = {}
-    for s in page["slots"]:
-        t = slot_time(s["time"])
-        if t and s["available"] and s["free"] != 0:
+    for s, t in zip(page["slots"], times):
+        if s["available"] and s["free"] != 0:
             open_times[t] = s["free"]
     return "ok", open_times, None
 
@@ -243,6 +274,7 @@ def run_check_pass(state, config, jar, email):
     active = [t for t in config.get("targets", []) if t["date"] >= today_str]
     if not active:
         log("  no active (future) targets — nothing to check")
+        clear_unreadable_streak(state)  # not an unreadable pass: the streak is broken
         return "ok"
 
     fetch_keys = sorted({(t["date"], loc) for t in active for loc in t["locations"]})
@@ -253,6 +285,7 @@ def run_check_pass(state, config, jar, email):
         kind, open_times, info = fetch_availability(jar, date, loc)
         if kind == "login":
             log(f"      🔴 login redirect ({info}) — bot session expired, stopping")
+            clear_unreadable_streak(state)  # the session email takes over from here
             return "login"
         if kind == "error":
             log(f"      ⚠ {info}")
@@ -272,8 +305,8 @@ def run_check_pass(state, config, jar, email):
     if pages_read == 0:
         note_unreadable_pass(state, problems, email)
         return "ok"  # last_check, currently_open_count and known_open untouched
-    for k in ("unreadable_since", "unreadable_passes", "read_alert"):
-        state.pop(k, None)
+    clear_unreadable_streak(state)
+    state.pop("read_alert", None)
 
     known_open = {k: v for k, v in state.get("known_open", {}).items() if k.split("|", 1)[0] >= today_str}
     new_alerts = []
@@ -342,9 +375,15 @@ def note_unreadable_pass(state, problems, email):
     """A pass that read no page at all. After UNREADABLE_ALERT_AFTER_MINUTES
     of these in a row, send ONE email; the next good read clears it."""
     now = datetime.now(TZ)
-    since = state.setdefault("unreadable_since", now.isoformat())
+    last = _parse_time(state.get("unreadable_last"))
+    since = _parse_time(state.get("unreadable_since"))
+    if since is None or last is None or (now - last).total_seconds() > UNREADABLE_STREAK_GAP_MINUTES * 60:
+        clear_unreadable_streak(state)  # stale or partial: start a new streak now
+        since = now
+        state["unreadable_since"] = now.isoformat()
+    state["unreadable_last"] = now.isoformat()
     state["unreadable_passes"] = state.get("unreadable_passes", 0) + 1
-    minutes = int((now - datetime.fromisoformat(since)).total_seconds() // 60)
+    minutes = int((now - since).total_seconds() // 60)
     log(f"  ⚠ no page readable this pass ({state['unreadable_passes']} pass(es) in a row, {minutes} min)")
     if "read_alert" in state or minutes < UNREADABLE_ALERT_AFTER_MINUTES:
         return
@@ -361,6 +400,13 @@ def note_unreadable_pass(state, problems, email):
         return
     state["read_alert"] = {"sent_at": now.isoformat()}
     log("✉ unreadable-site email sent")
+
+
+def _parse_time(value):
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def email_settings(config=None):
@@ -398,16 +444,17 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
     if prev and prev.get("jar_sha256") == bot_session.file_fingerprint(jar.path):
         log(f"🔴 bot session marked {prev.get('kind')} at {prev.get('sent_at')} and {jar.path.name} hasn't "
             "changed since — not sending any requests until it's reseeded (already emailed; exit 0).")
-        save_state(state)
+        try_save_state(state)
         return EXIT_OK
 
     log(f"Running {iterations} check pass(es), {interval}s apart — notify-only, auto-book paused")
+    state_write_failed = False
     for i in range(iterations):
         log(f"--- iteration {i + 1}/{iterations} ---")
         try:
             status = run_check_pass(state, config, jar, email)
         except bot_session.JarSaveError as e:
-            save_state(state)
+            try_save_state(state)
             if not e.changes:
                 log(f"⚠ couldn't save {jar.path.name} ({e.error}), but no cookie had changed — the copy on "
                     "disk is still current. Failing this run; the next one retries.")
@@ -416,20 +463,25 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
                 "the session is likely lost")
             alert_session(state, "lost", f"saving {jar.path.name} failed: {e.error}",
                           bot_session.file_fingerprint(jar.path), email)
-            save_state(state)
+            try_save_state(state)
             return EXIT_JAR
         except Exception as e:
             log(f"⚠ iteration {i + 1} failed: {e}")
             status = "ok"
-        save_state(state)
+        state_saved = try_save_state(state)
         if status == "login":
             alert_session(state, "expired", None, bot_session.file_fingerprint(jar.path), email)
-            save_state(state)
+            try_save_state(state)
             return EXIT_SESSION
+        if not state_saved:
+            state_write_failed = True
         if i < iterations - 1:
             log(f"  sleeping {interval}s before next iteration...")
             time.sleep(interval)
 
+    if state_write_failed:
+        log(f"Done, but {STATE_FILE.name} couldn't be written — failing the run (dedupe may repeat an email).")
+        return EXIT_ERROR
     log("Done.")
     return EXIT_OK
 
@@ -442,7 +494,7 @@ def alert_session_lost(reason):
         return EXIT_SETUP
     state = load_state()
     alert_session(state, "lost", reason, bot_session.file_fingerprint(current_jar_path()), email)
-    save_state(state)
+    try_save_state(state)
     return EXIT_JAR
 
 

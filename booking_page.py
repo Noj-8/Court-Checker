@@ -31,6 +31,13 @@ from urllib.parse import urlsplit
 THAI_CHARS = re.compile(f"[{chr(0x0E00)}-{chr(0x0E7F)}]")  # the Thai Unicode block
 FIRST_INT = re.compile(r"\d+")  # str pattern: also matches Thai digits, which int() accepts
 TIME_RE = re.compile(r"(\d{1,2})[:.](\d{2})")
+# A clock time: H:MM / H.MM with an optional AM/PM, or a bare hour WITH AM/PM.
+# The trailing (?!\w) stops "8 pmx" or "8:00 amount" being read as a marker.
+CLOCK_RE = re.compile(
+    r"(?<![\d:.])(\d{1,2})(?:[:.](\d{2}))?\s*([ap])\.?\s?m\.?(?!\w)"
+    r"|(?<![\d:.])(\d{1,2})[:.](\d{2})(?![\d:.])",
+    re.IGNORECASE)
+AMPM_RE = re.compile(r"(?<![a-z])[ap]\.?\s?m\.?(?![a-z])", re.IGNORECASE)
 OPENS_AT_RE = re.compile(
     r"(?:\bbookings?\s+(?:opens?|will\s+open)\b"        # "Booking opens", "Bookings will open"
     r"|\bopens?\s+for\s+bookings?\b"                    # "Opens for booking"
@@ -139,10 +146,38 @@ def is_login_page(html, url=""):
     return bool(login_page_markers(html, url))
 
 
+def to_24h(hour, minute, ampm=None):
+    """'HH:MM', or None if out of range. ampm is 'a', 'p' or None (24-hour)."""
+    hour, minute = int(hour), int(minute or 0)
+    if not 0 <= minute <= 59:
+        return None
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None  # "13:00 PM", "0:30 AM": no unambiguous reading
+        hour = hour % 12 + (12 if ampm.lower() == "p" else 0)
+    elif not 0 <= hour <= 23:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
 def slot_time(text):
-    """'20:00', '8:00', '20.00', '20:00 - 21:00' -> 'HH:MM' (the start); None if no time."""
-    m = TIME_RE.search(text or "")
-    return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
+    """The slot's START time as 24-hour 'HH:MM', or None when it can't be
+    read unambiguously — callers must treat None as an unexpected page,
+    never guess.
+      '20:00', '8:00', '20.00', '๒๐:๐๐', '20:00 - 21:00'  -> 24-hour as written
+      '8:00 PM', '8 pm', '8:00 p.m.', '12:00 AM'          -> converted (20:00, 00:00)
+      '8:00 - 9:00 PM'  -> None: the AM/PM isn't on the start time, so its
+                           half of the day is a guess
+      '25:00', '13:00 PM', 'Full', ''                     -> None"""
+    text = text or ""
+    m = CLOCK_RE.search(text)
+    if not m:
+        return None
+    if m.group(3):  # the start time carries its own AM/PM
+        return to_24h(m.group(1), m.group(2), m.group(3))
+    if AMPM_RE.search(text):
+        return None  # an AM/PM elsewhere in the text: ambiguous
+    return to_24h(m.group(4), m.group(5))
 
 
 def parse_page(html):
@@ -160,7 +195,7 @@ def parse_page(html):
         })
     thai = any(THAI_CHARS.search(s["meta"]) for s in slots) or bool(THAI_CHARS.search(p.title))
     opens = None if slots else OPENS_AT_RE.search(" ".join(" ".join(p.text).split()))
-    opens_at = f"{int(opens.group(1)):02d}:{int(opens.group(2)):02d}" if opens else None
+    opens_at = to_24h(opens.group(1), opens.group(2)) if opens else None
     return {"slots": slots, "lang": p.lang, "thai": thai, "title": " ".join(p.title.split()),
             "locked": p.locked,           # the court map's is-locked: diagnostics only
             "opens_at": opens_at,         # only looked for when there are no slots

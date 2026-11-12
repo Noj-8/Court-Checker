@@ -182,9 +182,20 @@ class TestGridParsing(unittest.TestCase):
         self.assertEqual([s["available"] for s in page["slots"]], [False, True])
 
     def test_slot_time_normalisation(self):
-        for text, want in [("20:00", "20:00"), ("8:00", "08:00"), ("20.00", "20:00"),
-                           ("20:00 - 21:00", "20:00"), ("Full", None)]:
-            self.assertEqual(booking_page.slot_time(text), want, text)
+        for text, want in [
+            ("20:00", "20:00"), ("8:00", "08:00"), ("20.00", "20:00"), ("๒๐:๐๐", "20:00"),
+            ("20:00 - 21:00", "20:00"), ("20:00 น.", "20:00"),
+            ("8:00 PM", "20:00"), ("8 pm", "20:00"), ("8:00 p.m.", "20:00"), ("08:30PM", "20:30"),
+            ("12:00 AM", "00:00"), ("12:30 pm", "12:30"), ("6:00 AM - 7:00 AM", "06:00"),
+            ("8:00 - 9:00 PM", None),     # whose PM? never guessed
+            ("13:00 PM", None), ("0:30 AM", None), ("25:00", None), ("20:75", None),
+            ("Full", None), ("", None), ("Evening", None), ("8", None),
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(booking_page.slot_time(text), want)
+
+    def test_opens_at_uses_the_same_24_hour_conversion(self):
+        self.assertEqual(booking_page.parse_page("<p>Booking opens 21:00</p>")["opens_at"], "21:00")
 
 
 class TestCheckPass(MonitorTestCase):
@@ -272,6 +283,27 @@ class TestCheckPass(MonitorTestCase):
         self.assertNotIn("23:00", sent[0]["body"])
         self.assertIn("loc=LOC002", adapter.sent[0]["url"])
 
+    def test_12_hour_grid_is_converted(self):
+        page = grid(("8:00 PM", "2 free", False), ("9:00 PM", "Full", True), ("10:00 PM", "1 free", False))
+        _, _, _, sent = self.run_monitor([ok(page)])
+        self.assertEqual(len(sent), 1)
+        self.assertIn(f"{self.date} 20:00 — Crystal Sports (2 free)", sent[0]["body"])
+        self.assertIn(f"{self.date} 22:00 — Crystal Sports (1 free)", sent[0]["body"])
+
+    def test_unreadable_or_duplicate_slot_times_make_the_page_unexpected(self):
+        for label, page in [
+            ("ambiguous AM/PM", grid(("8:00 - 9:00 PM", "2 free", False), ("22:00", "1 free", False))),
+            ("no time at all", grid(("Evening", "2 free", False), ("22:00", "1 free", False))),
+            ("same time twice", grid(("8:00", "2 free", False), ("8:00", "1 free", False), ("22:00", "1 free", False))),
+        ]:
+            with self.subTest(label):
+                self.state_file.unlink(missing_ok=True)
+                code, out, _, sent = self.run_monitor([ok(page)])
+                self.assertEqual(code, monitor.EXIT_OK)
+                self.assertEqual(sent, [], "no slot email from a page whose times can't be trusted")
+                self.assertIn("unexpected page", out)
+                self.assertNotIn("known_open", self.state())
+
     def test_page_errors_keep_known_open_and_old_format_keys_are_pruned(self):
         self.write_config([target(self.date, [("20:00", False)], locations=("LOC001", "LOC002"))])
         self.state_file.write_text(json.dumps({"known_open": {
@@ -306,8 +338,11 @@ class TestUnreadableSite(MonitorTestCase):
         self.assertIn("unreadable_since", state)
 
     def test_one_email_after_30_minutes_then_cleared_by_a_good_read(self):
-        since = (datetime.now(monitor.TZ) - timedelta(minutes=31)).isoformat()
-        self.state_file.write_text(json.dumps({"unreadable_since": since, "unreadable_passes": 7}))
+        now = datetime.now(monitor.TZ)
+        self.state_file.write_text(json.dumps({
+            "unreadable_since": (now - timedelta(minutes=31)).isoformat(),
+            "unreadable_last": (now - timedelta(minutes=2)).isoformat(),  # a live streak
+            "unreadable_passes": 7}))
         _, _, _, sent = self.run_monitor([ok(NO_GRID)])
         self.assertEqual([m["subject"] for m in sent], ["🔴 Monitor can't read the booking site"])
         self.assertIn("31 minutes", sent[0]["body"])
@@ -322,10 +357,43 @@ class TestUnreadableSite(MonitorTestCase):
         self.assertIn("last_check", state)
 
     def test_no_email_before_30_minutes(self):
-        since = (datetime.now(monitor.TZ) - timedelta(minutes=29)).isoformat()
-        self.state_file.write_text(json.dumps({"unreadable_since": since}))
+        now = datetime.now(monitor.TZ)
+        self.state_file.write_text(json.dumps({"unreadable_since": (now - timedelta(minutes=29)).isoformat(),
+                                               "unreadable_last": (now - timedelta(minutes=2)).isoformat()}))
         _, _, _, sent = self.run_monitor([ok(NO_GRID)])
         self.assertEqual(sent, [])
+
+    def test_stale_or_partial_streak_starts_over_instead_of_emailing(self):
+        now = datetime.now(monitor.TZ)
+        two_days = (now - timedelta(days=2)).isoformat()
+        for label, planted in [
+            ("streak whose last pass was long ago", {"unreadable_since": two_days, "unreadable_last": two_days}),
+            ("since without a last pass (written by the previous version)", {"unreadable_since": two_days}),
+            ("garbage timestamps", {"unreadable_since": "yesterday", "unreadable_last": 12}),
+        ]:
+            with self.subTest(label):
+                self.state_file.write_text(json.dumps({**planted, "unreadable_passes": 40}))
+                _, out, _, sent = self.run_monitor([ok(NO_GRID)])
+                self.assertEqual(sent, [], "a stale streak must not trigger the email at once")
+                state = self.state()
+                self.assertEqual(state["unreadable_passes"], 1)
+                self.assertLess((datetime.now(monitor.TZ) - datetime.fromisoformat(state["unreadable_since"])).total_seconds(), 60)
+                self.assertIn("0 min", out)
+
+    def test_early_exit_passes_break_the_streak(self):
+        now = datetime.now(monitor.TZ)
+        live = {"unreadable_since": (now - timedelta(minutes=29)).isoformat(),
+                "unreadable_last": (now - timedelta(minutes=1)).isoformat(), "unreadable_passes": 9}
+        # A pass with nothing to check, then an unreadable pass: a new streak, no email.
+        self.state_file.write_text(json.dumps(live))
+        self.write_config([target(day(-1), [("20:00", False)])])
+        self.run_monitor([])
+        self.assertFalse(set(monitor.UNREADABLE_STREAK_KEYS) & set(self.state()))
+        # A login exit clears it too (the session email takes over).
+        self.state_file.write_text(json.dumps(live))
+        self.write_config([target(self.date, [("20:00", False)])])
+        self.run_monitor([login_redirect()])
+        self.assertFalse(set(monitor.UNREADABLE_STREAK_KEYS) & set(self.state()))
 
     def test_one_readable_page_counts_as_a_read(self):
         self.write_config([target(self.date, [("20:00", False)], locations=("LOC001", "LOC002"))])
@@ -333,6 +401,52 @@ class TestUnreadableSite(MonitorTestCase):
         _, _, _, sent = self.run_monitor([ok(NO_GRID), ok(LOCKED_EN)])
         self.assertEqual(sent, [])
         self.assertNotIn("unreadable_since", self.state())
+
+
+class TestStateWriteFailures(MonitorTestCase):
+    """A failing state.json write must never stop a session email or change
+    the exit code a path intends."""
+
+    def broken_state(self):
+        return mock.patch.object(monitor, "save_state", side_effect=OSError("read-only file system"))
+
+    def test_expired_email_and_exit_3_survive_a_failing_state_write(self):
+        with self.broken_state():
+            code, out, _, sent = self.run_monitor([login_redirect()])
+        self.assertEqual(code, monitor.EXIT_SESSION)
+        self.assertEqual([m["subject"] for m in sent], ["🔴 Bot session expired — reseed needed"])
+        self.assertIn("couldn't write state.json", out)
+
+    def test_lost_email_and_exit_4_survive_a_failing_state_write(self):
+        rotate = f"cs.member={MEMBER_NEW}; path=/; secure"
+        with self.broken_state(), mock.patch.object(bot_session.os, "replace", side_effect=OSError("disk full")):
+            code, _, _, sent = self.run_monitor([ok(GRID_EN, set_cookies=[rotate])])
+        self.assertEqual(code, monitor.EXIT_JAR)
+        self.assertEqual([m["subject"] for m in sent], ["🔴 Bot session likely lost — reseed needed"])
+
+    def test_transient_jar_failure_stays_exit_1(self):
+        with self.broken_state(), mock.patch.object(bot_session.os, "replace", side_effect=OSError("disk full")):
+            code, _, _, sent = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual((code, sent), (monitor.EXIT_ERROR, []))
+
+    def test_dead_session_repeat_run_stays_exit_0(self):
+        self.run_monitor([login_redirect()])
+        with self.broken_state():
+            code, _, adapter, sent = self.run_monitor([ok()])
+        self.assertEqual((code, adapter.sent, sent), (monitor.EXIT_OK, [], []))
+
+    def test_alert_cli_still_emails_and_exits_4(self):
+        with self.broken_state():
+            code, _, _, sent = self.run_monitor([], argv=["--alert-session-lost", "push failed"])
+        self.assertEqual(code, monitor.EXIT_JAR)
+        self.assertEqual(len(sent), 1)
+
+    def test_normal_run_still_emails_then_fails_the_run(self):
+        with self.broken_state():
+            code, out, _, sent = self.run_monitor([ok(GRID_EN), ok(GRID_EN)], iterations=2)
+        self.assertEqual(code, monitor.EXIT_ERROR)
+        self.assertEqual(len(sent), 1, "in-memory dedupe still works within the run")
+        self.assertIn("couldn't be written — failing the run", out)
 
 
 class TestLoginDetector(unittest.TestCase):
