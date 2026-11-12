@@ -12,23 +12,43 @@ Language-independent by design — nothing depends on English or Thai text:
     (no time selected), including normal open dates, so "is-locked" outside
     a slot never decides anything — it is reported as `locked` for
     diagnostics only.
-  * "Not open yet" needs BOTH no slot links AND an opens-at marker in the
-    page text ("opens 21:00", "เปิดจอง 21:00 น."). Neither = an unexpected
-    page, which callers must log and skip — not a closed date, not a dead
-    session.
+  * "Not open yet" needs BOTH no slot links AND a booking-specific
+    opens-at phrase in the page text ("Booking opens 21:00", "Opens for
+    booking at 21:00", "เปิดจอง 21:00 น."). Generic text such as "Opening
+    hours 06:00-22:00" is not one. Neither = an unexpected page, which
+    callers must log and skip — not a closed date, not a dead session.
+  * is_login_page() is the one login-page detector, shared by monitor.py
+    and probe_new_site.py.
 
-The opens-at marker is the one text-based rule (the site gives no class for
-it): an English or Thai "open" word followed by an HH:MM within a few
-characters.
+The opens-at phrase and the login text are the only text-based rules (the
+site gives no class for either).
 """
 
 import re
 from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 THAI_CHARS = re.compile(f"[{chr(0x0E00)}-{chr(0x0E7F)}]")  # the Thai Unicode block
 FIRST_INT = re.compile(r"\d+")  # str pattern: also matches Thai digits, which int() accepts
 TIME_RE = re.compile(r"(\d{1,2})[:.](\d{2})")
-OPENS_AT_RE = re.compile(r"(?:\bopen(?:s|ing)?\b|เปิด)[^0-9\n]{0,24}(\d{1,2})[:.](\d{2})", re.IGNORECASE)
+OPENS_AT_RE = re.compile(
+    r"(?:\bbookings?\s+(?:opens?|will\s+open)\b"        # "Booking opens", "Bookings will open"
+    r"|\bopens?\s+for\s+bookings?\b"                    # "Opens for booking"
+    r"|เปิด(?:ให้)?(?:การ)?จอง)"                           # "เปิดจอง", "เปิดให้จอง", "เปิดการจอง"
+    r"[^0-9\n]{0,24}(\d{1,2})[:.](\d{2})",
+    re.IGNORECASE)
+
+# Login-page detection. Strong markers alone are enough; login TEXT only
+# counts on a page that also has a <form>, so an ordinary page with a
+# "Log in" link is never mistaken for one.
+LOGIN_URL_PATH = "/account/login"
+LOGIN_STRONG_MARKERS = {
+    "password input": re.compile(r"<input[^>]*\btype\s*=\s*[\"']?password\b", re.IGNORECASE),
+    "OTP input": re.compile(r"<input[^>]*(?:autocomplete\s*=\s*[\"']?one-time-code"
+                            r"|\bname\s*=\s*[\"']?[\w.-]*otp)", re.IGNORECASE),
+    "login form": re.compile(r"<form[^>]*\baction\s*=\s*[\"']?[^\"'>]*/account/login", re.IGNORECASE),
+}
+LOGIN_TEXT = re.compile(r"เข้าสู่ระบบ|\bsign[\s-]?in\b|\blog[\s-]?in\b", re.IGNORECASE)
 
 
 class PageParser(HTMLParser):
@@ -101,6 +121,22 @@ class PageParser(HTMLParser):
             self._slot[self._field] += data
         if not self._in_script:
             self.text.append(data)
+
+
+def login_page_markers(html, url=""):
+    """Names of the login-page markers present (empty = not a login page)."""
+    hits = []
+    if LOGIN_URL_PATH in urlsplit(url or "").path.lower():
+        hits.append("login URL")
+    html = html or ""
+    hits += [name for name, rx in LOGIN_STRONG_MARKERS.items() if rx.search(html)]
+    if not hits and LOGIN_TEXT.search(html) and re.search(r"<form\b", html, re.IGNORECASE):
+        hits.append("login text + form")
+    return hits
+
+
+def is_login_page(html, url=""):
+    return bool(login_page_markers(html, url))
 
 
 def slot_time(text):

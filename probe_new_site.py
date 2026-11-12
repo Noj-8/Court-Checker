@@ -61,7 +61,7 @@ from datetime import datetime, timedelta
 import requests
 
 import bot_session
-from booking_page import FIRST_INT, THAI_CHARS, PageParser, parse_page  # noqa: F401 (re-exported)
+from booking_page import FIRST_INT, THAI_CHARS, PageParser, login_page_markers, parse_page  # noqa: F401 (re-exported)
 from bot_session import (  # noqa: F401 (re-exported)
     BASE, BOOKING_PATH, CULTURE_COOKIE, ENC_FILE, FORBIDDEN_PATH_FRAGMENTS, HOST, JAR_FILE,
     JAR_KEY_ENV, JAR_VERSION, LOGIN_REDIRECT_MARKERS, OPTIONAL_SEED, SEED_ENV, TZ, USER_AGENT,
@@ -72,7 +72,6 @@ from bot_session import (  # noqa: F401 (re-exported)
 )
 
 LOCATIONS = {"LOC001": "Crystal Sports", "LOC002": "Crystal Sports G"}
-LOGIN_BODY_MARKERS = ('type="password"', "/account/login", "เข้าสู่ระบบ", "otp")
 CHALLENGE_BODY_MARKERS = (
     "just a moment", "challenge-platform", "cf-turnstile",
     "challenges.cloudflare.com/turnstile",
@@ -119,7 +118,7 @@ def probe_once(jar, loc, date):
     challenge_hits = [m for m in CHALLENGE_BODY_MARKERS if m in body_lower]
     if resp.headers.get("cf-mitigated"):
         challenge_hits.insert(0, f"cf-mitigated: {resp.headers['cf-mitigated']}")
-    login_hits = [m for m in LOGIN_BODY_MARKERS if m in body_lower]
+    login_hits = login_page_markers(body, resp.url)
     if challenge_hits:
         diag.append(f"verdict:    CLOUDFLARE CHALLENGE — {', '.join(challenge_hits)}")
     elif result["login"]:

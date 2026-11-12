@@ -266,12 +266,25 @@ def describe_expiry(expires, previous=None):
     was never copied — rather than shown as if it were a session cookie."""
     if expires is None:
         return "expires=session (no Expires/Max-Age)"
-    text = (f"expires={datetime.fromtimestamp(expires, TZ).isoformat(timespec='seconds')} "
-            f"(in {fmt_duration(expires - time.time())}")
-    if previous is not None:
+    when = _expiry_datetime(expires)
+    if when is None:
+        return "expires=far future (9999-12-31 sentinel or beyond)"
+    text = f"expires={when.isoformat(timespec='seconds')} (in {fmt_duration(expires - time.time())}"
+    if previous is not None and _expiry_datetime(previous) is not None:
         delta = expires - previous
         text += f"; {'+' if delta >= 0 else '-'}{fmt_duration(abs(delta))} vs previous"
     return text + ")"
+
+
+def _expiry_datetime(expires):
+    """The expiry as a Bangkok datetime, or None for "far future": the
+    9999-12-31 "never expires" sentinel (which overflows once shifted to
+    +07:00) and anything else out of range. Never raises."""
+    try:
+        when = datetime.fromtimestamp(expires, TZ)
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+    return None if when.year >= 9999 else when
 
 
 def merge_set_cookies(session, resp):
@@ -395,9 +408,14 @@ def is_login_redirect(resp):
 def fetch(jar, path, params):
     """GET one allowed page on the bot's session. The jar is saved before
     this returns — before the caller parses or prints anything about the
-    response. Raises JarSaveError if it can't be saved (stop: the copy on
-    disk may be superseded), requests.RequestException on network errors.
-    Fetched.login=True means the session is no longer valid: stop."""
+    response — and it is saved even when the request or the body read
+    raises, so a Set-Cookie that arrived is never lost: the headers (and
+    cookies) are taken with stream=True, the jar is saved, and only then is
+    the body read. Raises JarSaveError if the jar can't be saved (stop: the
+    copy on disk may be superseded), requests.RequestException on network
+    errors (including a body that fails mid-read — the cookies from its
+    headers are already on disk). Fetched.login=True means the session is
+    no longer valid: stop."""
     url = BASE + path
     if path not in ALLOWED_GET_PATHS or urlsplit(url).path != path or any(f in url for f in FORBIDDEN_PATH_FRAGMENTS):
         raise RuntimeError(f"refusing to request {path!r} — the bot session is GET /booking only")
@@ -406,22 +424,40 @@ def fetch(jar, path, params):
     try:
         before, _ = cookie_values(jar.session)
         before_exp = cookie_expiries(jar.session)
-        # The culture cookie goes per-request so it is sent but never stored
-        # in the jar — the jar holds only what the server itself issued.
-        resp = jar.session.get(url, params=params, cookies=CULTURE_COOKIE, allow_redirects=False, timeout=20)
+        resp, request_error = None, None
+        try:
+            # The culture cookie goes per-request so it is sent but never
+            # stored in the jar — the jar holds only what the server issued.
+            # stream=True: return as soon as the headers (and Set-Cookie)
+            # are in, so the jar is saved before the body is read.
+            resp = jar.session.get(url, params=params, cookies=CULTURE_COOKIE,
+                                   allow_redirects=False, timeout=20, stream=True)
+            merge_set_cookies(jar.session, resp)
+        except BaseException as e:  # saved below regardless, then re-raised
+            request_error = e
 
-        # Persist first, before anything else looks at the response.
-        merge_set_cookies(jar.session, resp)
+        # Persist first — whatever the session now holds, even if the
+        # request raised — before anything else looks at the response.
         after, dupes = cookie_values(jar.session)
         after_exp = cookie_expiries(jar.session)
         changes = diff_cookies(before, after)
         try:
             save_jar(jar.path, jar.session, jar.fernet)
         except OSError as e:
-            raise JarSaveError(f"{type(e).__name__}: {e}", changes) from None
+            raise JarSaveError(f"{type(e).__name__}: {e}", changes) from request_error
+        if request_error is not None:
+            raise request_error
+        log_cookie_changes(changes, dupes, before_exp, after_exp)
+        try:
+            resp.content  # the body, read only now that the jar is safe on disk
+        finally:
+            resp.close()
     finally:
         _request_lock.release()
+    return Fetched(resp=resp, changes=changes, login=is_login_redirect(resp))
 
+
+def log_cookie_changes(changes, dupes, before_exp, after_exp):
     for kind, name, old, new in changes:
         if kind == "ROTATED":
             say(f"[{stamp()}] ROTATED {name}: {fingerprint(old)} -> {fingerprint(new)} | "
@@ -432,4 +468,3 @@ def fetch(jar, path, params):
             say(f"[{stamp()}] REMOVED {name}: was {fingerprint(old)}")
     for name in sorted(dupes):
         say(f"[{stamp()}] WARNING: jar holds more than one {name} cookie")
-    return Fetched(resp=resp, changes=changes, login=is_login_redirect(resp))

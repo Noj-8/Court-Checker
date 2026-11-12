@@ -237,16 +237,29 @@ class TestCheckPass(MonitorTestCase):
         self.assertIn("1 tennis slot(s) open", sent[0]["subject"])
         self.assertIn("20:00", sent[0]["body"])
 
-    def test_locked_date_is_not_open_yet_not_an_error(self):
-        self.state_file.write_text(json.dumps({"known_open": {f"{self.date}|LOC001|any|20:00": True}}))
+    def test_not_open_yet_is_a_read_not_an_error_and_keeps_known_open(self):
+        known = {f"{self.date}|LOC001|any|20:00": True}
+        self.state_file.write_text(json.dumps({"known_open": known}))
         for page in (LOCKED_EN, LOCKED_TH):
             with self.subTest(lang=page[12:14]):
                 code, out, adapter, sent = self.run_monitor([ok(page)], iterations=1)
                 self.assertEqual(code, monitor.EXIT_OK)
                 self.assertEqual(sent, [])
                 self.assertIn("not open yet (opens 21:00)", out)
-                self.assertNotIn("session_alert", self.state())
-                self.assertEqual(self.state()["known_open"], {})
+                state = self.state()
+                self.assertNotIn("session_alert", state)
+                self.assertEqual(state["known_open"], known, "not-open-yet must leave known_open as-is")
+                self.assertIn("last_check", state, "a not-open-yet page counts as a read")
+                self.assertNotIn("unreadable_passes", state)
+
+    def test_opening_hours_text_without_a_grid_is_an_unexpected_page(self):
+        page = "<html><body><p>Opening hours 06:00-22:00</p><p>เวลาเปิด 06:00 - 22:00 น.</p></body></html>"
+        self.assertFalse(booking_page.parse_page(page)["not_open_yet"])
+        self.assertIsNone(booking_page.parse_page(page)["opens_at"])
+        code, out, _, sent = self.run_monitor([ok(page)])
+        self.assertEqual((code, sent), (monitor.EXIT_OK, []))
+        self.assertIn("unexpected page", out)
+        self.assertNotIn("not open yet", out)
 
     def test_zero_free_unwatched_times_and_legacy_config_strings(self):
         cfg = {"targets": [{"name": "Old", "date": self.date, "locations": ["LOC002"], "times": ["20:00", "21:00"]}]}
@@ -277,6 +290,74 @@ class TestCheckPass(MonitorTestCase):
         self.write_config([target(day(-1), [("20:00", False)])])
         code, _, adapter, sent = self.run_monitor([])
         self.assertEqual((code, adapter.sent, sent), (monitor.EXIT_OK, [], []))
+
+
+class TestUnreadableSite(MonitorTestCase):
+    def test_unreadable_pass_leaves_last_check_and_counts(self):
+        before = {"last_check": "2026-01-01T00:00:00+07:00", "currently_open_count": 3,
+                  "known_open": {f"{self.date}|LOC001|any|20:00": True}}
+        self.state_file.write_text(json.dumps(before))
+        code, out, _, sent = self.run_monitor([ok(NO_GRID), (503, [], "")], iterations=2)
+        self.assertEqual((code, sent), (monitor.EXIT_OK, []))
+        state = self.state()
+        for k, v in before.items():
+            self.assertEqual(state[k], v, f"{k} must not move when no page was read")
+        self.assertEqual(state["unreadable_passes"], 2)
+        self.assertIn("unreadable_since", state)
+
+    def test_one_email_after_30_minutes_then_cleared_by_a_good_read(self):
+        since = (datetime.now(monitor.TZ) - timedelta(minutes=31)).isoformat()
+        self.state_file.write_text(json.dumps({"unreadable_since": since, "unreadable_passes": 7}))
+        _, _, _, sent = self.run_monitor([ok(NO_GRID)])
+        self.assertEqual([m["subject"] for m in sent], ["🔴 Monitor can't read the booking site"])
+        self.assertIn("31 minutes", sent[0]["body"])
+        self.assertIn("unexpected page", sent[0]["body"])
+        _, _, _, sent = self.run_monitor([(503, [], ""), (503, [], "")], iterations=2)
+        self.assertEqual(sent, [], "deduped until a good read")
+        _, _, _, sent = self.run_monitor([ok(grid(("20:00", "Full", True)))])
+        self.assertEqual(sent, [])
+        state = self.state()
+        for k in ("unreadable_since", "unreadable_passes", "read_alert"):
+            self.assertNotIn(k, state)
+        self.assertIn("last_check", state)
+
+    def test_no_email_before_30_minutes(self):
+        since = (datetime.now(monitor.TZ) - timedelta(minutes=29)).isoformat()
+        self.state_file.write_text(json.dumps({"unreadable_since": since}))
+        _, _, _, sent = self.run_monitor([ok(NO_GRID)])
+        self.assertEqual(sent, [])
+
+    def test_one_readable_page_counts_as_a_read(self):
+        self.write_config([target(self.date, [("20:00", False)], locations=("LOC001", "LOC002"))])
+        self.state_file.write_text(json.dumps({"unreadable_since": day(-1) + "T00:00:00+07:00"}))
+        _, _, _, sent = self.run_monitor([ok(NO_GRID), ok(LOCKED_EN)])
+        self.assertEqual(sent, [])
+        self.assertNotIn("unreadable_since", self.state())
+
+
+class TestLoginDetector(unittest.TestCase):
+    def test_login_pages(self):
+        for label, html, url in [
+            ("password input", '<form><input type="password" name="p"></form>', ""),
+            ("OTP input", '<input autocomplete="one-time-code">', ""),
+            ("OTP by name", "<input name='otpCode'>", ""),
+            ("login form action", '<form method="post" action="/account/login?ReturnUrl=%2F">', ""),
+            ("login URL", "<p>hello</p>", f"{bot_session.BASE}/account/login?ReturnUrl=%2Fbooking"),
+            ("Thai text + form", "<h1>เข้าสู่ระบบ</h1><form><input name='mobile'></form>", ""),
+            ("English text + form", "<h1>Sign in</h1><form><input name='mobile'></form>", ""),
+        ]:
+            with self.subTest(label):
+                self.assertTrue(booking_page.is_login_page(html, url))
+
+    def test_not_login_pages(self):
+        for label, html in [
+            ("a Log in link, no form", '<a href="/account/login">Log in</a><p>Server busy</p>'),
+            ("logged-in nav", '<a href="/account/logout">Log out</a><form action="/booking/search"><input name="q"></form>'),
+            ("the grid", GRID_EN),
+            ("not open yet", LOCKED_TH),
+        ]:
+            with self.subTest(label):
+                self.assertFalse(booking_page.is_login_page(html, f"{bot_session.BASE}/booking"))
 
 
 class TestNoPost(MonitorTestCase):
@@ -342,11 +423,54 @@ class TestSessionFailures(MonitorTestCase):
         self.assertEqual(len(adapter.sent), 1)
         self.assertEqual(len(sent), 1)
 
-    def test_login_form_served_as_200_counts_as_expired(self):
-        page = '<html><body><form action="/account/login"><input type="password"></form></body></html>'
-        code, _, _, sent = self.run_monitor([ok(page)])
-        self.assertEqual(code, monitor.EXIT_SESSION)
-        self.assertEqual(len(sent), 1)
+    def test_login_or_otp_page_served_as_200_counts_as_expired(self):
+        for page in ('<html><body><form action="/account/login"><input type="password"></form></body></html>',
+                     '<html><body><h1>ยืนยัน OTP</h1><input autocomplete="one-time-code"></body></html>'):
+            with self.subTest(page=page[12:40]):
+                self.state_file.unlink(missing_ok=True)
+                code, _, _, sent = self.run_monitor([ok(page)])
+                self.assertEqual(code, monitor.EXIT_SESSION)
+                self.assertEqual(len(sent), 1)
+
+    def test_save_failure_without_cookie_changes_is_transient(self):
+        with mock.patch.object(bot_session.os, "replace", side_effect=OSError("disk full")):
+            code, out, adapter, sent = self.run_monitor([ok(GRID_EN), ok()], iterations=2)
+        self.assertEqual(code, monitor.EXIT_ERROR)
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(sent, [], "no session email: nothing was lost")
+        self.assertNotIn("session_alert", self.state())
+        self.assertIn("no cookie had changed", out)
+        # No permanent halt: the next run sends requests and works normally.
+        code, _, adapter, sent = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual((code, len(adapter.sent), len(sent)), (monitor.EXIT_OK, 1, 1))
+
+    def test_body_read_failure_after_rotation_still_persists_the_cookie(self):
+        rotate = f"cs.member={MEMBER_NEW}; path=/; secure"
+        broken = ok(GRID_EN, set_cookies=[rotate]) + (requests.exceptions.ChunkedEncodingError("connection reset mid-body"),)
+        code, out, adapter, sent = self.run_monitor([broken, ok(GRID_EN)], iterations=2)
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertIn("connection reset mid-body", out)
+        on_disk = {r["name"]: r["value"] for r in json.loads(self.jar.read_text())["cookies"]}
+        self.assertEqual(on_disk["cs.member"], MEMBER_NEW)
+        self.assertIn(("cs.member", MEMBER_NEW), adapter.sent[1]["cookies"])
+        self.assertNotIn(("cs.member", COOKIES["cs.member"]), adapter.sent[1]["cookies"])
+        self.assertIn("ROTATED cs.member", out)
+        self.assertNotIn(MEMBER_NEW, out)
+
+    def test_jar_is_saved_even_if_handling_the_response_raises(self):
+        # requests has applied the Set-Cookie by the time get() returns; if
+        # anything after that raises, the rotation must still reach disk.
+        session = requests.Session()
+        adapter = ScriptedAdapter([ok(GRID_EN, set_cookies=[f"cs.member={MEMBER_NEW}; path=/; secure"])])
+        session.mount("https://", adapter)
+        for name, value in COOKIES.items():
+            session.cookies.set_cookie(bot_session.create_cookie(name, value, domain=bot_session.HOST, path="/", secure=True))
+        jar = bot_session.Jar(session=session, path=self.jar)
+        with mock.patch.object(bot_session, "merge_set_cookies", side_effect=RuntimeError("boom")), \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            bot_session.fetch(jar, bot_session.BOOKING_PATH, {})
+        on_disk = {r["name"]: r["value"] for r in json.loads(self.jar.read_text())["cookies"]}
+        self.assertEqual(on_disk["cs.member"], MEMBER_NEW)
 
     def test_rotation_that_cannot_be_saved_is_session_likely_lost(self):
         rotate = f"cs.member={MEMBER_NEW}; path=/; secure"

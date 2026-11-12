@@ -55,19 +55,27 @@ GRID_TH = """<html lang="th"><head><title>จองสนาม</title></head><b
 </body></html>"""
 
 
-def make_response(request, status, headers, body):
+def make_response(request, status, headers, body, body_error=None):
+    """body_error: an exception raised when the body is read (the headers,
+    and so the Set-Cookie, have already arrived)."""
     raw_headers = "".join(f"{k}: {v}\r\n" for k, v in headers).encode("latin-1") + b"\r\n"
     msg = http.client.parse_headers(io.BytesIO(raw_headers))
+
+    def read(*a, **k):
+        if body_error is not None:
+            raise body_error
+        return b""
+
     raw = types.SimpleNamespace(
         _original_response=types.SimpleNamespace(msg=msg),
-        close=lambda: None, release_conn=lambda: None, read=lambda *a, **k: b"",
+        close=lambda: None, release_conn=lambda: None, read=read,
     )
     resp = requests.Response()
     resp.status_code = status
     for k, v in headers:
         resp.headers[k] = v if k not in resp.headers else resp.headers[k] + ", " + v
-    resp._content = body.encode("utf-8")
-    resp._content_consumed = True
+    resp._content = False if body_error is not None else body.encode("utf-8")
+    resp._content_consumed = body_error is None
     resp.encoding = "utf-8"
     resp.url = request.url
     resp.request = request
@@ -90,8 +98,8 @@ class ScriptedAdapter(requests.adapters.BaseAdapter):
             self.on_send(len(self.sent))
         if not self.script:
             raise AssertionError(f"unexpected extra request: {request.method} {request.url}")
-        status, headers, body = self.script.pop(0)
-        return make_response(request, status, headers, body)
+        status, headers, body, *body_error = self.script.pop(0)
+        return make_response(request, status, headers, body, *body_error)
 
     def close(self):
         pass
@@ -238,6 +246,28 @@ class TestRotationExpiry(ProbeTestCase):
         self.assertEqual(code, probe.EXIT_OK)
         rotation = next(line for line in out.splitlines() if "ROTATED cs.member" in line)
         self.assertRegex(rotation, r"expires=\S+ \(in (0h 59m|1h 0m)\)")
+
+
+class TestExpiryIsTotal(unittest.TestCase):
+    def test_sentinel_and_overflow_are_far_future(self):
+        for value in (253402300799, 253402300799.0, 10 ** 20, float("inf"), float("nan")):
+            with self.subTest(value=value):
+                self.assertEqual(probe.describe_expiry(value), "expires=far future (9999-12-31 sentinel or beyond)")
+        normal = time.time() + 3600
+        self.assertNotIn("vs previous", probe.describe_expiry(normal, 253402300799),
+                         "no delta against a far-future previous")
+        self.assertIn("far future", probe.describe_expiry(253402300799, normal))
+
+
+class TestFarFutureRotation(ProbeTestCase):
+    def test_rotation_to_a_never_expiring_cookie_is_logged_not_a_crash(self):
+        rotate = f"cs.member={MEMBER_NEW}; expires=Fri, 31 Dec 9999 23:59:59 GMT; path=/; secure"
+        code, out, adapter, _ = self.run_probe([ok(set_cookies=[rotate]), ok()], env=SEED)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual(len(adapter.sent), 2)
+        self.assertIn("ROTATED cs.member", out)
+        self.assertIn("expires=far future", out)
+        self.assertEqual(self.jar_cookies()["cs.member"], MEMBER_NEW)
 
 
 class TestAtomicWrite(ProbeTestCase):

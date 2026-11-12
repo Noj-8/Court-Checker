@@ -22,17 +22,24 @@ apart (default 60), then exits. Designed for GitHub Actions cron */5.
                   bot_session.fetch(). Grid first: if slot links are
                   parsed they decide (the court map's is-locked never
                   matters); a slot is open iff it lacks "is-disabled" and
-                  its free count isn't 0. No slots + an opens-at marker
-                  ("opens 21:00") = "not open yet"; no slots and no marker
-                  = unexpected page: logged, skipped, no emails, not a
-                  session failure.
+                  its free count isn't 0. No slots + a booking opens-at
+                  phrase ("Booking opens 21:00") = "not open yet" (counts
+                  as a read; known_open for it is kept as-is); no slots and
+                  no phrase = unexpected page: logged, skipped, no emails,
+                  not a session failure.
+  Unreadable:     last_check (the dashboard's "active") only moves when a
+                  pass read at least one page. After 30 min of passes that
+                  read nothing, ONE "Monitor can't read the booking site"
+                  email, cleared by the next good read.
   State:          known_open["date|loc|any|HH:MM"] dedupes "slot open"
                   emails exactly as before (the grid has no per-court
                   detail, so the court part of the key is "any").
                   session_alert dedupes the session email: sent once per
                   dead jar, cleared by the next successful check.
   Exit code:      0  ok
-                  1  setup error (missing env var, no/unreadable jar)
+                  1  setup error (missing env var, no/unreadable jar), or
+                     the jar couldn't be saved but no cookie had changed
+                     (transient: the copy on disk is current; next run retries)
                   3  bot session expired (login redirect) — the run that
                      detects it. Later runs on the same dead jar send
                      nothing and exit 0 (the dashboard shows "stale").
@@ -58,7 +65,7 @@ import requests
 
 import bot_session
 from bot_session import BASE, BOOKING_PATH, TZ
-from booking_page import parse_page, slot_time
+from booking_page import is_login_page, parse_page, slot_time
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
@@ -79,6 +86,8 @@ LOCATIONS = {
 }
 
 EXIT_OK, EXIT_SETUP, EXIT_SESSION, EXIT_JAR = 0, 1, 3, 4
+EXIT_ERROR = 1  # a failed run that needs no reseed
+UNREADABLE_ALERT_AFTER_MINUTES = 30
 
 RESEED_STEPS = """To reseed (on the Mac, in court-checker-live):
   1. Open an Incognito window, log in to {base}, copy cs.did then
@@ -174,9 +183,9 @@ def fetch_availability(jar, date, loc_id):
     body = resp.text or ""
     page = parse_page(body)
     if not page["slots"]:
-        if 'type="password"' in body.lower():
-            # A login form served as a 200 instead of the usual redirect.
-            return "login", None, "login form (200)"
+        if is_login_page(body, resp.url):
+            # A login page served as a 200 instead of the usual redirect.
+            return "login", None, "login page (200)"
         if page["not_open_yet"]:
             return "not_open_yet", {}, page["opens_at"]
         return "error", None, (f"unexpected page — no slot grid and no opens-at marker "
@@ -237,7 +246,8 @@ def run_check_pass(state, config, jar, email):
         return "ok"
 
     fetch_keys = sorted({(t["date"], loc) for t in active for loc in t["locations"]})
-    cache = {}  # (date, loc) -> {"HH:MM": free}; only for pages that were read successfully
+    cache = {}  # (date, loc) -> {"HH:MM": free}; only for grids that were read
+    pages_read, problems = 0, []
     for date, loc in fetch_keys:
         log(f"  → {LOCATIONS.get(loc, loc)} / {date}")
         kind, open_times, info = fetch_availability(jar, date, loc)
@@ -246,14 +256,24 @@ def run_check_pass(state, config, jar, email):
             return "login"
         if kind == "error":
             log(f"      ⚠ {info}")
+            problems.append(f"{LOCATIONS.get(loc, loc)} / {date}: {info}")
             continue
+        pages_read += 1
         state.pop("session_alert", None)  # the session works: a future failure may email again
         if kind == "not_open_yet":
+            # Not in `cache`: a date that isn't bookable yet says nothing
+            # about what was open, so its known_open entries stay as they are.
             log("      not open yet" + (f" (opens {info})" if info else ""))
-        else:
-            shown = " ".join(f"{t}({'?' if f is None else f})" for t, f in sorted(open_times.items()))
-            log(f"      open: {shown or 'none'}")
+            continue
+        shown = " ".join(f"{t}({'?' if f is None else f})" for t, f in sorted(open_times.items()))
+        log(f"      open: {shown or 'none'}")
         cache[(date, loc)] = open_times
+
+    if pages_read == 0:
+        note_unreadable_pass(state, problems, email)
+        return "ok"  # last_check, currently_open_count and known_open untouched
+    for k in ("unreadable_since", "unreadable_passes", "read_alert"):
+        state.pop(k, None)
 
     known_open = {k: v for k, v in state.get("known_open", {}).items() if k.split("|", 1)[0] >= today_str}
     new_alerts = []
@@ -318,6 +338,31 @@ def run_check_pass(state, config, jar, email):
     return "ok"
 
 
+def note_unreadable_pass(state, problems, email):
+    """A pass that read no page at all. After UNREADABLE_ALERT_AFTER_MINUTES
+    of these in a row, send ONE email; the next good read clears it."""
+    now = datetime.now(TZ)
+    since = state.setdefault("unreadable_since", now.isoformat())
+    state["unreadable_passes"] = state.get("unreadable_passes", 0) + 1
+    minutes = int((now - datetime.fromisoformat(since)).total_seconds() // 60)
+    log(f"  ⚠ no page readable this pass ({state['unreadable_passes']} pass(es) in a row, {minutes} min)")
+    if "read_alert" in state or minutes < UNREADABLE_ALERT_AFTER_MINUTES:
+        return
+    body = (f"The monitor hasn't been able to read a single booking page for {minutes} minutes\n"
+            f"({state['unreadable_passes']} check passes in a row). The bot session itself still looks\n"
+            "valid — this is the site or the network, or the page changed shape.\n\n"
+            "Last problems:\n" + "\n".join(f"  • {p}" for p in problems[:10]) + "\n\n"
+            "No slot emails can go out until it reads a page again. Nothing to do if it\n"
+            "recovers; you'll get no further email about this until then.\n")
+    try:
+        send_email("🔴 Monitor can't read the booking site", body, *email)
+    except Exception as e:
+        log(f"⚠ unreadable-site email failed: {e}")
+        return
+    state["read_alert"] = {"sent_at": now.isoformat()}
+    log("✉ unreadable-site email sent")
+
+
 def email_settings(config=None):
     user = os.environ.get("EMAIL_USER", "").strip()
     password = os.environ.get("EMAIL_APP_PASSWORD", "").strip()
@@ -362,9 +407,13 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
         try:
             status = run_check_pass(state, config, jar, email)
         except bot_session.JarSaveError as e:
-            log(f"🔴 couldn't save {jar.path.name} ({e.error}) — "
-                + ("a rotated cookie was NOT saved; the session is likely lost" if e.changes
-                   else "nothing had changed, but stopping rather than risk it"))
+            save_state(state)
+            if not e.changes:
+                log(f"⚠ couldn't save {jar.path.name} ({e.error}), but no cookie had changed — the copy on "
+                    "disk is still current. Failing this run; the next one retries.")
+                return EXIT_ERROR
+            log(f"🔴 couldn't save {jar.path.name} ({e.error}) — a rotated cookie was NOT saved; "
+                "the session is likely lost")
             alert_session(state, "lost", f"saving {jar.path.name} failed: {e.error}",
                           bot_session.file_fingerprint(jar.path), email)
             save_state(state)
