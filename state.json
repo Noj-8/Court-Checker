@@ -2,64 +2,7 @@
   "known_open": {
     "2026-11-15|LOC001|any|21:00": true
   },
-  "last_check": "2026-11-12T23:58:28.617099+07:00",
+  "last_check": "2026-11-13T00:03:38.228830+07:00",
   "currently_open_count": 1,
-  "autobook_attempts": {
-    "2026-11-12|LOC002|G South-1|22:00": {
-      "outcome": "parked",
-      "statusCode": "10",
-      "bookingRef": "SPORTS-202611209134",
-      "message": "Insufficient fund | 500.00 THB",
-      "classification_warning": null,
-      "attempted_at": "2026-11-09T13:06:20.517681+07:00"
-    },
-    "2026-11-12|LOC001|North-1|22:00": {
-      "outcome": "parked",
-      "statusCode": "10",
-      "bookingRef": "SPORTS-202611209438",
-      "message": "Insufficient fund | 500.00 THB",
-      "classification_warning": null,
-      "attempted_at": "2026-11-10T12:01:30.457232+07:00"
-    },
-    "2026-11-12|LOC001|North-2|23:00": {
-      "outcome": "parked",
-      "statusCode": "10",
-      "bookingRef": "SPORTS-202611209531",
-      "message": "Insufficient fund | 500.00 THB",
-      "classification_warning": null,
-      "attempted_at": "2026-11-10T17:05:17.109214+07:00"
-    },
-    "2026-11-12|LOC001|North-3|23:00": {
-      "outcome": "parked",
-      "statusCode": "10",
-      "bookingRef": "SPORTS-202611209532",
-      "message": "Insufficient fund | 500.00 THB",
-      "classification_warning": null,
-      "attempted_at": "2026-11-10T17:05:18.402617+07:00"
-    },
-    "2026-11-12|LOC001|Center-1|23:00": {
-      "outcome": "parked",
-      "statusCode": "10",
-      "bookingRef": "SPORTS-202611209533",
-      "message": "Insufficient fund | 500.00 THB",
-      "classification_warning": null,
-      "attempted_at": "2026-11-10T17:05:19.704368+07:00"
-    },
-    "2026-11-12|LOC002|G Center-2|23:00": {
-      "outcome": "parked",
-      "statusCode": "10",
-      "bookingRef": "SPORTS-202611209534",
-      "message": "Insufficient fund | 500.00 THB",
-      "classification_warning": null,
-      "attempted_at": "2026-11-10T17:05:21.002768+07:00"
-    },
-    "2026-11-12|LOC002|G South-1|23:00": {
-      "outcome": "parked",
-      "statusCode": "10",
-      "bookingRef": "SPORTS-202611209535",
-      "message": "Insufficient fund | 500.00 THB",
-      "classification_warning": null,
-      "attempted_at": "2026-11-10T17:05:22.285032+07:00"
-    }
-  }
+  "autobook_attempts": {}
 }
