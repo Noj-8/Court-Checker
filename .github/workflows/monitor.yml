@@ -63,6 +63,8 @@ jobs:
           fi
           jar_changed=false
           if [ -n "$(git status --porcelain -- bot_session.enc)" ]; then jar_changed=true; fi
+          state_changed=false
+          if [ -n "$(git status --porcelain -- state.json)" ]; then state_changed=true; fi
           git config user.name "tennis-monitor[bot]"
           git config user.email "tennis-monitor@users.noreply.github.com"
           git add state.json bot_session.enc
@@ -81,11 +83,14 @@ jobs:
             fi
             sleep $((attempt * 2))
           done
+          if [ "$state_changed" = true ]; then
+            echo "state_not_saved=true" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$jar_changed" = true ]; then
             echo "session_lost=true" >> "$GITHUB_OUTPUT"
             echo "::error title=Bot session likely lost::A cookie rotated during this run but bot_session.enc could not be pushed. The copy in the repo is now superseded and presenting it kills the session — reseed needed (see the email)."
           else
-            echo "::error::state.json could not be pushed (the bot session was unchanged, so it is fine)."
+            echo "::error::state.json could not be pushed (the bot session was unchanged, so it is fine). Auto-book records from this run are not in the repo — see the email."
           fi
           exit 1
 
@@ -96,6 +101,34 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
         run: python monitor.py --alert-session-lost "bot_session.enc could not be pushed after a cookie rotated"
+
+      # Deduped: a small marker (the repo's state.json blob id it was sent for)
+      # lives in the Actions cache, since the repo itself is what can't be written.
+      - name: Restore the "state not saved" email marker
+        if: always() && steps.save.outputs.state_not_saved == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .state_alert.json
+          key: state-not-saved-${{ github.run_id }}
+          restore-keys: state-not-saved-
+
+      - name: Email if state.json could not be saved
+        if: always() && steps.save.outputs.state_not_saved == 'true'
+        env:
+          BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: |
+          git fetch -q origin main || true
+          REMOTE_STATE_BLOB="$(git rev-parse -q --verify origin/main:state.json || echo unknown)" \
+            python monitor.py --alert-state-not-saved "state.json could not be pushed to main"
+
+      - name: Save the "state not saved" email marker
+        if: always() && steps.save.outputs.state_not_saved == 'true' && hashFiles('.state_alert.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .state_alert.json
+          key: state-not-saved-${{ github.run_id }}
 
       - name: Check no plaintext jar on the runner
         if: always()

@@ -725,7 +725,7 @@ class TestModes(AutobookTestCase):
         for mode in ("dry_run", "live"):
             with self.subTest(mode=mode):
                 self.site = FakeSite(self.p)
-                self.state_file.unlink(missing_ok=True)
+                self.state_file.write_text("{}")
                 code, sent = self.run_mode(mode)
                 self.assertEqual(self.site.methods(), ["GET"])
                 self.assertEqual([s["path"] for s in self.site.sent], ["/booking"])
@@ -896,7 +896,7 @@ class TestStateHoldsNoSiteText(AutobookTestCase):
             state = self.assert_state_clean(label)
             rec = state.get(autobook.LIVE_KEY, {}).get(self.key) or state.get(autobook.RETRY_KEY, {}).get(self.key)
             codes[label] = (rec.get("status"), rec.get("reason"), rec.get("problems"))
-        self.assertEqual(codes["unexpected pre-filled field"], ("aborted_mismatch", None, ["unexpected_field:?"]))
+        self.assertEqual(codes["unexpected pre-filled field"], ("aborted_mismatch", None, ["unexpected_field"]))
         self.assertEqual(codes["coach pre-selected"], ("aborted_mismatch", None, ["coach_preselected"]))
         self.assertEqual(codes["different date"][2], ["page_mismatch:time"])
         self.assertEqual(codes["unclear (network)"][:2], ("unclear", "not_listed_after:network_error"))
@@ -1035,15 +1035,6 @@ class TestStateFile(AutobookTestCase):
         self.run_mode("live")
         self.assertEqual(len(self.site.posts_sent()), 1)
 
-    def test_a_missing_state_file_is_just_a_fresh_start(self):
-        self.assertFalse(self.state_file.exists())
-        self.site.posts = [parked_redirect()]
-        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
-        code, sent = self.run_mode("live")
-        self.assertNotIn("autobook_halted", self.state())
-        self.assertEqual(len(self.site.posts_sent()), 1)
-
-
 class TestClashUsesTimeRanges(AutobookTestCase):
     def test_overlaps(self):
         d = "2026-11-15"
@@ -1090,7 +1081,7 @@ class TestErrorsNeverDropAnything(AutobookTestCase):
         ctx = autobook.Context(None, {}, "live", send=mock.Mock(side_effect=OSError("smtp")), save_state=None,
                                try_save_state=None, log=lambda m: None, locations={})
         self.assertFalse(ctx.email("k", "🟢 x", "y"))
-        self.assertEqual(ctx.emailed_keys, set())
+        self.assertEqual(ctx.emailed_slots, set())
 
     def test_a_crashing_auto_book_still_sends_the_slot_open_email(self):
         for exc in (RuntimeError("bug"), KeyError("x"), bot_session.JarSaveError("disk full", [])):
@@ -1202,6 +1193,288 @@ class TestErrorsNeverDropAnything(AutobookTestCase):
         self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
         self.run_mode("live")
         self.assertEqual(self.site.posts_sent(), [])
+
+
+
+# --- independent review ----------------------------------------------------------
+
+class TestHaltIsDurable(AutobookTestCase):
+    BAD = {
+        "missing": None,
+        "not json": "{oops",
+        "autobook is a list": json.dumps({"autobook": []}),
+        "a record's attempts aren't a list": json.dumps({"autobook": {"2026-11-15|23:00": {"status": "parked", "attempts": "x"}}}),
+        "a record isn't an object": json.dumps({"autobook_dry_run": {"2026-11-15|23:00": "dry_run"}}),
+        "retry entry isn't an object": json.dumps({"autobook_retry": {"2026-11-15|23:00": "x"}}),
+        "known_open value isn't true": json.dumps({"known_open": {"2026-11-15|LOC002|any|23:00": 1}}),
+        "session_alert isn't an object": json.dumps({"session_alert": "expired"}),
+        "halt isn't an object": json.dumps({"autobook_halted": True}),
+    }
+
+    def plant(self, content):
+        if content is None:
+            self.state_file.unlink()
+        else:
+            self.state_file.write_text(content)
+
+    def test_every_bad_state_halts_and_notify_only_carries_on(self):
+        for label, content in self.BAD.items():
+            with self.subTest(label):
+                self.setUp()
+                self.plant(content)
+                code, sent = self.run_mode("live")
+                self.assertEqual([s["path"] for s in self.site.sent], ["/booking"], "no auto-book requests")
+                self.assertEqual(self.subjects(sent)[0], monitor.STATE_UNREADABLE_SUBJECT)
+                self.assertTrue(self.subjects(sent)[1].startswith("🎾"), "notify-only from a fresh state")
+                self.assertIn("autobook_halted", self.state())
+                code, sent = self.run_mode("live")
+                self.assertNotIn(monitor.STATE_UNREADABLE_SUBJECT, self.subjects(sent), "deduped")
+                self.assertEqual([s["path"] for s in self.site.sent].count("/bookings"), 0)
+
+    def test_garbage_in_informational_keys_does_not_halt(self):
+        self.state_file.write_text(json.dumps({"last_check": 5, "unreadable_last": 12, "currently_open_count": "x"}))
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        self.assertNotIn("autobook_halted", self.state())
+        self.assertEqual(len(self.site.posts_sent()), 1)
+
+    def test_the_halt_is_on_disk_before_any_early_return(self):
+        early_returns = {
+            "email settings missing": lambda: self._run_patched(env={"EMAIL_USER": "", "EMAIL_APP_PASSWORD": ""}),
+            "config.json missing": lambda: (self.config_file.unlink(), self._run_patched(expect=SystemExit)),
+            "config.json unreadable": lambda: (self.config_file.write_text("{x"), self._run_patched(expect=ValueError)),
+            "bot session can't be opened": lambda: (self.jar.unlink(), self._run_patched()),
+            "bot session already marked dead": lambda: self._run_patched(dead_session=True),
+            "session-lost CLI": lambda: self._run_patched(argv=["--alert-session-lost", "x"]),
+            "session-lost CLI, email settings missing": lambda: self._run_patched(
+                argv=["--alert-session-lost", "x"], env={"EMAIL_USER": "", "EMAIL_APP_PASSWORD": ""}),
+        }
+        for bad_label in ("missing", "not json", "autobook is a list"):
+            for label, go in early_returns.items():
+                with self.subTest(state=bad_label, early_return=label):
+                    self.setUp()
+                    self.plant(self.BAD[bad_label])
+                    go()
+                    halted = self.state().get("autobook_halted")
+                    self.assertIsNotNone(halted, "the halt must be on disk")
+                    self.assertEqual(halted["reason"], "state_unreadable")
+
+    def _run_patched(self, env=None, expect=None, dead_session=False, argv=None):
+        sent = []
+        full_env = {**EMAIL_ENV, "AUTOBOOK_MODE": "live", **(env or {})}
+        session = requests.Session()
+        session.mount("https://", self.site)
+        with mock.patch.dict(os.environ, full_env, clear=True), \
+             mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
+             mock.patch.object(monitor, "STATE_FILE", self.state_file), \
+             mock.patch.object(monitor, "send_email", side_effect=lambda s, b, *a: sent.append(s)), \
+             mock.patch.object(monitor.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+            if dead_session:
+                real_open = monitor.open_state
+
+                def open_and_mark():
+                    st = real_open()
+                    st["session_alert"] = {"kind": "expired", "sent_at": "x",
+                                           "jar_sha256": bot_session.file_fingerprint(self.jar)}
+                    return st
+                with mock.patch.object(monitor, "open_state", side_effect=open_and_mark):
+                    monitor.run(iterations=1, interval=0, jar_path=self.jar, enc_path=self.enc, session=session)
+            elif argv:
+                with mock.patch.object(monitor, "current_jar_path", return_value=self.jar):
+                    monitor.main(argv)
+            elif expect:
+                with self.assertRaises(expect):
+                    monitor.run(iterations=1, interval=0, jar_path=self.jar, enc_path=self.enc, session=session)
+            else:
+                monitor.run(iterations=1, interval=0, jar_path=self.jar, enc_path=self.enc, session=session)
+        self.assertEqual(self.site.posts_sent(), [])
+        return sent
+
+    def test_the_halt_emails_dedupe_mark_survives_an_early_return(self):
+        self.state_file.write_text("{oops")
+        self.jar.unlink()  # every run returns early: the bot session can't be opened
+        first = self._run_patched()
+        second = self._run_patched()
+        self.assertEqual(first, [monitor.STATE_UNREADABLE_SUBJECT])
+        self.assertEqual(second, [], "sent once, although no run got past opening the jar")
+
+    def test_the_halt_email_carries_the_restore_steps(self):
+        self.state_file.write_text("{oops")
+        code, sent = self.run_mode("live")
+        body = sent[0]["body"]
+        self.assertIn(monitor.HALT_RESTORE_STEPS, body)
+        for must in ("git log --oneline -15 -- state.json", "git show COMMIT:state.json",
+                     "autobook_dry_run", "autobook_retry", "bookings?tab=pending", "git push"):
+            self.assertIn(must, body)
+
+    def test_readme_has_the_same_restore_steps(self):
+        readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        self.assertIn(monitor.HALT_RESTORE_STEPS, readme)
+
+    def test_the_restore_steps_actually_work(self):
+        # Run steps 3 and 4 exactly as written, in a scratch git repo whose
+        # history is: good state (with records) -> halted fresh state.
+        repo = self.dir / "repo"
+        repo.mkdir()
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        good = {"autobook": {"2026-11-15|23:00": {"status": "parked", "attempts": [{"n": 1}]}},
+                "autobook_dry_run": {"2026-11-16|20:00": {"status": "dry_run"}},
+                "autobook_retry": {"2026-11-17|21:00": {"reason": "no_free_court"}}, "known_open": {}}
+        (repo / "state.json").write_text(json.dumps(good))
+        git("add", "state.json")
+        git("commit", "-qm", "good")
+        (repo / "state.json").write_text("{broken")
+        git("commit", "-qam", "broken")
+        (repo / "state.json").write_text(json.dumps({"autobook_halted": {"reason": "state_unreadable"}, "known_open": {"k": True}}))
+        git("commit", "-qam", "halted")
+        steps = monitor.HALT_RESTORE_STEPS.splitlines()
+        find = next(l for l in steps if l.startswith("for c in "))
+        out = subprocess.run(["bash", "-c", find], cwd=repo, capture_output=True, text=True).stdout
+        commit = out.strip().split("last good: ")[1]
+        self.assertEqual(commit, git("log", "--format=%h", "-1", "HEAD~2").strip(), "picks the last good, not the halted one")
+        for line in steps:
+            if line.startswith(("git show COMMIT:state.json >", "python3 -c ")):
+                subprocess.run(["bash", "-c", line.replace("COMMIT", commit).replace("/tmp/good_state.json",
+                                                                                      str(self.dir / "good.json"))],
+                               cwd=repo, check=True)
+        restored = json.loads((repo / "state.json").read_text())
+        self.assertNotIn("autobook_halted", restored)
+        for k in ("autobook", "autobook_dry_run", "autobook_retry"):
+            self.assertEqual(restored[k], good[k])
+        self.assertEqual(restored["known_open"], {"k": True}, "the current state otherwise kept")
+        with mock.patch.object(monitor, "STATE_FILE", repo / "state.json"):
+            monitor.load_state()  # the result is a valid state
+
+
+class TestKeyedFingerprint(unittest.TestCase):
+    def test_fingerprint_is_a_keyed_hmac_from_bot_jar_key(self):
+        import hashlib, hmac as _hmac
+        plain = hashlib.sha256(REF.encode()).hexdigest()[:12]
+        with mock.patch.dict(os.environ, {"BOT_JAR_KEY": "A" * 44}):
+            a = autobook.ref_fp(REF)
+            self.assertEqual(a, autobook.ref_fp(REF), "stable for one key")
+            key = _hmac.new(b"A" * 44, b"court-checker ref fingerprint v1", hashlib.sha256).digest()
+            self.assertEqual(a, _hmac.new(key, REF.encode(), hashlib.sha256).hexdigest()[:12])
+            self.assertIn(f"ref:{a}", bot_session.redact(REF))
+            self.assertIn(f"payref:{autobook.ref_fp('100000000000000001')}", bot_session.redact("100000000000000001"))
+        with mock.patch.dict(os.environ, {"BOT_JAR_KEY": "B" * 44}):
+            b = autobook.ref_fp(REF)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            none = autobook.ref_fp(REF)
+        self.assertEqual(len({a, b, none, plain}), 4, "the old plain SHA-256 fingerprint no longer matches")
+        self.assertNotEqual(a, plain)
+        self.assertNotIn(plain, bot_session.redact(REF))
+
+
+class TestAlertOnlyTheAttemptedLocation(AutobookTestCase):
+    def test_other_locations_opening_is_still_alerted(self):
+        self.write_config([target(self.date, [("23:00", True)], locations=("LOC001", "LOC002"))])
+        # The pages are Crystal Sports G's, so the attempt at LOC001 (tried
+        # first) ends 🔴 page mismatch.
+        code, sent = self.run_mode("live")
+        subjects = self.subjects(sent)
+        self.assertTrue(any(s.startswith("🔴 Failed: booking form changed") for s in subjects), subjects)
+        self.assertEqual(self.record()["loc"], "LOC001")
+        slot = [m for m in sent if m["subject"].startswith("🎾")]
+        self.assertEqual(len(slot), 1)
+        self.assertIn("— Crystal Sports G (", slot[0]["body"], "LOC002's opening is alerted")
+        self.assertNotIn("— Crystal Sports (", slot[0]["body"], "LOC001's was replaced by its result email")
+        known = self.state()["known_open"]
+        for loc in ("LOC001", "LOC002"):
+            self.assertIn(monitor.slot_key(self.date, loc, monitor.ANY_COURT, "23:00"), known)
+
+
+class TestStateNotSaved(MonitorTestCase):
+    def call(self, blob, fail=False):
+        sent = []
+
+        def send(s, b, *a):
+            if fail:
+                raise smtplib.SMTPException("down")
+            sent.append({"subject": s, "body": b})
+        env = {**EMAIL_ENV, **({"REMOTE_STATE_BLOB": blob} if blob is not None else {})}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
+             mock.patch.object(monitor, "STATE_FILE", self.state_file), \
+             mock.patch.object(monitor, "STATE_ALERT_MARKER", self.dir / ".state_alert.json"), \
+             mock.patch.object(monitor, "send_email", side_effect=send), contextlib.redirect_stdout(io.StringIO()):
+            code = monitor.main(["--alert-state-not-saved", "push failed"])
+        return code, sent
+
+    def test_email_lists_this_runs_records_and_is_deduped_per_repo_state(self):
+        self.state_file.write_text(json.dumps({"autobook": {"2026-11-15|23:00": {"status": "parked", "attempts": []}}}))
+        code, sent = self.call("blob1")
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual([m["subject"] for m in sent], [monitor.STATE_NOT_SAVED_SUBJECT])
+        self.assertIn("2026-11-15|23:00: parked", sent[0]["body"])
+        self.assertIn("bookings?tab=pending", sent[0]["body"])
+        self.assertEqual(self.call("blob1")[1], [], "same repo state.json: no second email")
+        self.assertEqual(len(self.call("blob2")[1]), 1, "the repo moved on: a new episode")
+        self.assertEqual(len(self.call("unknown")[1]), 1, "can't tell: always email")
+        self.assertEqual(len(self.call("unknown")[1]), 1, "... every time")
+        self.assertEqual(len(self.call(None)[1]), 1)
+        self.assertEqual(len(self.call(None)[1]), 1)
+
+    def test_a_failed_send_leaves_no_marker(self):
+        code, sent = self.call("blob1", fail=True)
+        self.assertEqual(code, monitor.EXIT_ERROR)
+        self.assertFalse((self.dir / ".state_alert.json").exists())
+        self.assertEqual(len(self.call("blob1")[1]), 1)
+
+    def test_workflow_sends_it_when_the_push_fails(self):
+        wf = (Path(__file__).resolve().parent / ".github" / "workflows" / "monitor.yml").read_text(encoding="utf-8")
+        self.assertIn('echo "state_not_saved=true" >> "$GITHUB_OUTPUT"', wf)
+        self.assertIn("python monitor.py --alert-state-not-saved", wf)
+        self.assertIn("if: always() && steps.save.outputs.state_not_saved == 'true'", wf)
+        self.assertIn("REMOTE_STATE_BLOB=", wf)
+
+
+class TestSecondCourtOnlyIfNothingNew(AutobookTestCase):
+    def test_refused_but_a_new_booking_appeared_is_unclear(self):
+        two = self.p.pending_with_ref("SPORTS-900000000071").replace(
+            '<a class="bk-row"', self.p.pending_with_ref("SPORTS-900000000072").split('<div id="bookingList">')[1]
+            .split("</div>")[0] + '<a class="bk-row"', 1)
+        for label, after in (("one new booking", self.p.pending_with_ref("SPORTS-900000000071")), ("two new bookings", two)):
+            with self.subTest(label):
+                self.setUp()
+                self.site.details["SPORTS-900000000071"] = self.p.detail("SPORTS-900000000071", time="10:00")
+                self.site.posts = [refused_page(self.p.refused()), parked_redirect()]
+                self.site.pending = [self.p.pending_empty(), after]
+                code, sent = self.run_mode("live")
+                self.assertEqual(len(self.site.posts_sent()), 1, "no second court")
+                self.assertEqual(len(sent), 1)
+                self.assertTrue(sent[0]["subject"].startswith("🟠 Unclear"), sent[0]["subject"])
+                self.assertEqual(self.record()["reason"], "refused_but_new_booking_listed")
+
+    def test_refused_and_nothing_new_still_tries_one_other_court(self):
+        self.site.posts = [refused_page(self.p.refused()), parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 2)
+
+
+class TestNoSiteFieldNamesInState(AutobookTestCase):
+    def test_field_names_stay_in_the_email(self):
+        for name, extra, code_ in (("promo", 'value="X"', "unexpected_field"), ("phone", "required", "unexpected_field")):
+            with self.subTest(name):
+                self.setUp()
+                self.site.reviews[self.p.sel] = self.p.review().replace(
+                    '<input type="hidden" name="sel"', f'<input type="text" name="{name}" {extra} /><input type="hidden" name="sel"')
+                code, sent = self.run_mode("live")
+                self.assertEqual(self.record()["problems"], [code_])
+                self.assertNotIn(name, self.state_file.read_text())
+                self.assertIn(f"unexpected field {name!r}", sent[0]["body"])
+
+    def test_a_required_known_field_is_a_code_without_its_name(self):
+        self.site.reviews[self.p.sel] = self.p.review().replace(
+            f'name="coach_{self.p.sel}"', f'name="coach_{self.p.sel}" required')
+        self.run_mode("live")
+        self.assertEqual(self.record()["problems"], ["field_required"])
+        self.assertNotIn("coach_", self.state_file.read_text())
 
 
 class TestPostIsImpossibleElsewhere(unittest.TestCase):

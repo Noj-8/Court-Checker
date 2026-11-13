@@ -26,6 +26,7 @@ presenting a superseded cs.member kills the whole login session. So:
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -105,10 +106,26 @@ def remember_secret(value):
         _secrets.add(value)
 
 
+REF_FP_LABEL = b"court-checker ref fingerprint v1"
+# Without BOT_JAR_KEY (a local run on a plaintext jar) a random per-process
+# key: fingerprints then can't be matched across runs, but can't be guessed.
+_FALLBACK_FP_KEY = os.urandom(32)
+
+
+def _ref_fp_key():
+    jar_key = os.environ.get(JAR_KEY_ENV, "").strip()
+    if not jar_key:
+        return _FALLBACK_FP_KEY
+    return hmac.new(jar_key.encode("utf-8"), REF_FP_LABEL, hashlib.sha256).digest()
+
+
 def ref_fp(ref):
-    """Short fingerprint of a booking ref — what logs and state.json carry
-    instead of the ref itself (both are public)."""
-    return hashlib.sha256(ref.encode()).hexdigest()[:12]
+    """Short keyed fingerprint of a booking (or payment) ref — what logs and
+    state.json carry instead of the ref itself (both are public). Keyed
+    HMAC-SHA256, with a key derived from BOT_JAR_KEY, so nobody can confirm
+    a guessed ref against it. Note: reseeding (a new BOT_JAR_KEY) changes
+    every fingerprint."""
+    return hmac.new(_ref_fp_key(), ref.encode("utf-8"), hashlib.sha256).hexdigest()[:12]
 
 
 # Booking refs (SPORTS-<digits>) and 18-digit payment/top-up refs never

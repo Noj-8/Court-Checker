@@ -42,9 +42,9 @@ without ever POSTing):
   8. A key left in_progress by a run that died is never retried: 🟠 once.
 
 state.json and the Actions logs are public. state.json holds only our own
-values and fixed reason codes (field NAMES at most, never site text, field
-values, refs or personal data); refs appear only as a short fingerprint, in
-state and in the log. Emails carry the details.
+values and fixed reason codes (never site text, field names or values, refs
+or personal data); refs appear only as a short keyed fingerprint, in state
+and in the log. Emails carry the details.
 """
 
 import os
@@ -64,7 +64,6 @@ PENDING_URL = f"{BASE}{BOOKINGS_PATH}?tab=pending"
 BOOKINGS_URL = f"{BASE}{BOOKINGS_PATH}"
 REF_RE = re.compile(r"SPORTS-\d{1,20}")
 SEL_RE = re.compile(r"\d{8}-\d{1,6}")              # a court's sel, e.g. 20261115-270
-SAFE_NAME_RE = re.compile(r"[A-Za-z0-9_.\-]{1,64}")  # a form field NAME we may write to state
 PRICE_RE = re.compile(r"\d{1,6}(?:\.\d{1,2})?")
 SLOT_MINUTES = 60  # every grid slot is one hour
 MAX_DETAIL_READS = 10  # per pass: more unknown pending bookings than this -> fail closed
@@ -106,11 +105,6 @@ def date_label(date_iso):
     """'2026-11-15' -> 'Sun 15 Nov 2026', as the site writes it (English)."""
     d = _date.fromisoformat(date_iso)
     return f"{WEEKDAYS[d.weekday()]} {d.day} {MONTHS[d.month - 1]} {d.year}"
-
-
-def safe_name(name):
-    """A field name for a state.json reason code, or '?' if it isn't a plain one."""
-    return name if SAFE_NAME_RE.fullmatch(name or "") else "?"
 
 
 def safe_price(price):
@@ -157,7 +151,10 @@ class Context:
         self.jar, self.state, self.mode = jar, state, mode
         self.send, self.save_state, self.try_save_state, self.log = send, save_state, try_save_state, log
         self.locations = locations
-        self.emailed_keys = set()  # keys whose result email was actually SENT this pass
+        # (key, location) pairs whose result email was actually SENT this
+        # pass: only that location's opening is left out of the slot-open email.
+        self.emailed_slots = set()
+        self.current_loc = None  # the location being attempted
         self.detail_cache = {}  # ref -> [(date, start, end)] or None (unreadable), for this pass
         # key -> {"court", "price"} as the page showed them: for this pass's
         # emails only, never written to state.json (it's public).
@@ -177,13 +174,14 @@ class Context:
 
     def email(self, key, subject, body):
         """Send; True if it went out. Only a sent email counts as "this key
-        had its result email" (which drops it from the slot-open email)."""
+        had its result email at this location" (which drops that location's
+        opening from the slot-open email)."""
         try:
             self.send(subject, body)
         except Exception as e:
             self.log(f"⚠ auto-book email failed for {key}: {type(e).__name__}")
             return False
-        self.emailed_keys.add(key)
+        self.emailed_slots.add((key, self.current_loc))
         self.log(f"✉ {subject.split(' ', 1)[0]} email sent for {key}")
         return True
 
@@ -271,8 +269,8 @@ def existing_at(ctx, rows, cand_range):
 
 
 # --- verification ---------------------------------------------------------------
-# Each problem is (code, text): the code (fixed, or a field NAME) goes to
-# state.json; the text, which may quote the page, goes only in the email.
+# Each problem is (code, text): the fixed code goes to state.json; the text,
+# which may quote the page (field names included), goes only in the email.
 
 def check_slot_page(page, cand):
     problems = []
@@ -325,12 +323,12 @@ def check_review(review, cand, court):
     for f in fields:
         by_name.setdefault(f["name"], []).append(f)
         if f["name"] not in allowed:
-            problems.append((f"unexpected_field:{safe_name(f['name'])}",
+            problems.append(("unexpected_field",
                              f"unexpected field {f['name']!r} ({f['type']}"
                              + (", required" if f["required"] else "")
                              + (f", pre-filled {f['value']!r}" if f["value"] else "") + ")"))
         elif f["required"] and f["name"] != "acceptTerms" and not f["disabled"]:
-            problems.append((f"field_required:{safe_name(f['name'])}", f"field {f['name']!r} is now required"))
+            problems.append(("field_required", f"field {f['name']!r} is now required"))
 
     sels = by_name.get("sel", [])
     if len(sels) != 1 or sels[0]["type"] != "hidden" or sels[0]["value"] != sel:
@@ -376,6 +374,7 @@ def notify_interrupted(ctx):
     stays in_progress (and is tried again next run) until that email is sent."""
     for key, rec in ctx.state.get(LIVE_KEY, {}).items():
         if rec.get("status") == "in_progress":
+            ctx.current_loc = rec.get("loc")
             sent = ctx.email(key, f"🟠 Unclear — check My bookings: {_what(rec)}",
                              "A run stopped in the middle of auto-booking this slot (after recording the attempt,\n"
                              "possibly after the booking request). It will NOT be retried.\n\n"
@@ -427,6 +426,7 @@ def _process_one(ctx, key, cand):
     records = ctx.records()
     rec = records[key] = {"status": "started", "mode": ctx.mode, "loc": cand["loc"], "loc_name": cand["loc_name"],
                           "date": cand["date"], "time": cand["time"], "started_at": now_iso(), "attempts": []}
+    ctx.current_loc = cand["loc"]
     ctx.log(f"  ★ auto-book ({ctx.mode}) {key} at {cand['loc_name']}")
     try:
         _flow(ctx, key, cand, rec)
@@ -574,11 +574,20 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
     before = {r["ref"] for r in lists_before["pending"] + lists_before["upcoming"]}
     pending = {r["ref"]: r for r in lists["pending"]}
     upcoming = {r["ref"]: r for r in lists["upcoming"]}
-    if not ref:
-        new = [r for r in list(pending) + list(upcoming) if r not in before and ref_fp(r) not in ctx.own_ref_fps()]
-        if len(set(new)) == 1:
-            ref = new[0]
-            attempt["ref_fp"] = ref_fp(ref)
+    new = sorted({r for r in list(pending) + list(upcoming) if r not in before and ref_fp(r) not in ctx.own_ref_fps()})
+    if hint == "refused" and not ref:
+        # The site showed an error. Only if NO booking at all appeared is it
+        # safe to try another court; any new booking makes it unclear.
+        if not new:
+            rec["status"] = "refused"  # nothing booked; the caller may try one other court
+            attempt["refused"] = True
+            return "refused"
+        return _finish(ctx, key, rec, "unclear", "refused_but_new_booking_listed",
+                       f"the site showed an error, but {len(new)} new booking(s) appeared in My bookings",
+                       ref=new[0] if len(new) == 1 else None, location=location)
+    if not ref and len(new) == 1:
+        ref = new[0]  # the one new booking (still checked against this slot below)
+        attempt["ref_fp"] = ref_fp(ref)
     row = pending.get(ref) or upcoming.get(ref) if ref else None
     if row is not None and row["slot"] is not None and row["slot"][:2] != (cand["date"], cand["time"]):
         return _finish(ctx, key, rec, "unclear", "listed_other_slot",
@@ -588,10 +597,6 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
         return _finish(ctx, key, rec, "parked", None, None, ref=ref, location=location)
     if ref and ref in upcoming:
         return _finish(ctx, key, rec, "paid", None, None, ref=ref, location=location)
-    if hint == "refused" and not ref:
-        rec["status"] = "refused"  # nothing booked; the caller may try one other court
-        attempt["refused"] = True
-        return "refused"
     return _finish(ctx, key, rec, "unclear", f"not_listed_after:{hint}",
                    f"after the booking request the site answered {attempt.get('http', 'nothing')} ({hint}) and the "
                    "booking isn't clearly listed", ref=ref, location=location)

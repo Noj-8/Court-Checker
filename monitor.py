@@ -154,22 +154,61 @@ def load_config():
 
 
 class StateUnreadable(Exception):
-    """state.json exists but isn't a readable JSON object."""
+    """state.json is missing, unreadable, or not the shape we write."""
+
+
+# The shape monitor.py writes for every key that decides a booking or an
+# email: key -> what its value must be. Keys not listed are left alone; a
+# listed key of the wrong shape means the file can't be trusted.
+def _is_dict_of(check):
+    return lambda v: isinstance(v, dict) and all(isinstance(k, str) and check(x) for k, x in v.items())
+
+
+def _is_record(r):
+    return (isinstance(r, dict) and isinstance(r.get("status", ""), str)
+            and isinstance(r.get("attempts", []), list) and all(isinstance(a, dict) for a in r.get("attempts", [])))
+
+
+STATE_SHAPE = {
+    "known_open": _is_dict_of(lambda x: x is True),
+    "autobook": _is_dict_of(_is_record),
+    "autobook_dry_run": _is_dict_of(_is_record),
+    "autobook_retry": _is_dict_of(lambda x: isinstance(x, dict)),
+    "autobook_attempts": lambda v: isinstance(v, dict),  # old site's, only ever pruned
+    "autobook_halted": lambda v: isinstance(v, dict),
+    "session_alert": lambda v: isinstance(v, dict),
+    "read_alert": lambda v: isinstance(v, dict),
+}
+# Not checked: last_check, currently_open_count, autobook_mode and the
+# unreadable-streak keys are rewritten every run, never decide a booking, and
+# are already read defensively (a garbage timestamp just restarts the streak).
 
 
 def load_state():
-    """{} if there is no state.json yet. Raises StateUnreadable if it exists
-    but can't be read: the caller must fail closed (it holds the auto-book
-    records that stop a slot being booked twice)."""
+    """state.json as a dict. Raises StateUnreadable if it is missing (it's
+    tracked in git, so missing means something went wrong), unreadable, or
+    the wrong shape: the caller must fail closed — it holds the auto-book
+    records that stop a slot being booked twice."""
     if not STATE_FILE.exists():
-        return {}
+        raise StateUnreadable("missing")
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         raise StateUnreadable(type(e).__name__) from None
     if not isinstance(state, dict):
         raise StateUnreadable(f"top level is {type(state).__name__}, not an object")
+    bad = sorted(k for k, ok in STATE_SHAPE.items() if k in state and not ok(state[k]))
+    if bad:
+        raise StateUnreadable(f"unexpected shape: {', '.join(bad)}")
     return state
+
+
+def open_state():
+    """load_state(), or — if that fails — the halted fresh state, already on disk."""
+    try:
+        return load_state()
+    except StateUnreadable as e:
+        return recover_unreadable_state(str(e))
 
 
 def save_state(state):
@@ -401,7 +440,7 @@ def run_check_pass(state, config, jar, email, mode="off"):
     state["currently_open_count"] = len(currently_open)
     log(f"  currently open across watchlist: {len(currently_open)}")
 
-    status, booked_keys, jar_error = "ok", set(), None
+    status, emailed, jar_error = "ok", set(), None
     if mode in ("dry_run", "live"):
         ctx = None
         try:
@@ -426,13 +465,18 @@ def run_check_pass(state, config, jar, email, mode="off"):
         except Exception as e:
             # A bug in auto-book must never cost the slot-open email.
             log(f"      ⚠ auto-book failed ({where(e)}) — the slot-open email still goes out")
-        # In live mode a starred slot whose result email went out isn't repeated in the "slot open" email.
+        # In live mode a starred opening whose result email went out (for the
+        # location actually attempted) isn't repeated in the "slot open" email.
+        # The same time at the other location is always alerted normally.
         if mode == "live" and ctx is not None:
-            booked_keys = ctx.emailed_keys
+            emailed = ctx.emailed_slots
+
+    def replaced(a):
+        return a["starred"] and (autobook.key_for(a["date"], a["time"]), a["loc_id"]) in emailed
     for a in new_alerts:
-        if a["starred"] and autobook.key_for(a["date"], a["time"]) in booked_keys:
+        if replaced(a):
             known_open[slot_key(a["date"], a["loc_id"], ANY_COURT, a["time"])] = True  # its result email went out
-    new_alerts = [a for a in new_alerts if not (a["starred"] and autobook.key_for(a["date"], a["time"]) in booked_keys)]
+    new_alerts = [a for a in new_alerts if not replaced(a)]
 
     if not new_alerts:
         log("  no new openings this iteration")
@@ -526,6 +570,43 @@ def current_jar_path():
 
 STATE_UNREADABLE_SUBJECT = "🔴 state.json unreadable — auto-book halted"
 
+# The restore steps, in the halt email and (verbatim, a test checks) in README.md.
+HALT_RESTORE_STEPS = """\
+To restore the auto-book records and resume (on the Mac, in court-checker-live).
+Each command line can be pasted as is.
+
+1. Pause the monitor so it doesn't commit state.json while you work: pause the
+   cron-job.org job, and Actions -> Tennis monitor -> ... -> Disable workflow.
+
+2. Get the latest state and list the recent versions of state.json:
+git pull --rebase
+git log --oneline -15 -- state.json
+
+3. Find the newest version that is valid JSON and NOT halted, i.e. from before
+   the halt (this prints its commit):
+for c in $(git log --format=%h -50 -- state.json); do git show "$c:state.json" 2>/dev/null | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(not isinstance(s, dict) or "autobook_halted" in s)' 2>/dev/null && { echo "last good: $c"; break; }; done
+
+   Look at it, and check it has the auto-book records you expect
+   (replace COMMIT with the hash printed above):
+git show COMMIT:state.json | python3 -m json.tool | less
+
+4. Copy autobook, autobook_dry_run and autobook_retry from that version into the
+   current state.json, and drop autobook_halted:
+git show COMMIT:state.json > /tmp/good_state.json
+python3 -c 'import json; g = json.load(open("/tmp/good_state.json")); c = json.load(open("state.json")); [c.__setitem__(k, {**g.get(k, {}), **c.get(k, {})}) for k in ("autobook", "autobook_dry_run", "autobook_retry")]; c.pop("autobook_halted", None); json.dump(c, open("state.json", "w"), indent=2)'
+
+5. Check My bookings for anything booked since that version (Awaiting payment
+   and Upcoming). A booking the bot made in that gap isn't in the restored
+   records; it still blocks the same time, because the bot reads My bookings
+   before booking, but check it's one you want:
+   https://crystalsports-booking.kegroup.co.th/bookings?tab=pending
+   https://crystalsports-booking.kegroup.co.th/bookings
+
+6. Push, then resume the monitor (re-enable the workflow and the cron-job.org
+   job). Auto-book resumes from the next run:
+git commit -am "Restore auto-book records after halt" && git push
+"""
+
 
 def recover_unreadable_state(reason):
     """state.json exists but can't be read. It holds the auto-book records
@@ -535,14 +616,21 @@ def recover_unreadable_state(reason):
     beside it (on the runner; the workflow commits only state.json)."""
     now = datetime.now(TZ)
     kept = STATE_FILE.with_name(f"{STATE_FILE.name}.unreadable-{now:%Y%m%d-%H%M%S}")
-    try:
-        os.replace(STATE_FILE, kept)
-        kept_name = kept.name
-    except OSError:
-        kept_name = None
+    kept_name = None
+    if STATE_FILE.exists():
+        try:
+            os.replace(STATE_FILE, kept)
+            kept_name = kept.name
+        except OSError:
+            pass
     log(f"🔴 {STATE_FILE.name} unreadable ({reason}) — auto-book HALTED; notify-only continues from a fresh state")
-    return {"autobook_halted": {"reason": "state_unreadable", "detail": reason, "since": now.isoformat(),
-                                "kept_as": kept_name}}
+    state = {"autobook_halted": {"reason": "state_unreadable", "detail": reason, "since": now.isoformat(),
+                                 "kept_as": kept_name}}
+    # On disk NOW, before anything (config, email settings, the jar) can make
+    # the run return early. If even this fails there is no state.json, and
+    # the next run halts again: fail closed either way.
+    try_save_state(state)
+    return state
 
 
 def email_halt_once(state, email):
@@ -552,14 +640,11 @@ def email_halt_once(state, email):
         return
     kept = (f"The unreadable file was kept as {halted['kept_as']} on the runner (not committed)."
             if halted.get("kept_as") else "The unreadable file couldn't be moved aside.")
-    body = (f"{STATE_FILE.name} couldn't be read ({halted.get('detail', halted.get('reason'))}). It holds the\n"
-            "auto-book records that stop a date+time being booked twice, so auto-book is HALTED:\n"
-            "no booking requests at all, whatever AUTOBOOK_MODE says.\n\n"
+    body = (f"{STATE_FILE.name} couldn't be used ({halted.get('detail', halted.get('reason'))}). It holds the\n"
+            "auto-book records that stop a date+time being booked twice, so auto-book is HALTED\n"
+            f"since {halted.get('since')}: no booking requests at all, whatever AUTOBOOK_MODE says.\n\n"
             "Slot-open emails carry on (you may get one repeat for slots that are already open).\n"
-            f"{kept}\n\n"
-            "Check My bookings for anything booked recently:\n"
-            f"  {BASE}/bookings?tab=pending\n  {BASE}/bookings\n\n"
-            'To resume auto-book: remove the "autobook_halted" entry from state.json and push.\n')
+            f"{kept}\n\n" + HALT_RESTORE_STEPS)
     try:
         send_email(STATE_UNREADABLE_SUBJECT, body, *email)
     except Exception as e:
@@ -567,18 +652,16 @@ def email_halt_once(state, email):
         return
     halted["emailed_at"] = datetime.now(TZ).isoformat()
     log("✉ state-unreadable email sent")
+    try_save_state(state)  # the dedupe mark, on disk before any early return
 
 
 def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None):
     mode = autobook.mode_from_env(log)
+    state = open_state()  # first: a halt is on disk before any early return below
     config = load_config()
     email = email_settings(config)
     if email is None:
         return EXIT_SETUP
-    try:
-        state = load_state()
-    except StateUnreadable as e:
-        state = recover_unreadable_state(str(e))
     halted = state.get("autobook_halted")
     if halted:
         email_halt_once(state, email)
@@ -648,26 +731,76 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
 def alert_session_lost(reason):
     """Called by monitor.yml when bot_session.enc couldn't be pushed after
     a cookie rotated."""
+    state = open_state()
     email = email_settings(load_config())
     if email is None:
         return EXIT_SETUP
-    try:
-        state = load_state()
-    except StateUnreadable as e:
-        state = recover_unreadable_state(str(e))
+    if state.get("autobook_halted"):
         email_halt_once(state, email)
     alert_session(state, "lost", reason, bot_session.file_fingerprint(current_jar_path()), email)
     try_save_state(state)
     return EXIT_JAR
 
 
+STATE_NOT_SAVED_SUBJECT = "🔴 state not saved — check before trusting auto-book"
+STATE_ALERT_MARKER = ROOT / ".state_alert.json"  # kept in the Actions cache by monitor.yml, never committed
+
+
+def alert_state_not_saved(reason, remote_blob=None):
+    """Called by monitor.yml when this run's state.json couldn't be pushed:
+    the next run starts from the older state.json in the repo, which may
+    lack the auto-book records written in this run. Deduped per episode:
+    no second email while the repo's state.json (remote_blob, its git blob
+    id) is still the one we already emailed about."""
+    email = email_settings(load_config())
+    if email is None:
+        return EXIT_SETUP
+    try:
+        marker = json.loads(STATE_ALERT_MARKER.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        marker = {}
+    if remote_blob and remote_blob != "unknown" and isinstance(marker, dict) and marker.get("remote_blob") == remote_blob:
+        log(f"state-not-saved email already sent at {marker.get('sent_at')} for this repo state.json — not resending")
+        return EXIT_OK
+    try:
+        records = {k: v.get("status") for k, v in load_state().get(autobook.LIVE_KEY, {}).items()}
+    except StateUnreadable:
+        records = None
+    lines = ([f"  {k}: {v}" for k, v in sorted(records.items())] or ["  (none)"]) if records is not None \
+        else ["  (this run's state.json couldn't be read either)"]
+    body = (f"This run's {STATE_FILE.name} couldn't be saved to the repo ({reason}).\n\n"
+            "The next run starts from the older state.json in the repo. If this run auto-booked\n"
+            "anything, the next run doesn't know it (it still checks My bookings before booking,\n"
+            "which normally catches it). Check before trusting auto-book:\n\n"
+            f"  {BASE}/bookings?tab=pending\n  {BASE}/bookings\n\n"
+            "Auto-book records this run held (date|time: status):\n" + "\n".join(lines) + "\n\n"
+            "Then check the Actions log for why the push failed. To stop auto-book meanwhile:\n"
+            "  gh variable set AUTOBOOK_MODE --body off\n\n"
+            "You won't get this email again until the repo's state.json changes.\n")
+    try:
+        send_email(STATE_NOT_SAVED_SUBJECT, body, *email)
+    except Exception as e:
+        log(f"⚠ state-not-saved email failed: {type(e).__name__}")
+        return EXIT_ERROR
+    log("✉ state-not-saved email sent")
+    try:
+        STATE_ALERT_MARKER.write_text(json.dumps({"remote_blob": remote_blob, "sent_at": datetime.now(TZ).isoformat()}))
+    except OSError as e:
+        log(f"⚠ couldn't write {STATE_ALERT_MARKER.name}: {type(e).__name__}")
+    return EXIT_OK
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Crystal Sports court monitor (notify-only).")
     ap.add_argument("--alert-session-lost", metavar="REASON",
                     help="send the 'session likely lost' email and exit 4")
+    ap.add_argument("--alert-state-not-saved", metavar="REASON",
+                    help="send the 'state not saved' email (deduped by $REMOTE_STATE_BLOB)")
     args = ap.parse_args(argv)
     if args.alert_session_lost is not None:
         return alert_session_lost(args.alert_session_lost)
+    if args.alert_state_not_saved is not None:
+        return alert_state_not_saved(args.alert_state_not_saved, os.environ.get("REMOTE_STATE_BLOB", "").strip() or None)
     return run(iterations=int(os.environ.get("LOOP_ITERATIONS", "4")),
                interval=int(os.environ.get("LOOP_INTERVAL_SECONDS", "60")))
 

@@ -84,6 +84,7 @@ class MonitorTestCase(unittest.TestCase):
         self.config_file = self.dir / "config.json"
         self.state_file = self.dir / "state.json"
         self.write_jar(COOKIES)
+        self.state_file.write_text("{}")  # tracked in git: always there (missing = halt, see test_autobook)
         self.date = day(1)
         self.write_config([target(self.date, [("20:00", False), ("22:00", False)])])
 
@@ -297,7 +298,7 @@ class TestCheckPass(MonitorTestCase):
             ("same time twice", grid(("8:00", "2 free", False), ("8:00", "1 free", False), ("22:00", "1 free", False))),
         ]:
             with self.subTest(label):
-                self.state_file.unlink(missing_ok=True)
+                self.state_file.write_text("{}")
                 code, out, _, sent = self.run_monitor([ok(page)])
                 self.assertEqual(code, monitor.EXIT_OK)
                 self.assertEqual(sent, [], "no slot email from a page whose times can't be trusted")
@@ -480,7 +481,7 @@ class TestNoPost(MonitorTestCase):
         # test_autobook.TestModes, which has the pages auto-book reads.
         for env in ({}, {"AUTOBOOK_MODE": "off"}, {"AUTOBOOK_MODE": "not-a-mode"}):
             with self.subTest(env=env):
-                self.state_file.unlink(missing_ok=True)
+                self.state_file.write_text("{}")
                 self._full_run_never_posts(env)
 
     def _full_run_never_posts(self, env):
@@ -545,7 +546,7 @@ class TestSessionFailures(MonitorTestCase):
         for page in ('<html><body><form action="/account/login"><input type="password"></form></body></html>',
                      '<html><body><h1>ยืนยัน OTP</h1><input autocomplete="one-time-code"></body></html>'):
             with self.subTest(page=page[12:40]):
-                self.state_file.unlink(missing_ok=True)
+                self.state_file.write_text("{}")
                 code, _, _, sent = self.run_monitor([ok(page)])
                 self.assertEqual(code, monitor.EXIT_SESSION)
                 self.assertEqual(len(sent), 1)

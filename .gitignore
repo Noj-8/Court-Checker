@@ -40,3 +40,4 @@ fixtures_raw/
 # monitor.py's atomic state.json write (temp file) and an unreadable state.json kept aside
 .state.json.*.tmp
 state.json.unreadable-*
+.state_alert.json

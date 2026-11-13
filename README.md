@@ -118,9 +118,10 @@ Start with `dry_run` and read a few 🧪 emails before switching to `live`.
    "booking form changed / page mismatch" and submits nothing.
 5. **Records the attempt** in `state.json` before submitting, then submits
    once: **Wallet**, terms accepted, no coach.
-6. **Checks My bookings again** to decide the outcome (below). If the court
-   was taken in the meantime, it tries **one** other free court at the same
-   time, never more.
+6. **Checks My bookings again** to decide the outcome (below). If the site
+   refused the court (taken in the meantime) **and no new booking at all**
+   appeared, it tries **one** other free court at the same time, never more.
+   Any new booking after a refusal → 🟠 Unclear, no second court.
 
 A run that dies mid-booking is never retried: the next run sends 🟠 once.
 
@@ -136,31 +137,64 @@ A run that dies mid-booking is never retried: the next run sends 🟠 once.
 | 🟠 Unclear — check My bookings | A booking request was sent but the result couldn't be confirmed | **Check My bookings now.** It will not be retried. |
 | ℹ️ Already booked: … | You already have a booking at that date and time | Nothing |
 | ℹ️ Not auto-booking … — can't check your bookings | A booking's date/time couldn't be read, so it didn't risk a double booking | Book manually if you want it; it keeps trying quietly |
-| 🔴 state.json unreadable — auto-book halted | `state.json` (which holds the "already booked" records) couldn't be read. Auto-book is **halted**: no booking requests at all. Slot-open emails carry on | Check My bookings, then [resume](#if-auto-book-is-halted) |
+| 🔴 state.json unreadable — auto-book halted | `state.json` (which holds the "already booked" records) is missing, couldn't be read, or isn't the shape the monitor writes. Auto-book is **halted**: no booking requests at all. Slot-open emails carry on | Follow the [restore steps](#if-auto-book-is-halted) (they're in the email too) |
+| 🔴 state not saved — check before trusting auto-book | A run's `state.json` couldn't be pushed to the repo, so the next run starts from an older one. It lists the auto-book records that run held | Check My bookings, then the Actions log for why the push failed. Sent once until the repo's `state.json` changes |
 
 Each result is sent once per date + time. If a result email can't be sent,
 that time is included in the normal 🎾 email instead. A failure inside
-auto-book never stops the 🎾 email.
+auto-book never stops the 🎾 email. A result email replaces the 🎾 line only
+for the location that was attempted: the same time opening at the other
+location is always in the 🎾 email.
 
 `state.json` and the Actions logs are public. They hold only fixed reason
-codes, form field names and a short fingerprint of booking refs: no page text,
-field values, refs or court names. The full ref, the court and the payment
-link are only in your emails.
+codes and a short keyed fingerprint of booking refs (an HMAC with a key
+derived from `BOT_JAR_KEY`, so it can't be checked against a guessed ref; it
+changes when you reseed). No page text, field names or values, refs or court
+names. The full ref, the court and the payment link are only in your emails.
 
 ### If auto-book is halted
 
-When `state.json` can't be read, the monitor keeps the bad copy aside on the
-runner, starts a fresh `state.json` with an `"autobook_halted"` entry, and
-sends one 🔴 email. Auto-book stays off, whatever `AUTOBOOK_MODE` says, and
-the dashboard banner says *HALTED*. To resume, check My bookings, then:
+When `state.json` is missing, can't be read, or isn't the shape the monitor
+writes, the monitor keeps the bad copy aside on the runner and writes a fresh
+`state.json` with an `"autobook_halted"` entry straight away. It then sends one
+🔴 email. Auto-book stays off, whatever `AUTOBOOK_MODE` says, and the
+dashboard banner says *HALTED*. Slot-open emails carry on. The email contains
+these steps:
 
-```bash
+```text
+To restore the auto-book records and resume (on the Mac, in court-checker-live).
+Each command line can be pasted as is.
+
+1. Pause the monitor so it doesn't commit state.json while you work: pause the
+   cron-job.org job, and Actions -> Tennis monitor -> ... -> Disable workflow.
+
+2. Get the latest state and list the recent versions of state.json:
 git pull --rebase
-python3 - <<'PY'
-import json; s = json.load(open("state.json")); s.pop("autobook_halted", None)
-json.dump(s, open("state.json", "w"), indent=2)
-PY
-git commit -am "Resume auto-book" && git push
+git log --oneline -15 -- state.json
+
+3. Find the newest version that is valid JSON and NOT halted, i.e. from before
+   the halt (this prints its commit):
+for c in $(git log --format=%h -50 -- state.json); do git show "$c:state.json" 2>/dev/null | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(not isinstance(s, dict) or "autobook_halted" in s)' 2>/dev/null && { echo "last good: $c"; break; }; done
+
+   Look at it, and check it has the auto-book records you expect
+   (replace COMMIT with the hash printed above):
+git show COMMIT:state.json | python3 -m json.tool | less
+
+4. Copy autobook, autobook_dry_run and autobook_retry from that version into the
+   current state.json, and drop autobook_halted:
+git show COMMIT:state.json > /tmp/good_state.json
+python3 -c 'import json; g = json.load(open("/tmp/good_state.json")); c = json.load(open("state.json")); [c.__setitem__(k, {**g.get(k, {}), **c.get(k, {})}) for k in ("autobook", "autobook_dry_run", "autobook_retry")]; c.pop("autobook_halted", None); json.dump(c, open("state.json", "w"), indent=2)'
+
+5. Check My bookings for anything booked since that version (Awaiting payment
+   and Upcoming). A booking the bot made in that gap isn't in the restored
+   records; it still blocks the same time, because the bot reads My bookings
+   before booking, but check it's one you want:
+   https://crystalsports-booking.kegroup.co.th/bookings?tab=pending
+   https://crystalsports-booking.kegroup.co.th/bookings
+
+6. Push, then resume the monitor (re-enable the workflow and the cron-job.org
+   job). Auto-book resumes from the next run:
+git commit -am "Restore auto-book records after halt" && git push
 ```
 
 ### Emergency: turn it off
