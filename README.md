@@ -123,7 +123,15 @@ Start with `dry_run` and read a few 🧪 emails before switching to `live`.
    appeared, it tries **one** other free court at the same time, never more.
    Any new booking after a refusal → 🟠 Unclear, no second court.
 
+A new booking under Awaiting payment counts as 🟡 Parked only after its own
+page (`/bookings/SPORTS-…`) shows this date and time. If it shows another
+slot, or can't be read, the result is 🟠 Unclear.
+
 A run that dies mid-booking is never retried: the next run sends 🟠 once.
+
+If a starred time was already auto-booked (or tried) at the other location,
+the 🎾 line for this location says *auto-book already attempted at
+&lt;location&gt; (result: 🟢/🟡/🔴/🟠) — see that email*.
 
 ### Auto-book emails
 
@@ -138,7 +146,7 @@ A run that dies mid-booking is never retried: the next run sends 🟠 once.
 | ℹ️ Already booked: … | You already have a booking at that date and time | Nothing |
 | ℹ️ Not auto-booking … — can't check your bookings | A booking's date/time couldn't be read, so it didn't risk a double booking | Book manually if you want it; it keeps trying quietly |
 | 🔴 state.json unreadable — auto-book halted | `state.json` (which holds the "already booked" records) is missing, couldn't be read, or isn't the shape the monitor writes. Auto-book is **halted**: no booking requests at all. Slot-open emails carry on | Follow the [restore steps](#if-auto-book-is-halted) (they're in the email too) |
-| 🔴 state not saved — check before trusting auto-book | A run's `state.json` couldn't be pushed to the repo, so the next run starts from an older one. It lists the auto-book records that run held | Check My bookings, then the Actions log for why the push failed. Sent once until the repo's `state.json` changes |
+| 🔴 state not saved — check before trusting auto-book | A run's `state.json` couldn't be pushed to the repo, so the next runs start from an older one. Auto-book is **paused** (notify-only) until a later run saves `state.json`, then resumes by itself. It lists the auto-book records that run held | Check My bookings, then the Actions log for why the push failed. Sent once per episode |
 
 Each result is sent once per date + time. If a result email can't be sent,
 that time is included in the normal 🎾 email instead. A failure inside
@@ -158,44 +166,45 @@ When `state.json` is missing, can't be read, or isn't the shape the monitor
 writes, the monitor keeps the bad copy aside on the runner and writes a fresh
 `state.json` with an `"autobook_halted"` entry straight away. It then sends one
 🔴 email. Auto-book stays off, whatever `AUTOBOOK_MODE` says, and the
-dashboard banner says *HALTED*. Slot-open emails carry on. The email contains
-these steps:
+dashboard banner says *HALTED*. Slot-open emails carry on.
+
+Auto-book is halted whenever the `"autobook_halted"` key is in `state.json`,
+whatever its value (`{}` and `null` included). The only way to clear it is
+to delete the key, which `restore_state.py` does. The email contains these
+steps (plain commands, the same in bash and zsh):
 
 ```text
-To restore the auto-book records and resume (on the Mac, in court-checker-live).
-Each command line can be pasted as is.
+To restore and resume (on the Mac, in court-checker-live):
 
-1. Pause the monitor so it doesn't commit state.json while you work: pause the
-   cron-job.org job, and Actions -> Tennis monitor -> ... -> Disable workflow.
-
-2. Get the latest state and list the recent versions of state.json:
-git pull --rebase
-git log --oneline -15 -- state.json
-
-3. Find the newest version that is valid JSON and NOT halted, i.e. from before
-   the halt (this prints its commit):
-for c in $(git log --format=%h -50 -- state.json); do git show "$c:state.json" 2>/dev/null | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(not isinstance(s, dict) or "autobook_halted" in s)' 2>/dev/null && { echo "last good: $c"; break; }; done
-
-   Look at it, and check it has the auto-book records you expect
-   (replace COMMIT with the hash printed above):
-git show COMMIT:state.json | python3 -m json.tool | less
-
-4. Copy autobook, autobook_dry_run and autobook_retry from that version into the
-   current state.json, and drop autobook_halted:
-git show COMMIT:state.json > /tmp/good_state.json
-python3 -c 'import json; g = json.load(open("/tmp/good_state.json")); c = json.load(open("state.json")); [c.__setitem__(k, {**g.get(k, {}), **c.get(k, {})}) for k in ("autobook", "autobook_dry_run", "autobook_retry")]; c.pop("autobook_halted", None); json.dump(c, open("state.json", "w"), indent=2)'
-
-5. Check My bookings for anything booked since that version (Awaiting payment
-   and Upcoming). A booking the bot made in that gap isn't in the restored
-   records; it still blocks the same time, because the bot reads My bookings
-   before booking, but check it's one you want:
-   https://crystalsports-booking.kegroup.co.th/bookings?tab=pending
-   https://crystalsports-booking.kegroup.co.th/bookings
-
-6. Push, then resume the monitor (re-enable the workflow and the cron-job.org
-   job). Auto-book resumes from the next run:
-git commit -am "Restore auto-book records after halt" && git push
+1. Pause the monitor: pause the cron-job.org job, so it doesn't commit
+   state.json while you work.
+2. Get the latest state:
+    git pull --rebase
+3. Restore the auto-book records from the newest good state.json in git
+   history (valid, not halted, the right shape). It only edits state.json,
+   prints what it restored (counts only), and never commits:
+    python3 restore_state.py
+4. Check My bookings for anything booked since that version, in Awaiting
+   payment and Upcoming. A booking made in that gap isn't in the restored
+   records (the bot still reads My bookings before booking, so it blocks the
+   same time):
+    https://crystalsports-booking.kegroup.co.th/bookings?tab=pending
+    https://crystalsports-booking.kegroup.co.th/bookings
+5. Commit and push:
+    git commit -am "Restore state after halt" && git push
+6. Resume the cron-job.org job. Auto-book resumes from the next run.
 ```
+
+### If a run's state.json couldn't be saved
+
+If a run can't push `state.json`, the next runs start from an older copy that
+may not know what that run auto-booked. So the workflow keeps a small marker
+in the Actions cache: the id of the repo's `state.json` at the moment of the
+failure. While the repo's `state.json` is still that one, no later push has
+succeeded, and auto-book is **paused** (notify-only). The dashboard says
+*PAUSED*, and `state.json` has `"autobook_blocked"`. It resumes by itself
+once a push succeeds. If the marker or the cache can't be read, that run
+doesn't auto-book. You get one 🔴 "state not saved" email per episode.
 
 ### Emergency: turn it off
 
@@ -307,6 +316,7 @@ no requests.
 |---|---|
 | `monitor.py` | The monitor: check passes, emails, state |
 | `autobook.py` | Auto-book: the checks, the booking flow and its emails |
+| `restore_state.py` | After a halt: restores the auto-book records from the newest good `state.json` in git history (see [If auto-book is halted](#if-auto-book-is-halted)) |
 | `bot_session.py` | The bot's session: encrypted jar, cookie rotation, and the one guarded request function (a short allow-list of GETs, plus the single POST to `/booking/confirm`, live mode only) |
 | `booking_page.py` | Page parsers: the grid, the court and review pages, My bookings (Thai and English), and the login-page detector |
 | `probe_new_site.py` | Read-only diagnostic probe |
@@ -316,7 +326,7 @@ no requests.
 | `state.json` | Monitor state: open slots, last check, session and site-read alerts |
 | `.github/workflows/monitor.yml` | The monitor job |
 | `.github/workflows/probe.yml` | The manual probe job |
-| `test_*.py` | Tests: `python3 -m unittest test_monitor test_probe_new_site test_seal_session test_autobook` |
+| `test_*.py` | Tests: `python3 -m unittest test_monitor test_probe_new_site test_seal_session test_autobook` (the restore tests need `git`, and `zsh` for the zsh run) |
 | `tests/fixtures/` | Scrubbed copies of live pages for the tests (see its README). The raw pages go in `fixtures_raw/`, which is gitignored and never committed |
 | `app/`, `lib/` | The dashboard (Next.js, see [DEPLOY.md](DEPLOY.md)) |
 | `WALLET_GUARD_SAFETY.md` | History: the old site's auto-book wallet guard |

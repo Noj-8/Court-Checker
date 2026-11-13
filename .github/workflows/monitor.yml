@@ -36,6 +36,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt "cryptography>=42"
 
+      # The "state not saved" marker (see the email steps below). Restored
+      # before the monitor runs: while the repo's state.json is still the one
+      # a failed push left behind, auto-book stays off. If the cache can't be
+      # read, the outcome isn't "success" and the monitor assumes the worst.
+      - name: Restore the "state not saved" marker
+        id: push_marker
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: .state_alert.json
+          key: state-not-saved-${{ github.run_id }}
+          restore-keys: state-not-saved-
+
       - name: Run monitor
         env:
           BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
@@ -46,11 +59,15 @@ jobs:
           AUTOBOOK_MODE: ${{ vars.AUTOBOOK_MODE }}
           LOOP_ITERATIONS: '4'         # 4 polls per run
           LOOP_INTERVAL_SECONDS: '60'  # 60s between polls = ~60s effective polling
+          PUSH_MARKER_STATUS: ${{ steps.push_marker.outcome }}
         run: |
           if [ -z "$BOT_JAR_KEY" ]; then
             echo "::error::BOT_JAR_KEY secret is not set."
             exit 1
           fi
+          REPO_STATE_BLOB="$(git rev-parse -q --verify HEAD:state.json || echo unknown)"
+          echo "REPO_STATE_BLOB=$REPO_STATE_BLOB" >> "$GITHUB_ENV"
+          export REPO_STATE_BLOB
           python monitor.py
 
       - name: Commit state and bot session
@@ -102,16 +119,9 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
         run: python monitor.py --alert-session-lost "bot_session.enc could not be pushed after a cookie rotated"
 
-      # Deduped: a small marker (the repo's state.json blob id it was sent for)
-      # lives in the Actions cache, since the repo itself is what can't be written.
-      - name: Restore the "state not saved" email marker
-        if: always() && steps.save.outputs.state_not_saved == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: .state_alert.json
-          key: state-not-saved-${{ github.run_id }}
-          restore-keys: state-not-saved-
-
+      # The marker (the repo's state.json blob id at the failure) lives in the
+      # Actions cache, since the repo itself is what can't be written. It
+      # pauses auto-book until a push succeeds, and dedupes this email.
       - name: Email if state.json could not be saved
         if: always() && steps.save.outputs.state_not_saved == 'true'
         env:
@@ -123,7 +133,7 @@ jobs:
           REMOTE_STATE_BLOB="$(git rev-parse -q --verify origin/main:state.json || echo unknown)" \
             python monitor.py --alert-state-not-saved "state.json could not be pushed to main"
 
-      - name: Save the "state not saved" email marker
+      - name: Save the "state not saved" marker
         if: always() && steps.save.outputs.state_not_saved == 'true' && hashFiles('.state_alert.json') != ''
         uses: actions/cache/save@v4
         with:

@@ -22,14 +22,19 @@ function modeView(state: State): ModeView {
 const DANGER = "bg-claylight text-clay border border-clay/30"
 const CAUTION = "bg-amberlight text-amber border border-amber/20"
 
-function modeText(mode: ModeView, halted: boolean) {
+function modeText(mode: ModeView, halted: boolean, blocked: boolean) {
   switch (mode) {
     case "off":
       return {
         banner: halted
-          ? "Auto-book is HALTED: state.json was found unreadable, so the monitor books nothing until the " +
-            "\"autobook_halted\" entry is removed from state.json. Starred times get a normal alert — book manually."
-          : "Auto-book is off. Starred times get a normal alert — book manually.",
+          ? "Auto-book is HALTED: state.json couldn't be trusted, so the monitor books nothing until the " +
+            "\"autobook_halted\" entry is removed (run restore_state.py — see the email). Starred times get a " +
+            "normal alert — book manually."
+          : blocked
+            ? "Auto-book is PAUSED: a run's state.json couldn't be saved to the repo, so the monitor books " +
+              "nothing until a later run saves it (it resumes by itself). Starred times get a normal alert — " +
+              "book manually."
+            : "Auto-book is off. Starred times get a normal alert — book manually.",
         bannerClass: CAUTION,
         label: "starred — notify only (auto-book off)",
         labelClass: "bg-amberlight text-amber",
@@ -84,7 +89,8 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
   const [errorMsg, setErrorMsg] = useState<string | null>(loadError)
   const [now, setNow] = useState(() => Date.now())
   const mode = modeView(state)
-  const modeInfo = modeText(mode, !!state.autobook_halted)
+  // Halted = the key is present, whatever its value (null included).
+  const modeInfo = modeText(mode, "autobook_halted" in state, !!state.autobook_blocked)
 
   // Tick clock so "last check: X min ago" stays fresh
   useEffect(() => {
@@ -412,7 +418,7 @@ function TargetRow({
       ? target.times.map((t) => t.time).join(", ")
       : `${target.times[0].time}–${target.times[target.times.length - 1].time} (${target.times.length} slots)`
   const starredTimes = target.times.filter((t) => t.autoBook).map((t) => t.time)
-  const modeInfo = modeText(mode, false)
+  const modeInfo = modeText(mode, false, false)
 
   return (
     <div className="bg-white border border-line rounded-xl p-4 flex items-center justify-between gap-4 hover:border-line2 transition-colors">
@@ -489,7 +495,7 @@ function TargetForm({
     initial?.locations || ["LOC001", "LOC002"],
   )
   const [times, setTimes] = useState<TimeSlot[]>(initial?.times || [])
-  const modeInfo = modeText(mode, false)
+  const modeInfo = modeText(mode, false, false)
   const [submitting, setSubmitting] = useState(false)
 
   function toggleLoc(loc: LocId) {

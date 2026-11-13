@@ -69,6 +69,8 @@ SLOT_MINUTES = 60  # every grid slot is one hour
 MAX_DETAIL_READS = 10  # per pass: more unknown pending bookings than this -> fail closed
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+RESULT_EMOJI = {"paid": "🟢", "parked": "🟡", "failed": "🔴", "aborted_mismatch": "🔴", "not_recorded": "🔴",
+                "unclear": "🟠", "interrupted": "🟠", "in_progress": "🟠", "skipped_existing": "ℹ️"}
 TERMINAL = {"skipped_existing", "aborted_mismatch", "dry_run", "in_progress", "interrupted",
             "paid", "parked", "failed", "unclear", "not_recorded"}
 
@@ -151,9 +153,10 @@ class Context:
         self.jar, self.state, self.mode = jar, state, mode
         self.send, self.save_state, self.try_save_state, self.log = send, save_state, try_save_state, log
         self.locations = locations
-        # (key, location) pairs whose result email was actually SENT this
-        # pass: only that location's opening is left out of the slot-open email.
-        self.emailed_slots = set()
+        # (key, location) -> the result emoji of an email actually SENT this
+        # pass: only that location's opening is left out of the slot-open
+        # email; the other location's line points at it.
+        self.emailed_slots = {}
         self.current_loc = None  # the location being attempted
         self.detail_cache = {}  # ref -> [(date, start, end)] or None (unreadable), for this pass
         # key -> {"court", "price"} as the page showed them: for this pass's
@@ -181,7 +184,7 @@ class Context:
         except Exception as e:
             self.log(f"⚠ auto-book email failed for {key}: {type(e).__name__}")
             return False
-        self.emailed_slots.add((key, self.current_loc))
+        self.emailed_slots[(key, self.current_loc)] = subject.split(" ", 1)[0]
         self.log(f"✉ {subject.split(' ', 1)[0]} email sent for {key}")
         return True
 
@@ -589,6 +592,19 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
         ref = new[0]  # the one new booking (still checked against this slot below)
         attempt["ref_fp"] = ref_fp(ref)
     row = pending.get(ref) or upcoming.get(ref) if ref else None
+    if ref and ref in pending and row["slot"] is None:
+        # Awaiting-payment rows don't show the court time: read the new
+        # booking's own page before calling it ours (🟡).
+        slots = booking_slots(ctx, ref)
+        if slots is None:
+            return _finish(ctx, key, rec, "unclear", "new_booking_unreadable",
+                           "a new booking is awaiting payment, but its own page couldn't be read to confirm "
+                           "its date and time", ref=ref, location=location)
+        if any(s[:2] != (cand["date"], cand["time"]) for s in slots):
+            other = ", ".join(f"{s[0]} {s[1]}" for s in slots)
+            return _finish(ctx, key, rec, "unclear", "listed_other_slot",
+                           f"the new booking's own page shows {other}, not {cand['date']} {cand['time']}",
+                           ref=ref, location=location)
     if row is not None and row["slot"] is not None and row["slot"][:2] != (cand["date"], cand["time"]):
         return _finish(ctx, key, rec, "unclear", "listed_other_slot",
                        f"the new booking is listed for {row['slot'][0]} {row['slot'][1]}, not {cand['date']} {cand['time']}",

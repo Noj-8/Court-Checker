@@ -44,9 +44,13 @@ export type AutobookMode = "off" | "dry_run" | "live"
 
 export type State = {
   autobook_mode?: AutobookMode
-  // Set when state.json was found unreadable: auto-book stays off until the
-  // owner removes this entry from state.json.
-  autobook_halted?: { reason: string; since: string; emailed_at?: string }
+  // Halted = this KEY is present, whatever its value (null included). Set
+  // when state.json was found missing/unreadable/wrong shape; auto-book stays
+  // off until the key is deleted (restore_state.py does that).
+  autobook_halted?: unknown
+  // Set while an earlier run's state.json push failed and no later push has
+  // succeeded: auto-book is paused and resumes by itself.
+  autobook_blocked?: { reason: string; since?: string }
   last_check?: string             // ISO datetime of the last pass that READ a booking page
   currently_open_count?: number   // watched TIME SLOTS open right now (per time, not per court)
   known_open?: Record<string, true> // keys "YYYY-MM-DD|LOC00x|any|HH:MM" — one per open time slot

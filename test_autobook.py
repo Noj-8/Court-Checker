@@ -21,9 +21,11 @@ import io
 import json
 import os
 import re
+import shutil
 import smtplib
 import subprocess
 import sys
+import tempfile
 import unittest
 from datetime import date as _date, timedelta
 from pathlib import Path
@@ -143,7 +145,9 @@ class FakeSite(requests.adapters.BaseAdapter):
         self.pending = [pages.pending_empty()]       # served in order; the last one repeats
         self.upcoming = [pages.upcoming_empty()]
         self.posts = []                              # POST responses in order
-        self.details = {}                            # ref -> a booking's own page (or a response tuple)
+        # ref -> a booking's own page (or a response tuple). The bot's own new
+        # booking (REF) is at the test slot: DERIVED from the real page 7.
+        self.details = {REF: pages.detail(REF)}
         self.on_post = None
 
     @staticmethod
@@ -210,12 +214,12 @@ class AutobookTestCase(MonitorTestCase):
         self.write_config([target(self.date, [("23:00", True)], locations=("LOC002",))])
         self.site = FakeSite(self.p)
 
-    def run_mode(self, mode, iterations=1, raise_ok=False, fail_subjects=()):
+    def run_mode(self, mode, iterations=1, raise_ok=False, fail_subjects=(), env=None):
         session = requests.Session()
         session.mount("https://", self.site)
         sent = []
         out = io.StringIO()
-        env = {**EMAIL_ENV, **({"AUTOBOOK_MODE": mode} if mode is not None else {})}
+        env = {**EMAIL_ENV, **({"AUTOBOOK_MODE": mode} if mode is not None else {}), **(env or {})}
         with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
              mock.patch.object(monitor, "STATE_FILE", self.state_file), \
@@ -272,7 +276,8 @@ class TestParkedEndToEnd(AutobookTestCase):
         order = [(s["method"], s["path"], s["query"].get("tab", s["query"].get("time", ""))) for s in self.site.sent]
         self.assertEqual(order, [("GET", "/booking", "0"), ("GET", "/bookings", "pending"), ("GET", "/bookings", ""),
                                  ("GET", "/booking", "18"), ("GET", "/booking/review", ""),
-                                 ("POST", "/booking/confirm", ""), ("GET", "/bookings", "pending"), ("GET", "/bookings", "")])
+                                 ("POST", "/booking/confirm", ""), ("GET", "/bookings", "pending"), ("GET", "/bookings", ""),
+                                 ("GET", f"/bookings/{REF}", "")], "the new pending booking's own page, read before 🟡")
 
         self.assertEqual(self.subjects(sent), [f"🟡 Parked — pay within 15 min: Crystal Sports G G South-1 {self.date} 23:00 ฿500"])
         body = sent[0]["body"]
@@ -865,6 +870,19 @@ class TestStateHoldsNoSiteText(AutobookTestCase):
                     self.assertNotIn(injected, s)
         return state
 
+    def test_attempts_hold_only_our_own_keys(self):
+        self.site.posts = [refused_page(self.p.refused()), parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        attempts = self.record()["attempts"]
+        self.assertEqual(len(attempts), 2)
+        for a in attempts:
+            self.assertLessEqual(set(a), {"n", "court_index", "at", "http", "hint", "ref_fp", "refused"})
+        for v in strings_in(self.state()):
+            self.assertIsNone(re.fullmatch(r"\d{8}-\d{1,6}", v), f"a court's sel in state: {v}")
+            self.assertNotIn(self.p.sel, v)
+            self.assertNotIn(self.p.sel2, v)
+
     def test_page_texts_are_actually_collected(self):
         texts = page_texts()
         for expected in ("Hi Test Member", "Awaiting payment", "I have read and accept the terms of service"):
@@ -939,7 +957,10 @@ class TestDashboardWording(unittest.TestCase):
                      "starred — dry run (emails what it would book, books nothing)",
                      "AUTO-BOOK — books with Wallet when it opens"):
             self.assertIn(text, src)
-        self.assertNotIn("paused", src.lower(), "no fixed 'paused' text left")
+        for stale in ("auto-book paused — notify only", "paused while it's rebuilt"):
+            self.assertNotIn(stale, src, "no fixed 'paused' text left")
+        self.assertIn('"autobook_halted" in state', src, "halted = the key is present, whatever its value")
+        self.assertIn("state.autobook_blocked", src)
         view = src[src.index("function modeView"):src.index("const DANGER")]
         self.assertIn('return m === "off" || m === "dry_run" || m === "live" ? m : "unknown"', view)
         default = src[src.index("    default:", src.index("function modeText")):]
@@ -1081,7 +1102,7 @@ class TestErrorsNeverDropAnything(AutobookTestCase):
         ctx = autobook.Context(None, {}, "live", send=mock.Mock(side_effect=OSError("smtp")), save_state=None,
                                try_save_state=None, log=lambda m: None, locations={})
         self.assertFalse(ctx.email("k", "🟢 x", "y"))
-        self.assertEqual(ctx.emailed_slots, set())
+        self.assertEqual(ctx.emailed_slots, {})
 
     def test_a_crashing_auto_book_still_sends_the_slot_open_email(self):
         for exc in (RuntimeError("bug"), KeyError("x"), bot_session.JarSaveError("disk full", [])):
@@ -1304,50 +1325,144 @@ class TestHaltIsDurable(AutobookTestCase):
         code, sent = self.run_mode("live")
         body = sent[0]["body"]
         self.assertIn(monitor.HALT_RESTORE_STEPS, body)
-        for must in ("git log --oneline -15 -- state.json", "git show COMMIT:state.json",
-                     "autobook_dry_run", "autobook_retry", "bookings?tab=pending", "git push"):
+        for must in ("cron-job.org", "git pull --rebase", "python3 restore_state.py", "bookings?tab=pending",
+                     'git commit -am "Restore state after halt" && git push'):
             self.assertIn(must, body)
 
     def test_readme_has_the_same_restore_steps(self):
         readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
         self.assertIn(monitor.HALT_RESTORE_STEPS, readme)
 
-    def test_the_restore_steps_actually_work(self):
-        # Run steps 3 and 4 exactly as written, in a scratch git repo whose
-        # history is: good state (with records) -> halted fresh state.
-        repo = self.dir / "repo"
+    def test_the_steps_are_plain_commands(self):
+        commands = restore_commands()
+        self.assertEqual(commands, ["git pull --rebase", "python3 restore_state.py",
+                                    'git commit -am "Restore state after halt" && git push'])
+        for c in commands:  # nothing that differs between bash and zsh
+            for shell_feature in ("$(", "`", "<<", "for ", "{ ", "[[", "!", "*", "~", ";"):
+                self.assertNotIn(shell_feature, c)
+
+
+def restore_commands():
+    return [l.strip() for l in monitor.HALT_RESTORE_STEPS.splitlines()
+            if l.startswith("    ") and l.strip().startswith(("git ", "python3 "))]
+
+
+class TestRestoreState(unittest.TestCase):
+    """restore_state.py and the halt email's steps, run for real in a throwaway
+    repo (with a bare "origin"), in bash and in zsh."""
+    CODE = ("restore_state.py", "monitor.py", "autobook.py", "booking_page.py", "bot_session.py")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def git(self, repo, *a):
+        return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout
+
+    def make_history(self):
+        origin, repo = self.root / "origin.git", self.root / "repo"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True, capture_output=True)
+        self.git(repo, "config", "user.email", "t@example.invalid")
+        self.git(repo, "config", "user.name", "t")
+        self.git(repo, "checkout", "-q", "-b", "main")
+        self.good = {"autobook": {"2026-11-15|23:00": {"status": "parked", "attempts": [{"n": 1, "ref_fp": "abcdef123456"}]},
+                                  "2026-11-20|20:00": {"status": "failed", "attempts": []}},
+                     "autobook_dry_run": {"2026-11-16|20:00": {"status": "dry_run"}},
+                     "autobook_retry": {"2026-11-17|21:00": {"reason": "no_free_court"}}, "known_open": {}}
+        versions = [
+            ("older good", {"autobook": {"2026-11-01|20:00": {"status": "paid", "attempts": []}}}),
+            ("good", self.good),
+            ("wrong shape", {"autobook": [], "known_open": {}}),
+            ("not json", "{broken"),
+            ("halted by hand, null", {**self.good, "autobook_halted": None}),
+            ("wrong-shape halt (monitor's fresh state)", {"autobook_halted": {"reason": "state_unreadable"},
+                                                          "known_open": {"k": True},
+                                                          "autobook": {"2026-11-20|20:00": {"status": "paid", "attempts": []}}}),
+        ]
+        for msg, content in versions:
+            (repo / "state.json").write_text(content if isinstance(content, str) else json.dumps(content))
+            self.git(repo, "add", "state.json")
+            self.git(repo, "commit", "-qm", msg)
+        self.git(repo, "push", "-q", "-u", "origin", "main")
+        src = Path(__file__).resolve().parent
+        for f in self.CODE:  # the code, untracked, as in the real working copy
+            shutil.copy(src / f, repo / f)
+        return origin, repo
+
+    def test_the_halt_steps_work_in_bash_and_zsh(self):
+        for shell in ("bash", "zsh"):
+            with self.subTest(shell=shell):
+                if not shutil.which(shell):
+                    self.skipTest(f"{shell} not installed")
+                self.setUp()
+                origin, repo = self.make_history()
+                outputs = []
+                for cmd in restore_commands():
+                    r = subprocess.run([shell, "-c", cmd], cwd=repo, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, f"{cmd}: {r.stdout} {r.stderr}")
+                    outputs.append(r.stdout)
+                pushed = json.loads(self.git(origin, "show", "main:state.json"))
+                self.assertNotIn("autobook_halted", pushed)
+                self.assertEqual(pushed["autobook_dry_run"], self.good["autobook_dry_run"])
+                self.assertEqual(pushed["autobook_retry"], self.good["autobook_retry"])
+                self.assertEqual(pushed["autobook"]["2026-11-15|23:00"], self.good["autobook"]["2026-11-15|23:00"])
+                self.assertEqual(pushed["autobook"]["2026-11-20|20:00"]["status"], "paid", "the current value wins")
+                self.assertNotIn("2026-11-01|20:00", pushed["autobook"], "the NEWEST good version, not an older one")
+                self.assertEqual(pushed["known_open"], {"k": True}, "the rest of the current state is kept")
+                self.assertEqual(monitor.shape_problems(pushed), [])
+                summary = outputs[1]
+                self.assertIn("skipped 4 newer version(s)", summary,
+                              "wrong shape, not JSON, halted with null, the monitor's halted state")
+                self.assertIn("autobook: 2 record(s) in that version -> 2 now", summary)
+                self.assertNotIn("abcdef123456", summary, "counts only, no record contents")
+                self.assertNotIn("SPORTS-", summary)
+
+    def run_restore(self, repo):
+        return subprocess.run([sys.executable, "restore_state.py"], cwd=repo, capture_output=True, text=True)
+
+    def test_it_never_commits_or_pushes(self):
+        origin, repo = self.make_history()
+        head = self.git(repo, "rev-parse", "HEAD")
+        r = self.run_restore(repo)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(origin, "rev-parse", "main"), head)
+        self.assertIn("state.json", self.git(repo, "status", "--porcelain"))
+
+    def test_nothing_usable_leaves_state_untouched(self):
+        repo = self.root / "bare-history"
         repo.mkdir()
-        git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout
-        git("init", "-q")
-        git("config", "user.email", "t@example.invalid")
-        git("config", "user.name", "t")
-        good = {"autobook": {"2026-11-15|23:00": {"status": "parked", "attempts": [{"n": 1}]}},
-                "autobook_dry_run": {"2026-11-16|20:00": {"status": "dry_run"}},
-                "autobook_retry": {"2026-11-17|21:00": {"reason": "no_free_court"}}, "known_open": {}}
-        (repo / "state.json").write_text(json.dumps(good))
-        git("add", "state.json")
-        git("commit", "-qm", "good")
-        (repo / "state.json").write_text("{broken")
-        git("commit", "-qam", "broken")
-        (repo / "state.json").write_text(json.dumps({"autobook_halted": {"reason": "state_unreadable"}, "known_open": {"k": True}}))
-        git("commit", "-qam", "halted")
-        steps = monitor.HALT_RESTORE_STEPS.splitlines()
-        find = next(l for l in steps if l.startswith("for c in "))
-        out = subprocess.run(["bash", "-c", find], cwd=repo, capture_output=True, text=True).stdout
-        commit = out.strip().split("last good: ")[1]
-        self.assertEqual(commit, git("log", "--format=%h", "-1", "HEAD~2").strip(), "picks the last good, not the halted one")
-        for line in steps:
-            if line.startswith(("git show COMMIT:state.json >", "python3 -c ")):
-                subprocess.run(["bash", "-c", line.replace("COMMIT", commit).replace("/tmp/good_state.json",
-                                                                                      str(self.dir / "good.json"))],
-                               cwd=repo, check=True)
-        restored = json.loads((repo / "state.json").read_text())
-        self.assertNotIn("autobook_halted", restored)
-        for k in ("autobook", "autobook_dry_run", "autobook_retry"):
-            self.assertEqual(restored[k], good[k])
-        self.assertEqual(restored["known_open"], {"k": True}, "the current state otherwise kept")
-        with mock.patch.object(monitor, "STATE_FILE", repo / "state.json"):
-            monitor.load_state()  # the result is a valid state
+        self.git(repo, "init", "-q")
+        self.git(repo, "config", "user.email", "t@example.invalid")
+        self.git(repo, "config", "user.name", "t")
+        for v in ("{bad", json.dumps({"autobook": "x"}), json.dumps({"autobook_halted": {}})):
+            (repo / "state.json").write_text(v)
+            self.git(repo, "add", "state.json")
+            self.git(repo, "commit", "-qm", "v")
+        for f in self.CODE:
+            shutil.copy(Path(__file__).resolve().parent / f, repo / f)
+        before = (repo / "state.json").read_text()
+        r = self.run_restore(repo)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no usable state.json", r.stdout)
+        self.assertEqual((repo / "state.json").read_text(), before)
+
+    def test_not_halted_is_a_no_op(self):
+        origin, repo = self.make_history()
+        (repo / "state.json").write_text(json.dumps({"known_open": {}}))
+        r = self.run_restore(repo)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Nothing to do", r.stdout)
+        self.assertEqual(json.loads((repo / "state.json").read_text()), {"known_open": {}})
+
+    def test_an_unreadable_current_file_is_left_alone(self):
+        origin, repo = self.make_history()
+        (repo / "state.json").write_text("{nope")
+        r = self.run_restore(repo)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((repo / "state.json").read_text(), "{nope")
 
 
 class TestKeyedFingerprint(unittest.TestCase):
@@ -1419,11 +1534,13 @@ class TestStateNotSaved(MonitorTestCase):
         self.assertEqual(len(self.call(None)[1]), 1)
         self.assertEqual(len(self.call(None)[1]), 1)
 
-    def test_a_failed_send_leaves_no_marker(self):
+    def test_a_failed_send_still_writes_the_marker_and_retries_the_email(self):
         code, sent = self.call("blob1", fail=True)
         self.assertEqual(code, monitor.EXIT_ERROR)
-        self.assertFalse((self.dir / ".state_alert.json").exists())
-        self.assertEqual(len(self.call("blob1")[1]), 1)
+        marker = json.loads((self.dir / ".state_alert.json").read_text())
+        self.assertEqual((marker["remote_blob"], marker["emailed"]), ("blob1", False), "the pause doesn't depend on the email")
+        self.assertEqual(len(self.call("blob1")[1]), 1, "not emailed yet: sent on the next failure")
+        self.assertEqual(self.call("blob1")[1], [])
 
     def test_workflow_sends_it_when_the_push_fails(self):
         wf = (Path(__file__).resolve().parent / ".github" / "workflows" / "monitor.yml").read_text(encoding="utf-8")
@@ -1475,6 +1592,234 @@ class TestNoSiteFieldNamesInState(AutobookTestCase):
         self.run_mode("live")
         self.assertEqual(self.record()["problems"], ["field_required"])
         self.assertNotIn("coach_", self.state_file.read_text())
+
+
+
+# --- second independent review ---------------------------------------------------
+
+class TestHaltIsTheKey(AutobookTestCase):
+    def test_any_value_halts_and_never_replaces_the_file(self):
+        for value in ({}, None, [], "yes", 0, False, {"reason": "manual"}):
+            with self.subTest(value=value):
+                self.setUp()
+                self.state_file.write_text(json.dumps({"autobook_halted": value, "known_open": {}}))
+                code, sent = self.run_mode("live")
+                self.assertEqual([s["path"] for s in self.site.sent], ["/booking"], "no auto-book requests")
+                self.assertEqual(list(self.dir.glob("state.json.unreadable-*")), [],
+                                 "an odd value is not 'wrong shape': the file isn't replaced")
+                self.assertEqual(self.subjects(sent)[0], monitor.STATE_UNREADABLE_SUBJECT)
+                self.assertIn('has an "autobook_halted" entry', sent[0]["body"])
+                self.assertIn("autobook_halted", self.state(), "still halted")
+                code, sent = self.run_mode("live")
+                self.assertEqual([s["path"] for s in self.site.sent].count("/bookings"), 0)
+                self.assertNotIn(monitor.STATE_UNREADABLE_SUBJECT, self.subjects(sent), "emailed once")
+
+    def test_odd_halt_value_is_not_a_shape_problem(self):
+        for value in (None, [], "x", 3):
+            self.assertEqual(monitor.shape_problems({"autobook_halted": value}), [])
+            self.assertTrue(monitor.is_halted({"autobook_halted": value}))
+        self.assertFalse(monitor.is_halted({}))
+
+    def test_only_deleting_the_key_resumes(self):
+        self.state_file.write_text(json.dumps({"autobook_halted": None}))
+        self.run_mode("live")
+        state = self.state()
+        state["autobook_halted"] = {}
+        self.state_file.write_text(json.dumps({**state, "known_open": {}}))
+        self.run_mode("live")
+        self.assertEqual(self.site.posts_sent(), [], "an emptied value is still a halt")
+        state = self.state()
+        del state["autobook_halted"]
+        self.state_file.write_text(json.dumps({**state, "known_open": {}}))
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+
+
+class TestPushFailurePause(AutobookTestCase):
+    MARKER_ENV = {"PUSH_MARKER_STATUS": "success"}
+
+    def fail_push(self, blob, fail_email=False):
+        """What monitor.yml does after a failed push."""
+        sent = []
+
+        def send(s, b, *a):
+            if fail_email:
+                raise smtplib.SMTPException("down")
+            sent.append(s)
+        with mock.patch.dict(os.environ, {**EMAIL_ENV, "REMOTE_STATE_BLOB": blob}, clear=True), \
+             mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
+             mock.patch.object(monitor, "STATE_FILE", self.state_file), \
+             mock.patch.object(monitor, "send_email", side_effect=send), contextlib.redirect_stdout(io.StringIO()):
+            monitor.main(["--alert-state-not-saved", "push failed"])
+        return sent
+
+    def live(self, blob, status="success"):
+        self.site.sent.clear()
+        self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
+        return self.run_mode("live", env={"PUSH_MARKER_STATUS": status, "REPO_STATE_BLOB": blob})
+
+    def book_ok(self):
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+
+    def test_an_episode_pauses_auto_book_emails_once_then_resumes(self):
+        self.assertEqual(self.fail_push("B1"), [monitor.STATE_NOT_SAVED_SUBJECT])
+        for _ in range(3):  # the following runs: the repo's state.json is still B1
+            code, sent = self.live("B1")
+            self.assertEqual(self.site.posts_sent(), [])
+            self.assertNotIn("/bookings", [s["path"] for s in self.site.sent], "no auto-book requests at all")
+            self.assertTrue(any(m["subject"].startswith("🎾") for m in sent), "notify-only carries on")
+            self.assertEqual(self.state()["autobook_mode"], "off")
+            self.assertEqual(self.state()["autobook_blocked"]["reason"], "state_push_failed")
+            self.assertEqual(self.fail_push("B1"), [], "one email per episode, even if pushes keep failing")
+        # A later push succeeded: the repo's state.json is now B2.
+        self.book_ok()
+        code, sent = self.live("B2")
+        self.assertEqual(len(self.site.posts_sent()), 1, "auto-book resumes by itself")
+        self.assertEqual(self.state()["autobook_mode"], "live")
+        self.assertNotIn("autobook_blocked", self.state())
+
+    def fail_push_env(self, env):
+        sent = []
+        with mock.patch.dict(os.environ, {**EMAIL_ENV, **env}, clear=True), \
+             mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
+             mock.patch.object(monitor, "STATE_FILE", self.state_file), \
+             mock.patch.object(monitor, "send_email", side_effect=lambda s, b, *a: sent.append(s)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            monitor.main(["--alert-state-not-saved", "push failed"])
+        return sent
+
+    def test_no_known_blob_at_all_always_emails(self):
+        env = {"REMOTE_STATE_BLOB": "unknown", "REPO_STATE_BLOB": "unknown"}
+        self.assertEqual(self.fail_push_env(env), [monitor.STATE_NOT_SAVED_SUBJECT])
+        self.assertEqual(self.fail_push_env(env), [monitor.STATE_NOT_SAVED_SUBJECT], "can't tell episodes apart")
+        self.assertIsNone(json.loads((self.dir / ".state_alert.json").read_text())["remote_blob"])
+
+    def test_the_checkout_blob_is_the_fallback_baseline(self):
+        env = {"REMOTE_STATE_BLOB": "unknown", "REPO_STATE_BLOB": "B1"}
+        self.assertEqual(self.fail_push_env(env), [monitor.STATE_NOT_SAVED_SUBJECT])
+        self.assertEqual(self.fail_push_env(env), [], "same episode")
+        self.book_ok()
+        self.live("B1")
+        self.assertEqual(self.site.posts_sent(), [])
+        self.live("B2")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+
+    def test_a_new_episode_emails_again(self):
+        self.fail_push("B1")
+        self.assertEqual(self.fail_push("B2"), [monitor.STATE_NOT_SAVED_SUBJECT])
+        self.live("B2")
+        self.assertEqual(self.site.posts_sent(), [])
+
+    def test_if_the_email_fails_the_pause_still_holds(self):
+        self.assertEqual(self.fail_push("B1", fail_email=True), [])
+        self.live("B1")
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertEqual(self.fail_push("B1"), [monitor.STATE_NOT_SAVED_SUBJECT], "sent at the next chance")
+
+    def test_unreadable_marker_or_cache_means_no_auto_book(self):
+        cases = {
+            "cache restore failed": lambda: self.live("B1", status="failure"),
+            "cache restore cancelled/skipped": lambda: self.live("B1", status="cancelled"),
+            "marker isn't JSON": lambda: ((self.dir / ".state_alert.json").write_text("{x"), self.live("B1")),
+            "marker isn't an object": lambda: ((self.dir / ".state_alert.json").write_text("[1]"), self.live("B1")),
+            "current blob unknown": lambda: (self.fail_push("B1"), self.live("unknown")),
+            "current blob not given": lambda: (self.fail_push("B1"), self.run_mode("live", env=self.MARKER_ENV)),
+        }
+        for label, go in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                self.book_ok()
+                go()
+                self.assertEqual(self.site.posts_sent(), [])
+                self.assertIn("autobook_blocked", self.state())
+
+    def test_no_marker_books_normally(self):
+        self.book_ok()
+        self.live("B1")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        self.assertNotIn("autobook_blocked", self.state())
+
+    def test_a_marker_without_a_baseline_pauses_for_an_hour(self):
+        now = monitor.datetime.now(monitor.TZ)
+        for age, blocked in ((timedelta(minutes=10), True), (timedelta(hours=2), False)):
+            with self.subTest(age=age):
+                self.setUp()
+                (self.dir / ".state_alert.json").write_text(json.dumps(
+                    {"remote_blob": None, "sent_at": (now - age).isoformat(), "emailed": True}))
+                self.book_ok()
+                self.live("B9")
+                self.assertEqual(self.site.posts_sent() == [], blocked)
+
+    def test_workflow_restores_the_marker_before_the_monitor_runs(self):
+        wf = (Path(__file__).resolve().parent / ".github" / "workflows" / "monitor.yml").read_text(encoding="utf-8")
+        restore = wf.index("id: push_marker")
+        run = wf.index("- name: Run monitor")
+        self.assertLess(restore, run)
+        self.assertIn("continue-on-error: true", wf[restore - 300:run])
+        self.assertIn("PUSH_MARKER_STATUS: ${{ steps.push_marker.outcome }}", wf)
+        self.assertIn('REPO_STATE_BLOB="$(git rev-parse -q --verify HEAD:state.json || echo unknown)"', wf)
+
+
+class TestOtherLocationWording(AutobookTestCase):
+    def test_same_pass_attempt_at_the_other_location_is_named(self):
+        self.write_config([target(self.date, [("23:00", True)], locations=("LOC001", "LOC002"))])
+        code, sent = self.run_mode("live")  # LOC001 (tried first) ends 🔴: the pages are G's
+        slot = next(m for m in sent if m["subject"].startswith("🎾"))
+        self.assertIn("auto-book already attempted at Crystal Sports (result: 🔴) — see that email", slot["body"])
+        self.assertNotIn("no result yet", slot["body"])
+
+    def test_an_earlier_attempt_at_the_other_location_is_named(self):
+        self.write_config([target(self.date, [("23:00", True)], locations=("LOC001", "LOC002"))])
+        self.state_file.write_text(json.dumps({
+            "known_open": {monitor.slot_key(self.date, "LOC001", monitor.ANY_COURT, "23:00"): True},
+            autobook.LIVE_KEY: {self.key: {"status": "parked", "loc": "LOC001", "date": self.date, "time": "23:00",
+                                           "attempts": [{"n": 1}]}}}))
+        code, sent = self.run_mode("live")
+        self.assertEqual(self.site.posts_sent(), [])
+        slot = next(m for m in sent if m["subject"].startswith("🎾"))
+        self.assertIn("— Crystal Sports G (", slot["body"])
+        self.assertIn("auto-book already attempted at Crystal Sports (result: 🟡) — see that email", slot["body"])
+
+    def test_no_attempt_elsewhere_keeps_the_usual_note(self):
+        self.write_config([target(self.date, [("23:00", True), ("22:00", False)], locations=("LOC002",))])
+        self.site.grid["LOC002"] = self.p.grid_with_2200_open()
+        self.site.pending = [self.p.pending_with_ref(OTHER)]  # unreadable booking: no attempt, no result email
+        self.site.details[OTHER] = (500, [], "x")
+        self.state_file.write_text(json.dumps({autobook.RETRY_KEY: {self.key: {"notified": "x", "reason": "r"}}}))
+        code, sent = self.run_mode("live")
+        slot = next(m for m in sent if m["subject"].startswith("🎾"))
+        self.assertIn(monitor.AUTOBOOK_NOTES["live"], slot["body"])
+
+
+class TestNewPendingBookingIsReadBeforeParked(AutobookTestCase):
+    def test_its_own_page_must_show_this_slot(self):
+        cases = {
+            "another time": (self.p.detail(REF, time="21:00"), "listed_other_slot"),
+            "another date": (self.p.detail(REF, d=self.d + timedelta(days=1)), "listed_other_slot"),
+            "page unreadable": ((500, [], "x"), "new_booking_unreadable"),
+            "page for another booking": (self.p.detail("SPORTS-900000000098"), "new_booking_unreadable"),
+        }
+        for label, (page, reason) in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                self.site.details[REF] = page
+                self.site.posts = [parked_redirect()]
+                self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+                code, sent = self.run_mode("live")
+                self.assertEqual(len(self.site.posts_sent()), 1, "never a second court")
+                self.assertEqual(len(sent), 1)
+                self.assertTrue(sent[0]["subject"].startswith("🟠 Unclear"), sent[0]["subject"])
+                self.assertEqual(self.record()["reason"], reason)
+                self.assertIn(f"/bookings/{REF}", [x["path"] for x in self.site.sent])
+
+    def test_matching_page_is_parked(self):
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        self.assertTrue(sent[0]["subject"].startswith("🟡"))
 
 
 class TestPostIsImpossibleElsewhere(unittest.TestCase):

@@ -85,6 +85,9 @@ class MonitorTestCase(unittest.TestCase):
         self.state_file = self.dir / "state.json"
         self.write_jar(COOKIES)
         self.state_file.write_text("{}")  # tracked in git: always there (missing = halt, see test_autobook)
+        marker = mock.patch.object(monitor, "STATE_ALERT_MARKER", self.dir / ".state_alert.json")
+        marker.start()
+        self.addCleanup(marker.stop)
         self.date = day(1)
         self.write_config([target(self.date, [("20:00", False), ("22:00", False)])])
 
