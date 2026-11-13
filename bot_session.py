@@ -28,6 +28,7 @@ presenting a superseded cs.member kills the whole login session. So:
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -48,6 +49,9 @@ BOOKINGS_PATH = "/bookings"
 CONFIRM_PATH = "/booking/confirm"
 ALLOWED_GET_PATHS = frozenset({BOOKING_PATH, REVIEW_PATH, BOOKINGS_PATH})
 ALLOWED_REQUESTS = frozenset({("GET", p) for p in ALLOWED_GET_PATHS} | {("POST", CONFIRM_PATH)})
+# One booking's own page, e.g. /bookings/SPORTS-202611210443 (seen live
+# 2026-11-13): GET only, exactly this shape — not /sheet, not /cancel.
+BOOKING_DETAIL_RE = re.compile(r"/bookings/SPORTS-\d{1,20}")
 TZ = ZoneInfo("Asia/Bangkok")
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -412,7 +416,8 @@ def is_login_redirect(resp):
 
 
 def fetch(jar, path, params):
-    """GET one allowed page (ALLOWED_GET_PATHS) on the bot's session."""
+    """GET one allowed page (ALLOWED_GET_PATHS, or a booking's own page
+    matching BOOKING_DETAIL_RE) on the bot's session."""
     return _send(jar, "GET", path, params=params)
 
 
@@ -440,7 +445,8 @@ def _send(jar, method, path, params=None, data=None, headers=None):
     headers are already on disk). Fetched.login=True means the session is
     no longer valid: stop."""
     url = BASE + path
-    if (method, path) not in ALLOWED_REQUESTS or urlsplit(url).path != path:
+    allowed = (method, path) in ALLOWED_REQUESTS or (method == "GET" and BOOKING_DETAIL_RE.fullmatch(path))
+    if not allowed or urlsplit(url).path != path:
         raise RuntimeError(f"refusing to {method} {path!r} — not an allowed request on the bot session")
     if (method == "POST") != (data is not None) or (method == "GET" and data is not None):
         raise RuntimeError("only the booking POST may carry a body")

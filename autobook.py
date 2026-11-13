@@ -12,29 +12,33 @@ The flow for a starred time that is newly open (or was deferred earlier
 without ever POSTing):
   1. Key = date|HH:MM. At most ONE booking per key across both locations,
      ever: the attempt is recorded in state before any booking request.
-  2. Read /bookings?tab=pending and /bookings. A listed booking showing this
-     date+time -> skip (one ℹ️ email). A listed booking whose played
-     date/time the list doesn't show (the live Awaiting-payment rows show
-     only ref, booked-on time and status) -> can't be sure: no booking,
-     one ℹ️ email per key, retried on a later pass. Bookings this bot made
-     itself are recognised by their ref fingerprint and ignored.
+  2. Read /bookings?tab=pending and /bookings. Upcoming rows show the
+     played day and time (the year is inferred); Awaiting-payment rows
+     don't, so for each such booking (not the bot's own, recognised by its
+     ref fingerprint) its own page /bookings/SPORTS-… is read. A booking at
+     this date + start time, any location or court -> skip (one ℹ️ email).
+     A booking at another date/time doesn't block. One whose date/time
+     can't be read anywhere -> no booking this pass, one ℹ️ email per key,
+     retried on a later pass.
   3. GET the slot's own link from the grid; check the page has that date,
      branch and time selected; take the first free court tile (site order).
   4. GET /booking/review?sel=..; verify branch, court, date, time, price, and
-     that the form posts to /booking/confirm with exactly: sel, a method
-     radio offering WALLET, __RequestVerificationToken, the terms checkbox,
-     and the optional coach selects (left empty). Anything else, anything
-     required or pre-filled -> 🔴 "booking form changed / page mismatch",
-     no POST.
+     that the form posts to /booking/confirm with exactly: sel, the
+     coach_<sel> select on "No coach", a method radio offering WALLET, the
+     terms checkbox (value "true"), __RequestVerificationToken, and the
+     disabled type_<sel>. Anything else, anything required, pre-filled or
+     pre-selected -> 🔴 "booking form changed / page mismatch", no POST.
   5. dry_run: 🧪 "Would have booked ..." once per key. No POST.
   6. live: write-ahead (status in_progress) saved to state.json on disk,
-     then the ONE POST (bot_session.post_booking_confirm) with method=WALLET,
-     acceptTerms ticked and no coach fields; redirect not followed.
-  7. Verify via both lists: our ref under Awaiting payment -> 🟡 Parked;
-     under Upcoming -> 🟢 Paid; clearly refused (an error shown on the
-     re-rendered form) AND not listed -> ONE other free court at the same
-     time (back to 4), else 🔴 Failed; anything else -> 🟠 Unclear, never
-     Failed.
+     then the ONE POST (bot_session.post_booking_confirm) with exactly the
+     body a browser sent on 2026-11-13: sel, coach_<sel>=, method=WALLET,
+     acceptTerms=true, __RequestVerificationToken. Redirect not followed;
+     a Location with "topup" and SPORTS-<digits> is the parked hint.
+  7. Verify via both lists: our ref under Awaiting payment -> 🟡 Parked
+     (the email links the actual Location); under Upcoming -> 🟢 Paid;
+     clearly refused (an error shown on the re-rendered form) AND not
+     listed -> ONE other free court at the same time (back to 4), else
+     🔴 Failed; anything else -> 🟠 Unclear, never Failed.
   8. A key left in_progress by a run that died is never retried: 🟠 once.
 
 state.json and the Actions logs are public, so booking/payment refs are
@@ -45,7 +49,7 @@ import hashlib
 import os
 import re
 from datetime import date as _date, datetime
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -57,7 +61,8 @@ MODES = ("off", "dry_run", "live")
 LIVE_KEY, DRY_KEY, RETRY_KEY = "autobook", "autobook_dry_run", "autobook_retry"
 PENDING_URL = f"{BASE}{BOOKINGS_PATH}?tab=pending"
 BOOKINGS_URL = f"{BASE}{BOOKINGS_PATH}"
-REF_RE = re.compile(r"SPORTS-\d+")
+REF_RE = re.compile(r"SPORTS-\d{1,20}")
+MAX_DETAIL_READS = 10  # per pass: more unknown pending bookings than this -> fail closed
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 TERMINAL = {"skipped_existing", "aborted_mismatch", "dry_run", "in_progress", "interrupted",
@@ -96,6 +101,14 @@ def ref_fp(ref):
     return hashlib.sha256(ref.encode()).hexdigest()[:12]
 
 
+def is_parked_location(location):
+    """The redirect after a booking the Wallet didn't cover. Seen live:
+    /wallet/topup/<id>?then=SPORTS-<ref> (2026-11-11) and
+    /payment/SPORTS-<ref>/topup-shortfall (2026-11-13). Any Location with
+    "topup" and a booking ref counts. Only a hint: never followed."""
+    return "topup" in (location or "").lower() and bool(REF_RE.search(location or ""))
+
+
 def now_iso():
     return datetime.now(TZ).isoformat(timespec="seconds")
 
@@ -108,6 +121,7 @@ class Context:
         self.send, self.save_state, self.try_save_state, self.log = send, save_state, try_save_state, log
         self.locations = locations
         self.emailed_keys = set()
+        self.detail_cache = {}  # ref -> [(date, time)] or None (unreadable), for this pass
 
     def records(self):
         return self.state.setdefault(LIVE_KEY if self.mode == "live" else DRY_KEY, {})
@@ -167,6 +181,39 @@ def slot_page(ctx, href):
 
 # --- verification ---------------------------------------------------------------
 
+def booking_slots(ctx, ref):
+    """The (date, start) of every court in booking `ref`, read from its own
+    page (/bookings/SPORTS-…): the Awaiting-payment list doesn't show them.
+    None if unreadable. Cached for the pass."""
+    if ref in ctx.detail_cache:
+        return ctx.detail_cache[ref]
+    slots = None
+    if REF_RE.fullmatch(ref or "") and len(ctx.detail_cache) < MAX_DETAIL_READS:
+        try:
+            page = booking_page.parse_booking_detail(_get(ctx, f"{BOOKINGS_PATH}/{ref}", {}))
+        except Deferred as e:
+            ctx.log(f"    couldn't read a booking's own page: {e}")
+            page = None
+        if page and page["ref"] == ref and page["lines"] and all(l["slot"] for l in page["lines"]):
+            slots = [l["slot"] for l in page["lines"]]
+    ctx.detail_cache[ref] = slots
+    return slots
+
+
+def existing_at(ctx, rows, slot):
+    """(clash, unreadable): whether any of these bookings (not the bot's own)
+    is at `slot` = (date, start) — any location or court — and how many have
+    a date/time that couldn't be read from the list or the booking's page."""
+    unreadable = 0
+    for r in rows:
+        slots = [r["slot"]] if r["slot"] else booking_slots(ctx, r["ref"])
+        if slots is None:
+            unreadable += 1
+        elif slot in slots:
+            return True, 0
+    return False, unreadable
+
+
 def check_slot_page(page, cand):
     problems = []
     want = date_label(cand["date"])
@@ -209,7 +256,8 @@ def check_review(review, cand, court):
     if review["page_date"] and review["page_date"] != date_label(cand["date"]):
         problems.append(f"page date is {review['page_date']!r}, expected {date_label(cand['date'])!r}")
 
-    allowed = {"sel", "method", "acceptTerms", "__RequestVerificationToken", f"coach_{sel}", f"type_{sel}"}
+    coach_name, type_name = f"coach_{sel}", f"type_{sel}"
+    allowed = {"sel", "method", "acceptTerms", "__RequestVerificationToken", coach_name, type_name}
     fields = review["fields"]
     by_name = {}
     for f in fields:
@@ -224,38 +272,36 @@ def check_review(review, cand, court):
     sels = by_name.get("sel", [])
     if len(sels) != 1 or sels[0]["type"] != "hidden" or sels[0]["value"] != sel:
         problems.append(f"sel field is {[(s['type'], s['value']) for s in sels]}, expected one hidden {sel!r}")
+    coaches = by_name.get(coach_name, [])
+    if len(coaches) != 1 or coaches[0]["tag"] != "select" or coaches[0]["disabled"]:
+        problems.append(f"coach field {coach_name!r} missing or changed "
+                        f"({[(c['tag'], c['disabled']) for c in coaches]})")
+    elif coaches[0]["value"]:
+        problems.append(f"{coach_name} is pre-selected ({coaches[0]['value']!r}), expected no coach")
+    for t in by_name.get(type_name, []):
+        # A browser leaves the coach-type select out while it's disabled; if it
+        # were enabled it would be sent too, and the body would differ.
+        if not t["disabled"] or t["value"]:
+            problems.append(f"{type_name} is enabled or pre-filled ({t['value']!r}) — a browser would send it")
     methods = by_name.get("method", [])
     if not any(m["type"] == "radio" and m["value"] == "WALLET" for m in methods):
         problems.append("no WALLET payment-method radio")
     if any(m["type"] != "radio" for m in methods):
         problems.append("a non-radio 'method' field")
     terms = by_name.get("acceptTerms", [])
-    if len(terms) != 1 or terms[0]["type"] != "checkbox" or not terms[0]["value"]:
+    if len(terms) != 1 or terms[0]["type"] != "checkbox" or terms[0]["value"] != "true":
         problems.append(f"terms checkbox missing or changed ({[(t['type'], t['value']) for t in terms]})")
     tokens = by_name.get("__RequestVerificationToken", [])
     if len(tokens) != 1 or tokens[0]["type"] != "hidden" or not tokens[0]["value"]:
         problems.append("anti-forgery token missing or changed")
-    for opt in (f"coach_{sel}", f"type_{sel}"):
-        for f in by_name.get(opt, []):
-            if f["value"]:
-                problems.append(f"{opt} is pre-filled with {f['value']!r}")
 
     if problems:
         return problems, None, price
-    # Exactly what a browser sends, in document order, with Wallet chosen and
-    # the terms box ticked — minus the coach selects (owner's rule: never
-    # send coach fields; a browser would send coach_<sel>="" for "No coach").
-    post, method_done = [], False
-    for f in fields:
-        if f["name"] == "sel":
-            post.append(("sel", f["value"]))
-        elif f["name"] == "method" and not method_done:
-            post.append(("method", "WALLET"))
-            method_done = True
-        elif f["name"] == "acceptTerms":
-            post.append(("acceptTerms", f["value"]))
-        elif f["name"] == "__RequestVerificationToken":
-            post.append((f["name"], f["value"]))
+    # Exactly the body a real browser sent on 2026-11-13 (DevTools payload),
+    # in that order and nothing else: the court, "No coach", Wallet, the
+    # terms box ticked, the anti-forgery token.
+    post = [("sel", sel), (coach_name, ""), ("method", "WALLET"), ("acceptTerms", "true"),
+            ("__RequestVerificationToken", tokens[0]["value"])]
     return [], post, price
 
 
@@ -340,23 +386,24 @@ def _flow(ctx, key, cand, rec):
     lists = read_lists(ctx)
     own = ctx.own_ref_fps()
     others = [r for r in lists["pending"] + lists["upcoming"] if ref_fp(r["ref"]) not in own]
-    if any(r["slot"] == (cand["date"], cand["time"]) for r in others):
+    clash, unreadable = existing_at(ctx, others, (cand["date"], cand["time"]))
+    if clash:
         rec["status"] = "skipped_existing"
         rec["result_at"] = now_iso()
         ctx.email(key, f"ℹ️ Already booked: {cand['date']} {cand['time']} — not auto-booking",
                   f"A starred time opened ({cand['loc_name']} {cand['date']} {cand['time']}), but My bookings already\n"
                   f"shows a booking at that date and time, so I didn't book another.\n\n  {BOOKINGS_URL}\n")
         return
-    unreadable = [r for r in others if r["slot"] is None]
     if unreadable:
         retry = ctx.retries().setdefault(key, {"since": now_iso()})
-        retry["reason"] = f"{len(unreadable)} existing booking(s) without a readable date/time"
+        retry["reason"] = f"{unreadable} existing booking(s) without a readable date/time"
         if not retry.get("notified"):
             retry["notified"] = now_iso()
             ctx.email(key, f"ℹ️ Not auto-booking {cand['date']} {cand['time']} — can't check your bookings",
                       f"A starred time opened ({cand['loc_name']} {cand['date']} {cand['time']}), but My bookings lists\n"
-                      f"{len(unreadable)} booking(s) whose court date/time the list doesn't show, so I can't rule out\n"
-                      "that you already have this slot. Not booking — book manually if you want it:\n\n"
+                      f"{unreadable} booking(s) whose court date/time I couldn't read (neither on the list nor on\n"
+                      "the booking's own page), so I can't rule out that you already have this slot.\n"
+                      "Not booking — book manually if you want it:\n\n"
                       f"  {BASE}{cand['href']}\n  {BOOKINGS_URL}\n\nI'll try again while it stays open; no more emails about it.\n")
         del ctx.records()[key]
         ctx.log(f"    not booking: {retry['reason']}")
@@ -423,7 +470,7 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
         location = f.resp.headers.get("Location", "")
         if f.login:
             hint = "login"
-        elif 300 <= f.resp.status_code < 400 and urlsplit(location).path.startswith("/wallet/topup/"):
+        elif 300 <= f.resp.status_code < 400 and is_parked_location(location):
             hint = "parked"
         elif f.resp.status_code == 200:
             refused_msgs = booking_page.page_error_messages(f.resp.text or "")
@@ -433,7 +480,7 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
     except requests.RequestException as e:
         hint = f"network: {type(e).__name__}"
     attempt["hint"] = hint
-    ref_match = REF_RE.search(" ".join(parse_qs(urlsplit(location).query).get("then", [])) or location)
+    ref_match = REF_RE.search(location)  # a hint only: the lists decide the outcome
     ref = ref_match.group(0) if ref_match else None
     if ref:
         attempt["ref_fp"] = ref_fp(ref)
@@ -491,7 +538,7 @@ def _finish(ctx, key, rec, status, reason, ref=None, location=""):
         ctx.email(key, f"🟢 Paid: {what}",
                   f"Booked and paid from the Wallet:\n\n  {what}\n{ref_line}\n  {BOOKINGS_URL}\n")
     elif status == "parked":
-        topup = f"  Top up / pay: {BASE}{location}\n" if location.startswith("/wallet/topup/") else ""
+        topup = f"  Top up / pay: {urljoin(BASE + '/', location)}\n" if is_parked_location(location) else ""
         ctx.email(key, f"🟡 Parked — pay within 15 min: {what}",
                   f"Booked, awaiting payment — the Wallet didn't cover it. PAY WITHIN 15 MINUTES or the\n"
                   f"booking lapses:\n\n  {what}\n{ref_line}\n{topup}  Awaiting payment: {PENDING_URL}\n")

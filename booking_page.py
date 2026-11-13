@@ -394,24 +394,104 @@ def _play_slot(text):
     return None
 
 
-def parse_bookings_list(html):
+BOOKING_HREF_RE = re.compile(r"/bookings/(SPORTS-\d{1,20})")
+
+
+def bangkok_today():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Bangkok")).date()
+
+
+def infer_play_date(day, month, today):
+    """A list row shows "15 · Nov" with no year: the next date with that day
+    and month on or after `today` (Asia/Bangkok), so a "2 Jan" row seen in
+    December is next year. None if no such date (e.g. 31 Feb)."""
+    from datetime import date
+    for year in range(today.year, today.year + 5):  # 29 Feb may be up to 4 years out
+        try:
+            d = date(year, month, day)
+        except ValueError:
+            continue
+        if d >= today:
+            return d
+    return None
+
+
+def _start_of_range(text):
+    r = ROW_RANGE_RE.search(text or "")
+    return f"{int(r[1]):02d}:{r[2]}" if r else None
+
+
+def parse_bookings_list(html, today=None):
     """/bookings (Upcoming) or /bookings?tab=pending (Awaiting payment).
-    Returns {"tab": active tab href query, "rows": [{ref, status, text,
-    slot}]} where slot is ('YYYY-MM-DD','HH:MM') only if the row itself
-    shows the played date and time range — the live Awaiting-payment rows
-    (2026-11-13) show only ref, booked-on time and status, so slot is None."""
+    Returns {"tab", "rows": [{ref, status, text, slot, loc_name, court}],
+    "empty", "recognised"}. slot is ('YYYY-MM-DD', 'HH:MM' start) when the
+    row shows the played day and time:
+      - Upcoming rows (seen live 2026-11-13): a.booking-item with
+        <div class="booking-date"><b>15</b><span>Nov</span></div> (no year:
+        see infer_play_date), "23:00–24:00 · G South-1" and
+        "Crystal Sports G · SPORTS-…".
+      - Awaiting-payment rows (a.bk-row) show only ref, booked-on time and
+        status: slot is None, and the caller reads the booking's own page.
+    A row is any link in #bookingList to /bookings/SPORTS-<digits>."""
+    today = today or bangkok_today()
     root = dom(html)
     active = next((n for n in root.find_all("a", "tab") if "active" in n.classes), None)
     tab = query_of(active.attrs.get("href", ""))[1].get("tab", "") if active is not None else ""
     lst = root.find(id="bookingList")
     rows = []
     for row in (lst.iter() if lst is not None else ()):
-        ref = row.attrs.get("data-ref") or ""
-        if not ref or row.tag != "a":
+        if row.tag != "a":
+            continue
+        m = BOOKING_HREF_RE.fullmatch(urlsplit(row.attrs.get("href", "")).path)
+        ref = row.attrs.get("data-ref") or (m.group(1) if m else "")
+        if not ref:
             continue
         badge = row.find("span", "badge")
         text = row.text()
-        rows.append({"ref": ref, "status": badge.text() if badge is not None else "",
-                     "text": text, "slot": _play_slot(text)})
+        slot, loc_name, court = None, "", ""
+        date_box = row.find("div", "booking-date")
+        if date_box is not None:
+            day_el, mon_el = date_box.find("b"), date_box.find("span")
+            day = FIRST_INT.search(day_el.text()) if day_el is not None else None
+            month = MONTHS.get((mon_el.text() if mon_el is not None else "")[:3].lower())
+            head = row.find("div", "fw-700")
+            start = _start_of_range(head.text() if head is not None else "")
+            played = infer_play_date(int(day.group(0)), month, today) if day and month else None
+            if played and start:
+                slot = (played.isoformat(), start)
+            if head is not None and " · " in head.text():
+                court = head.text().split(" · ", 1)[1].strip()
+            sub = row.find("div", "text-muted")
+            if sub is not None and " · " in sub.text():
+                loc_name = sub.text().rsplit(" · ", 1)[0].strip()
+        else:
+            slot = _play_slot(text)
+        rows.append({"ref": ref, "status": badge.text() if badge is not None else "", "text": text,
+                     "slot": slot, "loc_name": loc_name, "court": court})
     empty = root.find("div", "empty-state") is not None
     return {"tab": tab, "rows": rows, "empty": empty and not rows, "recognised": lst is not None}
+
+
+def parse_booking_detail(html):
+    """/bookings/SPORTS-<digits> — one booking's own page (seen live
+    2026-11-13). Returns {"ref", "status", "lines": [{loc_name, court,
+    slot}]} where each card.bk-group is one court booked: its title
+    "Crystal Sports G · G South-1" and "Sun 15 Nov 2026 · 23:00–24:00"
+    (slot = ('2026-11-15', '23:00'), None if unreadable). The page also
+    has a cancel form; nothing here ever submits anything."""
+    root = dom(html)
+    h1 = root.find("h1", "section-title")
+    ref = h1.text() if h1 is not None else ""
+    badge = h1.parent.find("span", "badge") if h1 is not None and h1.parent is not None else None
+    lines = []
+    for card in root.find_all("div", "bk-group"):
+        title = card.find("b")
+        when = card.find("div", "text-muted")
+        loc_name, court = "", ""
+        if title is not None and " · " in title.text():
+            loc_name, court = (x.strip() for x in title.text().split(" · ", 1))
+        lines.append({"loc_name": loc_name, "court": court,
+                      "slot": _play_slot(when.text()) if when is not None else None})
+    return {"ref": ref, "status": badge.text() if badge is not None else "", "lines": lines}

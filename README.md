@@ -9,9 +9,10 @@ Crystal Sports replaced its booking site on **11 Nov 2026** with a
 server-rendered ASP.NET Core site. Everything below describes the new setup;
 the old `api_helper.php` / `PHPSESSID` flow is gone.
 
-> **Auto-book is paused.** `AUTOBOOK_ENABLED = False` in `monitor.py` while it's
-> rebuilt for the new site. Starred times (★ in the dashboard) still get the
-> normal "slot open" email, with a note to book manually.
+> **Auto-book** for starred times (★) is controlled by the `AUTOBOOK_MODE`
+> repository variable: `off` (the default), `dry_run` or `live`. See
+> [Auto-book](#auto-book-starred-times). With it off, starred times just get the
+> normal "slot open" email with a note to book manually.
 
 ---
 
@@ -63,9 +64,92 @@ cron-job.org ──(every ~5 min: workflow_dispatch)──▶ GitHub Actions: mo
 | 🔴 Bot session likely lost — reseed needed | A rotated cookie couldn't be saved or pushed | [Reseed](#reseeding-the-bot-session) |
 | 🔴 Monitor can't read the booking site | No page has been readable for 30 min (site down, network, or the page changed) | Usually nothing; it clears itself on the next good read |
 
+Auto-book emails (only when `AUTOBOOK_MODE` is `dry_run` or `live`) are listed
+under [Auto-book](#auto-book-starred-times).
+
 Each 🔴 email is sent **once**. After a session email, the monitor sends no
 requests until the jar changes, so later runs are quiet. They exit 0, and the
 dashboard shows the session as "Needs reseed".
+
+## Auto-book (starred times)
+
+**Real money.** In `live` mode the bot books a starred time as soon as it
+opens and pays from your **Wallet**.
+
+### Modes
+
+| `AUTOBOOK_MODE` | What happens when a starred time opens |
+|---|---|
+| unset, empty, `off`, or anything else | Nothing new: the normal 🎾 email, with "book manually". No auto-book requests at all. |
+| `dry_run` | Every check runs, up to and including reading the booking form, then a 🧪 email says what it **would** have booked. Nothing is submitted. You still get the 🎾 email. |
+| `live` | It books. You get one result email (🟢 / 🟡 / 🔴 / 🟠) instead of the 🎾 email for that time. |
+
+`AUTOBOOK_MODE` is a GitHub **repository variable** (not a secret, and not a
+Vercel setting). Set it in repo → Settings → Secrets and variables → Actions
+→ **Variables** tab, or from the Mac:
+
+```bash
+gh variable set AUTOBOOK_MODE --body dry_run    # or: live / off
+gh variable list                                # check what it is now
+```
+
+Each run reads it once at the start, so a change applies from the next run
+(within about 5 minutes). The run's log shows `auto-book mode: …`.
+
+Start with `dry_run` and read a few 🧪 emails before switching to `live`.
+
+### What it does, in order
+
+1. **One booking per date + time, ever,** across both locations. If 20:00 is
+   starred at both Crystal Sports and Crystal Sports G, it books only one.
+2. **Checks My bookings first,** both Upcoming and Awaiting payment. If you
+   already have a booking at that date and start time (any location, any
+   court), it doesn't book. Awaiting-payment rows don't show the court time,
+   so it opens each one's own page (`/bookings/SPORTS-…`) to read it.
+   Bookings at other times never block. If a booking's date/time can't be
+   read at all, it plays safe: no booking that pass, one ℹ️ email, and it
+   tries again while the time stays open.
+3. **Opens the time's own page** and takes the first free court (site order).
+4. **Checks the booking form** before submitting: right branch, court, date,
+   time, a price, and exactly the expected fields. Anything different, any
+   new required field, or a coach already selected → it stops with 🔴
+   "booking form changed / page mismatch" and submits nothing.
+5. **Records the attempt** in `state.json` before submitting, then submits
+   once: **Wallet**, terms accepted, no coach.
+6. **Checks My bookings again** to decide the outcome (below). If the court
+   was taken in the meantime, it tries **one** other free court at the same
+   time, never more.
+
+A run that dies mid-booking is never retried: the next run sends 🟠 once.
+
+### Auto-book emails
+
+| Subject | Meaning | What to do |
+|---|---|---|
+| 🧪 Would have booked … | Dry run: everything checked out | Nothing (book manually if you want it) |
+| 🟢 Paid: … | Booked and paid from the Wallet | Nothing |
+| 🟡 Parked — pay within 15 min: … | Booked, but the Wallet didn't cover it. The site holds it as **Awaiting payment** | **Pay within 15 minutes** using the link in the email, or it lapses. |
+| 🔴 Failed: … | Not booked: the courts were taken, or the attempt couldn't be recorded (then nothing was sent) | Book manually if anything's left |
+| 🔴 Failed: booking form changed / page mismatch | The site's pages changed; nothing was submitted. The email lists what differed | Book manually; the code needs updating |
+| 🟠 Unclear — check My bookings | A booking request was sent but the result couldn't be confirmed | **Check My bookings now.** It will not be retried. |
+| ℹ️ Already booked: … | You already have a booking at that date and time | Nothing |
+| ℹ️ Not auto-booking … — can't check your bookings | A booking's date/time couldn't be read, so it didn't risk a double booking | Book manually if you want it; it keeps trying quietly |
+
+Each result is sent once per date + time. `state.json` is public, so it holds
+only a fingerprint of booking refs; the full ref and payment link are only in
+your emails.
+
+### Emergency: turn it off
+
+```bash
+gh variable set AUTOBOOK_MODE --body off
+```
+
+(or delete the variable, or set it to `off` on the Variables tab). The next
+run is notify-only. A run that's already going finishes with the mode it
+started with (up to about 4 minutes). To stop that too, cancel it in the
+Actions tab, and pause the cron-job.org job (see
+[Stopping the monitor](#stopping-the-monitor)).
 
 ## Secrets (repo → Settings → Secrets and variables → Actions)
 
@@ -138,8 +222,9 @@ Use the dashboard (see [DEPLOY.md](DEPLOY.md)), or edit `config.json` directly:
 - `locations`: `LOC001` = Crystal Sports, `LOC002` = Crystal Sports G.
 - `times`: `HH:00`, from 06:00 to 23:00 (the grid's 18 slots). Plain strings
   like `"20:00"` are also accepted.
-- `autoBook` is the ★ star. It's kept for when auto-book returns, and for now
-  just adds the "book manually" note to the email.
+- `autoBook` is the ★ star: the times auto-book may book, depending on
+  [`AUTOBOOK_MODE`](#auto-book-starred-times). With the mode `off` it just adds
+  the "book manually" note to the email.
 
 Past dates are ignored automatically.
 
@@ -163,8 +248,9 @@ no requests.
 | File | What |
 |---|---|
 | `monitor.py` | The monitor: check passes, emails, state |
-| `bot_session.py` | The bot's session: encrypted jar, cookie rotation, the single guarded GET |
-| `booking_page.py` | Grid parser (Thai and English) and login-page detector |
+| `autobook.py` | Auto-book: the checks, the booking flow and its emails |
+| `bot_session.py` | The bot's session: encrypted jar, cookie rotation, and the one guarded request function (a short allow-list of GETs, plus the single POST to `/booking/confirm`, live mode only) |
+| `booking_page.py` | Page parsers: the grid, the court and review pages, My bookings (Thai and English), and the login-page detector |
 | `probe_new_site.py` | Read-only diagnostic probe |
 | `seal_session.py` | One-time Mac → Actions handoff (encrypts the jar, makes `BOT_JAR_KEY`) |
 | `bot_session.enc` | The encrypted bot session (committed by the workflow after rotations) |
@@ -172,6 +258,7 @@ no requests.
 | `state.json` | Monitor state: open slots, last check, session and site-read alerts |
 | `.github/workflows/monitor.yml` | The monitor job |
 | `.github/workflows/probe.yml` | The manual probe job |
-| `test_*.py` | Tests: `python3 -m unittest test_monitor test_probe_new_site test_seal_session` |
+| `test_*.py` | Tests: `python3 -m unittest test_monitor test_probe_new_site test_seal_session test_autobook` |
+| `tests/fixtures/` | Scrubbed copies of live pages for the tests (see its README). The raw pages go in `fixtures_raw/`, which is gitignored and never committed |
 | `app/`, `lib/` | The dashboard (Next.js, see [DEPLOY.md](DEPLOY.md)) |
 | `WALLET_GUARD_SAFETY.md` | History: the old site's auto-book wallet guard |

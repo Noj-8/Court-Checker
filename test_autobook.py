@@ -4,10 +4,13 @@ bot_session.py). Run with: python3 -m unittest test_autobook -v
 
 Pages come from tests/fixtures/ — scrubbed copies of pages saved from the
 live site on 2026-11-13 — moved to a date relative to today so nothing goes
-stale. Anything we have NOT seen on the live site is built in this file and
-marked SYNTHETIC (e.g. a paid booking in the Upcoming list, a re-rendered
-form refusing a taken court, the POST responses' exact shape apart from the
-parked redirect, whose Location is taken from the real top-up page).
+stale. Pages changed from a real one are marked DERIVED (e.g. the filled
+Upcoming list and a booking's own page for another date or time). Anything
+we have NOT seen on the live site is built in this file and marked
+SYNTHETIC (a re-rendered form refusing a taken court, the POST responses'
+exact shape apart from the parked redirects, whose Locations are the two
+real ones: Nov 11's /wallet/topup/…?then= and Nov 13's
+/payment/SPORTS-…/topup-shortfall).
 
 The fake site routes by method + path + query and records every request,
 including POST bodies, at the transport level — so "no POST" here means no
@@ -38,7 +41,10 @@ FIXTURE_DATE = _date(2026, 11, 15)  # the date the live pages were saved for (a 
 REAL_SEL, OTHER_SEL = "270", "306"  # the two free G South courts on the saved page
 TOKEN = "FAKE-ANTIFORGERY-TOKEN-02"
 REF = "SPORTS-900000000001"          # scrubbed ref: the real top-up URL and pending row agree on it
-TOPUP = "/wallet/topup/100000000000000001?then=" + REF
+TOPUP_NOV11 = "/wallet/topup/100000000000000001?then=" + REF   # the real Nov 11 shape (from 4_topup.html)
+TOPUP = f"/payment/{REF}/topup-shortfall"                         # the real Nov 13 shape
+REF2 = "SPORTS-900000000002"         # scrubbed ref of the real filled Upcoming row and its own page
+MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 def fixture(name):
@@ -82,18 +88,28 @@ class Pages:
         """DERIVED: the real Awaiting-payment page with its one row removed."""
         return re.sub(r'<a class="bk-row" role="row".*?</a>', "", fixture("5_bookings_awaiting.html"), flags=re.S)
 
-    def upcoming_with(self, ref, slot_text, status="Paid"):
-        """SYNTHETIC: an Upcoming list with one booking. Not yet observed on
-        the live site — modelled on the Awaiting-payment row, plus a cell
-        with the played date and time."""
-        page = fixture("5_bookings_awaiting.html").replace(
-            '<a class="tab active" href="/bookings?tab=pending">', '<a class="tab" href="/bookings?tab=pending">').replace(
-            '<a class="tab" href="/bookings?tab=upcoming">', '<a class="tab active" href="/bookings?tab=upcoming">')
-        row = (f'<a class="bk-row" role="row" href="/bookings/{ref}" data-ref="{ref}">'
-               f'<span class="mono fw-700" role="cell">{ref}</span>'
-               f'<span role="cell">{slot_text}</span>'
-               f'<span role="cell"><span class="badge badge-green badge-dot">{status}</span></span></a>')
-        return re.sub(r'<a class="bk-row" role="row".*?</a>', row, page, flags=re.S)
+    def upcoming_filled(self, ref=REF2, d=None, time="23:00", loc_name="Crystal Sports G", court="G South-1",
+                        status="Paid"):
+        """The REAL filled Upcoming page (one Paid row: 15 Nov, 23:00–24:00,
+        G South-1, Crystal Sports G). With arguments it is DERIVED: the same
+        row moved to another ref/day/time/location/court/status."""
+        d = d or self.d
+        end = f"{int(time[:2]) + 1:02d}:{time[3:]}"
+        return (fixture("6_bookings_upcoming_filled.html")
+                .replace(REF2, ref)
+                .replace("<b>15</b><span>Nov</span>", f"<b>{d.day}</b><span>{MONTH_ABBR[d.month - 1]}</span>")
+                .replace("23:00–24:00 · G South-1", f"{time}–{end} · {court}")
+                .replace(f"Crystal Sports G · {ref}", f"{loc_name} · {ref}")
+                .replace('badge-dot">Paid<', f'badge-dot">{status}<'))
+
+    def detail(self, ref, d=None, time="23:00", loc_name="Crystal Sports G", court="G South-1"):
+        """A booking's own page /bookings/SPORTS-… — the REAL page (15 Nov,
+        23:00–24:00, G South-1), DERIVED to another ref/date/time/court."""
+        d = d or self.d
+        end = f"{int(time[:2]) + 1:02d}:{time[3:]}"
+        return (fixture("7_booking_detail.html").replace(REF2, ref)
+                .replace(autobook.date_label("2026-11-15") + " · 23:00–24:00", f"{autobook.date_label(d.isoformat())} · {time}–{end}")
+                .replace("Crystal Sports G · G South-1", f"{loc_name} · {court}"))
 
     def refused(self, sel=None):
         """SYNTHETIC: the review form re-rendered with an error (court taken)."""
@@ -115,6 +131,7 @@ class FakeSite(requests.adapters.BaseAdapter):
         self.pending = [pages.pending_empty()]       # served in order; the last one repeats
         self.upcoming = [pages.upcoming_empty()]
         self.posts = []                              # POST responses in order
+        self.details = {}                            # ref -> a booking's own page (or a response tuple)
         self.on_post = None
 
     @staticmethod
@@ -143,6 +160,10 @@ class FakeSite(requests.adapters.BaseAdapter):
         if u.path == "/booking/review":
             html = self.reviews.get(q["sel"]) or self.p.review(q["sel"])
             return make_response(request, 200, [("Content-Type", "text/html")], html)
+        m = re.fullmatch(r"/bookings/(SPORTS-\d+)", u.path)
+        if m and m.group(1) in self.details:
+            page = self.details[m.group(1)]
+            return make_response(request, *(page if isinstance(page, tuple) else (200, [("Content-Type", "text/html")], page)))
         if u.path == "/bookings":
             queue = self.pending if q.get("tab") == "pending" else self.upcoming
             return make_response(request, 200, [("Content-Type", "text/html")], self._next(queue))
@@ -158,8 +179,8 @@ class FakeSite(requests.adapters.BaseAdapter):
         return [s for s in self.sent if s["method"] == "POST"]
 
 
-def parked_redirect():
-    return (302, [("Location", TOPUP)], "")
+def parked_redirect(location=TOPUP):
+    return (302, [("Location", location)], "")
 
 
 def refused_page(html):
@@ -206,21 +227,29 @@ class AutobookTestCase(MonitorTestCase):
 
 
 class TestParkedEndToEnd(AutobookTestCase):
-    def test_parked_path(self):
-        self.site.posts = [parked_redirect()]
+    def test_parked_path_both_real_redirect_shapes(self):
+        for location in (TOPUP, TOPUP_NOV11, bot_session.BASE + TOPUP):
+            with self.subTest(location=location):
+                self.setUp()
+                self._parked(location)
+
+    def _parked(self, location):
+        self.site.posts = [parked_redirect(location)]
         self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]  # before / after the POST
         code, sent = self.run_mode("live")
         self.assertEqual(code, monitor.EXIT_OK)
 
-        # Exactly one POST, to /booking/confirm, with exactly the browser fields: Wallet, terms ticked, no coach.
+        # Exactly one POST, to /booking/confirm, with exactly the body a real
+        # browser sent on Nov 13, in that order: "No coach", Wallet, terms ticked.
         posts = self.site.posts_sent()
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0]["path"], "/booking/confirm")
-        self.assertEqual(posts[0]["form"], [("sel", self.p.sel), ("method", "WALLET"), ("acceptTerms", "true"),
-                                            ("__RequestVerificationToken", TOKEN)])
-        self.assertFalse(any(n.startswith(("coach_", "type_")) for n, _ in posts[0]["form"]), "coach never sent")
+        self.assertEqual(posts[0]["form"], [("sel", self.p.sel), (f"coach_{self.p.sel}", ""), ("method", "WALLET"),
+                                            ("acceptTerms", "true"), ("__RequestVerificationToken", TOKEN)])
+        self.assertFalse(any(n.startswith("type_") for n, _ in posts[0]["form"]), "the disabled coach-type select is never sent")
 
-        # The order: lists, slot page, review, POST, lists again — all GETs on allowed paths.
+        # The order: lists, slot page, review, POST, lists again — all GETs on
+        # allowed paths. The redirect is never followed (no /payment or /wallet GET).
         order = [(s["method"], s["path"], s["query"].get("tab", s["query"].get("time", ""))) for s in self.site.sent]
         self.assertEqual(order, [("GET", "/booking", "0"), ("GET", "/bookings", "pending"), ("GET", "/bookings", ""),
                                  ("GET", "/booking", "18"), ("GET", "/booking/review", ""),
@@ -228,11 +257,13 @@ class TestParkedEndToEnd(AutobookTestCase):
 
         self.assertEqual(self.subjects(sent), [f"🟡 Parked — pay within 15 min: Crystal Sports G G South-1 {self.date} 23:00 ฿500"])
         body = sent[0]["body"]
-        self.assertIn(f"{bot_session.BASE}{TOPUP}", body)
+        self.assertIn(f"Top up / pay: {location if location.startswith('https://') else bot_session.BASE + location}\n", body,
+                      "the parked link is the actual Location")
         self.assertIn(f"{bot_session.BASE}/bookings?tab=pending", body)
         self.assertIn(REF, body)
         rec = self.record()
         self.assertEqual(rec["status"], "parked")
+        self.assertEqual(rec["attempts"][0]["hint"], "parked")
         self.assertEqual(rec["attempts"][0]["ref_fp"], autobook.ref_fp(REF))
         self.assert_private()
 
@@ -245,12 +276,12 @@ class TestParkedEndToEnd(AutobookTestCase):
 
 
 class TestOutcomes(AutobookTestCase):
-    def test_paid_path_SYNTHETIC(self):
-        # SYNTHETIC: a Wallet that covers the price. We haven't seen the paid
-        # redirect; here it carries no ref, and the new booking shows up in Upcoming.
+    def test_paid_path(self):
+        # The new booking shows up as the REAL Paid Upcoming row (moved to this
+        # slot). The paid redirect itself is SYNTHETIC: we haven't seen it, so
+        # here it carries no ref and the ref comes from the new row.
         self.site.posts = [(302, [("Location", "/bookings?tab=upcoming")], "")]
-        self.site.upcoming = [self.p.upcoming_empty(),
-                              self.p.upcoming_with("SPORTS-900000000077", f"{self.p.label} · 23:00 – 24:00")]
+        self.site.upcoming = [self.p.upcoming_empty(), self.p.upcoming_filled("SPORTS-900000000077")]
         code, sent = self.run_mode("live")
         self.assertEqual(self.subjects(sent), [f"🟢 Paid: Crystal Sports G G South-1 {self.date} 23:00 ฿500"])
         self.assertEqual(self.record()["status"], "paid")
@@ -338,7 +369,12 @@ class TestNoPostWhenThePageIsWrong(AutobookTestCase):
     def test_form_changes(self):
         r = self.p.review()
         variants = {
-            "coach pre-selected": (r.replace('<option value="1001"', '<option selected value="1001"'), "pre-filled"),
+            "coach pre-selected": (r.replace('<option value="1001"', '<option selected value="1001"'), "is pre-selected"),
+            "coach field missing": (re.sub(r'<select class="input" name="coach_[^"]*">.*?</select>', "", r, flags=re.S), "coach field"),
+            "coach field renamed": (r.replace(f'name="coach_{self.p.sel}"', 'name="coach"'), "coach field"),
+            "coach field disabled": (r.replace(f'name="coach_{self.p.sel}"', f'name="coach_{self.p.sel}" disabled'), "coach field"),
+            "coach-type select enabled": (r.replace(f'name="type_{self.p.sel}" disabled', f'name="type_{self.p.sel}"'), "a browser would send it"),
+            "terms value changed": (r.replace('name="acceptTerms" value="true"', 'name="acceptTerms" value="on"'), "terms checkbox"),
             "terms checkbox gone": (r.replace('name="acceptTerms"', 'name="accept"'), "terms checkbox"),
             "no Wallet option": (r.replace('value="WALLET"', 'value="WALLET2"'), "no WALLET"),
             "posts somewhere else": (r.replace('action="/booking/confirm"', 'action="/booking/confirm2"'), "0 forms"),
@@ -384,53 +420,175 @@ class TestNoPostWhenThePageIsWrong(AutobookTestCase):
 
 
 class TestExistingBookings(AutobookTestCase):
-    def test_existing_booking_at_that_time_skips_once_SYNTHETIC_ROW(self):
-        self.site.upcoming = [self.p.upcoming_with("SPORTS-900000000055", f"{self.p.label} · 23:00 – 24:00")]
-        code, sent = self.run_mode("live")
+    def assert_skipped(self, sent):
         self.assertEqual(self.site.posts_sent(), [])
         self.assertNotIn("/booking/review", [s["path"] for s in self.site.sent])
         self.assertEqual(self.subjects(sent), [f"ℹ️ Already booked: {self.date} 23:00 — not auto-booking"])
         self.assertEqual(self.record()["status"], "skipped_existing")
+
+    def assert_booked(self):
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        self.assertEqual(self.record()["status"], "parked")
+
+    def book_ok(self):
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+
+    def detail_gets(self):
+        return [s["path"] for s in self.site.sent if s["path"].startswith("/bookings/")]
+
+    def test_upcoming_booking_at_that_time_skips_once(self):
+        self.site.upcoming = [self.p.upcoming_filled()]  # the REAL row, moved to this date
+        code, sent = self.run_mode("live")
+        self.assert_skipped(sent)
+        self.assertEqual(self.detail_gets(), [], "the Upcoming row shows the date: no detail page needed")
         self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
         code, sent = self.run_mode("live")
         self.assertEqual(sent and [m for m in sent if "ℹ️" in m["subject"]], [])
 
-    def test_booking_at_another_time_does_not_block_SYNTHETIC_ROW(self):
-        self.site.upcoming = [self.p.upcoming_with("SPORTS-900000000055", f"{self.p.label} · 21:00 – 22:00")] * 2
-        self.site.posts = [parked_redirect()]
-        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
-        code, sent = self.run_mode("live")
-        self.assertEqual(len(self.site.posts_sent()), 1)
-        self.assertEqual(self.record()["status"], "parked")
+    def test_upcoming_booking_at_that_time_at_the_other_location_or_court_skips(self):
+        for loc_name, court in (("Crystal Sports", "Court 4"), ("Crystal Sports G", "G North-2")):
+            with self.subTest(loc=loc_name, court=court):
+                self.setUp()
+                self.site.upcoming = [self.p.upcoming_filled(loc_name=loc_name, court=court)]
+                code, sent = self.run_mode("live")
+                self.assert_skipped(sent)
 
-    def test_the_bots_own_booking_never_blocks_another_time(self):
+    def test_my_own_booking_at_another_time_or_date_does_not_block(self):
+        for label, kw in (("another time", {"time": "21:00"}), ("another date", {"d": self.d + timedelta(days=1)})):
+            with self.subTest(label):
+                self.setUp()
+                self.site.upcoming = [self.p.upcoming_filled(**kw)]
+                self.book_ok()
+                code, sent = self.run_mode("live")
+                self.assert_booked()
+                self.assertEqual([m for m in self.subjects(sent) if m.startswith("ℹ️")], [])
+
+    def test_pending_booking_is_read_from_its_own_page(self):
+        other = "SPORTS-900000000099"
+        cases = {"same time": (self.p.detail(other), "skip"),
+                 "same time, other location": (self.p.detail(other, loc_name="Crystal Sports", court="Court 4"), "skip"),
+                 "another time": (self.p.detail(other, time="20:00"), "book"),
+                 "another date": (self.p.detail(other, d=self.d + timedelta(days=3)), "book")}
+        for label, (page, expect) in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                self.site.details[other] = page
+                if expect == "skip":
+                    self.site.pending = [self.p.pending_with_ref(other)]
+                    code, sent = self.run_mode("live")
+                    self.assert_skipped(sent)
+                else:
+                    self.site.posts = [parked_redirect()]
+                    # before: someone else's pending booking; after: that one plus ours
+                    both = self.p.pending_with_ref(other).replace(
+                        '<a class="bk-row"', self.p.pending_with_ref().split('<div id="bookingList">')[1].split("</div>")[0]
+                        + '<a class="bk-row"', 1)
+                    self.site.pending = [self.p.pending_with_ref(other), both]
+                    code, sent = self.run_mode("live")
+                    self.assert_booked()
+                self.assertEqual(self.detail_gets()[:1], [f"/bookings/{other}"], "exactly the real detail path")
+                self.assertTrue(all(s["method"] == "GET" for s in self.site.sent if s["path"].startswith("/bookings/")))
+
+    def test_unreadable_listed_booking_blocks_and_retries(self):
+        # The REAL Awaiting-payment row shows no court date/time, and its own page can't be read either.
+        other = "SPORTS-900000000099"
+        unreadable = {
+            "server error": (500, [], "oops"),
+            "page without a date": self.p.detail(other).replace(f"{self.p.label} · 23:00–24:00", "—"),
+            "page for a different booking": self.p.detail("SPORTS-900000000098"),
+            "unexpected page": "<html><body><p>Hello</p></body></html>",
+        }
+        for label, page in unreadable.items():
+            with self.subTest(label):
+                self.setUp()
+                self.site.details[other] = page
+                self.site.pending = [self.p.pending_with_ref(other)]
+                code, sent = self.run_mode("live", iterations=2)
+                self.assertEqual(self.site.posts_sent(), [])
+                self.assertNotIn("/booking/review", [s["path"] for s in self.site.sent])
+                self.assertEqual(len([m for m in sent if m["subject"].startswith("ℹ️ Not auto-booking")]), 1)
+                self.assertIsNone(self.record(), "not a final outcome — nothing was submitted")
+                self.assertIn(self.key, self.state()[autobook.RETRY_KEY])
+                self.assertEqual([s["path"] for s in self.site.sent].count("/bookings"), 4, "re-checked on the second pass")
+        # Once the list is clear, the deferred key is booked.
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.site.posts = [parked_redirect()]
+        code, sent = self.run_mode("live")
+        self.assert_booked()
+        self.assertNotIn(self.key, self.state().get(autobook.RETRY_KEY, {}))
+
+    def test_the_bots_own_booking_is_not_looked_up_and_never_blocks(self):
         # The bot parked 22:00 earlier (its ref fingerprint is in state); that
-        # row is now on the Awaiting-payment list without a readable time.
-        # It must not block 23:00 the way an unknown booking would.
+        # row is on the Awaiting-payment list without a date/time.
         own = {autobook.key_for(self.date, "22:00"): {"status": "parked", "date": self.date, "time": "22:00",
                                                     "attempts": [{"ref_fp": autobook.ref_fp(REF)}]}}
         self.state_file.write_text(json.dumps({autobook.LIVE_KEY: own}))
         self.site.pending = [self.p.pending_with_ref(REF)]
         code, sent = self.run_mode("dry_run")
         self.assertEqual([m for m in self.subjects(sent) if m.startswith("ℹ️")], [])
+        self.assertEqual(self.detail_gets(), [])
         self.assertIn(f"🧪 Would have booked Crystal Sports G G South-1 {self.date} 23:00 ฿500", self.subjects(sent))
 
-    def test_unreadable_listed_booking_blocks_and_retries(self):
-        # The REAL Awaiting-payment row shows no court date/time: can't rule out a clash.
-        self.site.pending = [self.p.pending_with_ref("SPORTS-900000000099")]
-        code, sent = self.run_mode("live", iterations=2)
-        self.assertEqual(self.site.posts_sent(), [])
-        self.assertEqual(len([m for m in sent if m["subject"].startswith("ℹ️ Not auto-booking")]), 1)
-        self.assertIsNone(self.record(), "not a final outcome — nothing was submitted")
-        self.assertIn(self.key, self.state()[autobook.RETRY_KEY])
-        self.assertEqual([s["path"] for s in self.site.sent].count("/bookings"), 4, "re-checked on the second pass")
-        # Once the list is clear, the deferred key is booked.
+
+class TestListParsing(unittest.TestCase):
+    """The real filled Upcoming row and booking page, parsed directly."""
+
+    def test_real_upcoming_row(self):
+        page = booking_page.parse_bookings_list(fixture("6_bookings_upcoming_filled.html"), today=_date(2026, 11, 13))
+        self.assertEqual(page["tab"], "upcoming")
+        self.assertEqual(page["rows"], [{
+            "ref": REF2, "status": "Paid", "slot": ("2026-11-15", "23:00"), "loc_name": "Crystal Sports G",
+            "court": "G South-1", "text": page["rows"][0]["text"]}])
+
+    def test_the_year_is_the_next_occurrence_on_or_after_today(self):
+        html = fixture("6_bookings_upcoming_filled.html")
+        cases = [(_date(2026, 11, 15), "2026-11-15"),   # on the day itself: this year
+                 (_date(2026, 11, 16), "2027-11-15"),   # the day after: next year
+                 (_date(2025, 12, 31), "2026-11-15")]
+        for today, want in cases:
+            with self.subTest(today=today):
+                self.assertEqual(booking_page.parse_bookings_list(html, today=today)["rows"][0]["slot"][0], want)
+        jan = html.replace("<b>15</b><span>Nov</span>", "<b>2</b><span>Jan</span>")
+        self.assertEqual(booking_page.parse_bookings_list(jan, today=_date(2026, 12, 30))["rows"][0]["slot"],
+                         ("2027-01-02", "23:00"), "Dec -> Jan")
+        self.assertEqual(booking_page.infer_play_date(29, 2, _date(2026, 3, 1)), _date(2028, 2, 29))
+        self.assertIsNone(booking_page.infer_play_date(31, 2, _date(2026, 3, 1)))
+
+    def test_bangkok_today_is_the_default(self):
+        with mock.patch.object(booking_page, "bangkok_today", return_value=_date(2026, 11, 16)):
+            row = booking_page.parse_bookings_list(fixture("6_bookings_upcoming_filled.html"))["rows"][0]
+        self.assertEqual(row["slot"], ("2027-11-15", "23:00"))
+
+    def test_real_awaiting_payment_row_has_no_slot(self):
+        rows = booking_page.parse_bookings_list(fixture("5_bookings_awaiting.html"))["rows"]
+        self.assertEqual([(r["ref"], r["status"], r["slot"]) for r in rows], [(REF, "Awaiting payment", None)])
+
+    def test_real_booking_page(self):
+        page = booking_page.parse_booking_detail(fixture("7_booking_detail.html"))
+        self.assertEqual(page, {"ref": REF2, "status": "Paid", "lines": [
+            {"loc_name": "Crystal Sports G", "court": "G South-1", "slot": ("2026-11-15", "23:00")}]})
+
+
+class TestRedirectHint(AutobookTestCase):
+    def test_parked_location_shapes(self):
+        yes = [TOPUP, TOPUP_NOV11, bot_session.BASE + TOPUP, "/payment/SPORTS-1/TopUp-Shortfall"]
+        no = ["/bookings?tab=pending", "/payment/SPORTS-1/receipt", "/wallet/topup/123", "", None]
+        for loc in yes:
+            self.assertTrue(autobook.is_parked_location(loc), loc)
+        for loc in no:
+            self.assertFalse(autobook.is_parked_location(loc), loc)
+
+    def test_the_lists_decide_not_the_redirect(self):
+        # A topup redirect without a ref is not the parked hint, but the new
+        # booking under Awaiting payment still makes it 🟡 (ref from the list).
+        self.site.posts = [parked_redirect("/wallet/topup/100000000000000001")]
         self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
-        self.site.posts = [parked_redirect()]
         code, sent = self.run_mode("live")
-        self.assertEqual(len(self.site.posts_sent()), 1)
-        self.assertEqual(self.record()["status"], "parked")
-        self.assertNotIn(self.key, self.state().get(autobook.RETRY_KEY, {}))
+        self.assertEqual(self.record()["attempts"][0]["hint"], "other")
+        self.assertTrue(sent[0]["subject"].startswith("🟡 Parked"))
+        self.assertNotIn("Top up / pay:", sent[0]["body"])
+        self.assertIn(REF, sent[0]["body"])
 
 
 class TestOncePerDateTime(AutobookTestCase):
@@ -574,6 +732,25 @@ class TestPostIsImpossibleElsewhere(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             bot_session._send(self.jar, "GET", "/booking", data=[("a", "b")])
 
+    def test_booking_pages_are_get_only_and_exactly_that_shape(self):
+        refused_gets = ["/bookings/SPORTS-1/sheet", "/bookings/SPORTS-1/cancel", "/bookings/lines/1/cancel",
+                        "/bookings/SPORTS-", "/bookings/SPORTS-1x", "/bookings/sports-1", "/bookings/SPORTS-1/",
+                        "/bookings/SPORTS-1?x=1", "/bookings/SPORTS-1#x", "/bookings/SPORTS-" + "1" * 21,
+                        "/bookings/../booking/confirm", "/payment/SPORTS-1/topup-shortfall", "/wallet/topup/1"]
+        for path in refused_gets:
+            with self.subTest(get=path), self.assertRaises(RuntimeError):
+                bot_session._send(self.jar, "GET", path)
+        for method in ("POST", "PUT", "DELETE"):
+            with self.subTest(method=method), self.assertRaises(RuntimeError):
+                bot_session._send(self.jar, method, "/bookings/SPORTS-1", data=[("bookingRef", "SPORTS-1")])
+        # And the one allowed shape does reach the network layer (a fake one here).
+        site = FakeSite(Pages(FIXTURE_DATE))
+        site.details["SPORTS-123"] = "<html></html>"
+        self.jar.session.mount("https://", site)
+        with mock.patch.object(bot_session, "save_jar"):
+            bot_session.fetch(self.jar, "/bookings/SPORTS-123", {})
+        self.assertEqual([(x["method"], x["path"]) for x in site.sent], [("GET", "/bookings/SPORTS-123")])
+
     def test_only_one_place_in_the_code_can_post(self):
         root = Path(__file__).resolve().parent
         offenders = []
@@ -607,6 +784,10 @@ class TestFixturesAreScrubbed(unittest.TestCase):
                 for ref in re.findall(r"SPORTS-\d+", t):
                     self.assertTrue(ref.startswith("SPORTS-9000000000"), ref)
                 self.assertNotIn("นจ", t)
+                for line_id in re.findall(r"/bookings/lines/(\d+)", t):
+                    self.assertTrue(line_id.startswith("9000"), "real booking line id")
+        self.assertEqual(sorted(f.name for f in FIX.glob("*.html"))[-2:],
+                         ["6_bookings_upcoming_filled.html", "7_booking_detail.html"])
 
 
 if __name__ == "__main__":

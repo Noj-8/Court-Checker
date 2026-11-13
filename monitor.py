@@ -78,7 +78,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
 STATE_FILE = ROOT / "state.json"
 
-AUTOBOOK_PAUSED_NOTE = "Auto-book is paused while it's rebuilt for the new site — book manually."
+AUTOBOOK_PAUSED_NOTE = "Auto-book is off (AUTOBOOK_MODE) — book manually."
 AUTOBOOK_NOTES = {
     "off": AUTOBOOK_PAUSED_NOTE,
     "dry_run": "Auto-book is in DRY RUN: it only reports what it would book — book manually.",

@@ -91,7 +91,8 @@ Open <https://court-checker.vercel.app> and sign in with GitHub. You should see:
   minutes, otherwise "Idle".
 - **Watch list:** your targets, each showing either "N times open" or
   "Monitoring". Starred times are labelled *starred (auto-book paused — notify
-  only)*.
+  only)*. That label (and the "Auto-book is paused" note) is fixed text in the
+  dashboard and doesn't show the real mode. See *Auto-book mode* below.
 - **Bot session:** one of
   - **OK**
   - **Needs reseed**, with the time it was detected (the steps open
@@ -123,6 +124,21 @@ Vercel, and deploy again.
 
 **Bot session says "Needs reseed".** Follow the steps in the panel, or in
 [README.md](README.md#reseeding-the-bot-session).
+
+## Auto-book mode
+
+Auto-book is switched by the **`AUTOBOOK_MODE` repository variable** on
+GitHub (`off` / `dry_run` / `live`), not by anything in Vercel. The dashboard
+can't read or change it: it only edits which times are starred (★). To check
+or change the mode:
+
+```bash
+gh variable list
+gh variable set AUTOBOOK_MODE --body off     # emergency off: applies from the next run
+```
+
+See [README.md](README.md#auto-book-starred-times) for what each mode does and
+the emails it sends.
 
 ## Adding a friend
 
