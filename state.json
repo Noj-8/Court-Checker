@@ -1,8 +1,6 @@
 {
-  "known_open": {
-    "2026-11-15|LOC002|any|19:00": true
-  },
-  "last_check": "2026-11-13T13:43:29.262154+07:00",
-  "currently_open_count": 1,
+  "known_open": {},
+  "last_check": "2026-11-13T13:48:28.112021+07:00",
+  "currently_open_count": 0,
   "autobook_attempts": {}
 }
