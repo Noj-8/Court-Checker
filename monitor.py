@@ -3,9 +3,12 @@
 Crystal Sports Tennis Court Monitor — cloud edition, rebuilt for the new
 booking site (live since 2026-11-11; the old api_helper.php API is gone).
 
-NOTIFY-ONLY: AUTOBOOK_ENABLED is False until auto-book is rebuilt for the
-new site (stage 3). Starred slots get the normal "slot open" email plus a
-note to book manually. The monitor never sends a POST.
+Auto-book (stage 3) is controlled by AUTOBOOK_MODE (the vars.AUTOBOOK_MODE
+repository variable, passed in by monitor.yml): "off" (default when unset —
+notify only, starred slots get the normal email plus a note to book
+manually, and the monitor never sends a POST), "dry_run" or "live". See
+autobook.py for the flow and its rules; the only POST anywhere is
+bot_session.post_booking_confirm(), and only in "live".
 
 Runs N check passes (LOOP_ITERATIONS, default 4), LOOP_INTERVAL_SECONDS
 apart (default 60), then exits. Designed for GitHub Actions cron */5.
@@ -68,17 +71,19 @@ import requests
 
 import bot_session
 from bot_session import BASE, BOOKING_PATH, TZ
+import autobook
 from booking_page import is_login_page, parse_page, slot_time
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
 STATE_FILE = ROOT / "state.json"
 
-# Stage 3 rebuilds auto-book for the new site. Until then there is no
-# booking code at all: this constant only selects the note in the email,
-# and the monitor refuses to start if it's flipped without that code.
-AUTOBOOK_ENABLED = False
 AUTOBOOK_PAUSED_NOTE = "Auto-book is paused while it's rebuilt for the new site — book manually."
+AUTOBOOK_NOTES = {
+    "off": AUTOBOOK_PAUSED_NOTE,
+    "dry_run": "Auto-book is in DRY RUN: it only reports what it would book — book manually.",
+    "live": "Auto-book is on for this time but has no result yet — book manually to be sure.",
+}
 
 BOOKING_URL = BASE + BOOKING_PATH
 ANY_COURT = "any"  # the court part of a known_open key — the grid is per time, not per court
@@ -194,39 +199,42 @@ def fetch_availability(jar, date, loc_id):
       "not_open_yet"  open_times = {}; info = opening time if shown
       "login"         the session is no longer valid — caller must stop
       "error"         open_times = None; info = reason (network, http, no grid)
+    plus links = {"HH:MM": the open slot's own href} for "ok" (empty otherwise).
     Raises bot_session.JarSaveError if a response couldn't be persisted."""
     params = {"date": date, "loc": loc_id, "time": "0", "sel": ""}
     try:
         fetched = bot_session.fetch(jar, BOOKING_PATH, params)
     except requests.RequestException as e:
-        return "error", None, f"network: {e}"
+        return "error", None, f"network: {e}", {}
     resp = fetched.resp
     if fetched.login:
-        return "login", None, resp.headers.get("Location", "")
+        return "login", None, resp.headers.get("Location", ""), {}
     if resp.status_code != 200:
-        return "error", None, f"http {resp.status_code}"
+        return "error", None, f"http {resp.status_code}", {}
     body = resp.text or ""
     page = parse_page(body)
     if not page["slots"]:
         if is_login_page(body, resp.url):
             # A login page served as a 200 instead of the usual redirect.
-            return "login", None, "login page (200)"
+            return "login", None, "login page (200)", {}
         if page["not_open_yet"]:
-            return "not_open_yet", {}, page["opens_at"]
+            return "not_open_yet", {}, page["opens_at"], {}
         return "error", None, (f"unexpected page — no slot grid and no opens-at marker "
-                               f"({len(body)} bytes, title {page['title']!r}); skipped")
+                               f"({len(body)} bytes, title {page['title']!r}); skipped"), {}
     times = [slot_time(s["time"]) for s in page["slots"]]
     unreadable = [s["time"] for s, t in zip(page["slots"], times) if t is None]
     if unreadable:
         return "error", None, (f"unexpected page — slot time(s) not readable unambiguously: "
-                               f"{', '.join(repr(u) for u in unreadable[:5])}; skipped")
+                               f"{', '.join(repr(u) for u in unreadable[:5])}; skipped"), {}
     if len(set(times)) != len(times):
-        return "error", None, "unexpected page — the same slot time appears twice; skipped"
-    open_times = {}
+        return "error", None, "unexpected page — the same slot time appears twice; skipped", {}
+    open_times, links = {}, {}
     for s, t in zip(page["slots"], times):
         if s["available"] and s["free"] != 0:
             open_times[t] = s["free"]
-    return "ok", open_times, None
+            if s["href"].startswith(BOOKING_PATH + "?"):  # the slot's own /booking?... link, nothing else
+                links[t] = s["href"]
+    return "ok", open_times, None, links
 
 
 def session_alert_email(kind, detail):
@@ -266,10 +274,12 @@ def format_free(free):
     return "free count not shown" if free is None else f"{free} free"
 
 
-def run_check_pass(state, config, jar, email):
+def run_check_pass(state, config, jar, email, mode="off"):
     """One full check. Mutates `state` in place. Returns "ok", or "login" if
     the session is no longer valid (stopped at that request, nothing else
-    sent). Raises bot_session.JarSaveError if a response couldn't be saved."""
+    sent). Raises bot_session.JarSaveError if a response couldn't be saved.
+    With mode "dry_run"/"live", starred times that just opened go through
+    autobook.process() before the "slot open" email."""
     today_str = datetime.now(TZ).date().isoformat()
     active = [t for t in config.get("targets", []) if t["date"] >= today_str]
     if not active:
@@ -279,10 +289,11 @@ def run_check_pass(state, config, jar, email):
 
     fetch_keys = sorted({(t["date"], loc) for t in active for loc in t["locations"]})
     cache = {}  # (date, loc) -> {"HH:MM": free}; only for grids that were read
+    slot_links = {}  # (date, loc) -> {"HH:MM": the open slot's own href}
     pages_read, problems = 0, []
     for date, loc in fetch_keys:
         log(f"  → {LOCATIONS.get(loc, loc)} / {date}")
-        kind, open_times, info = fetch_availability(jar, date, loc)
+        kind, open_times, info, links = fetch_availability(jar, date, loc)
         if kind == "login":
             log(f"      🔴 login redirect ({info}) — bot session expired, stopping")
             clear_unreadable_streak(state)  # the session email takes over from here
@@ -301,6 +312,7 @@ def run_check_pass(state, config, jar, email):
         shown = " ".join(f"{t}({'?' if f is None else f})" for t, f in sorted(open_times.items()))
         log(f"      open: {shown or 'none'}")
         cache[(date, loc)] = open_times
+        slot_links[(date, loc)] = links
 
     if pages_read == 0:
         note_unreadable_pass(state, problems, email)
@@ -324,7 +336,7 @@ def run_check_pass(state, config, jar, email):
                     new_alerts.append({
                         "target": target["name"], "date": target["date"], "loc_id": loc,
                         "loc": LOCATIONS.get(loc, loc), "time": t, "free": open_times[t],
-                        "starred": t in starred,
+                        "starred": t in starred, "href": slot_links[(target["date"], loc)].get(t),
                     })
 
     # A slot that's no longer open (on a page we did read) can alert again
@@ -340,13 +352,39 @@ def run_check_pass(state, config, jar, email):
     if "autobook_attempts" in state:
         state["autobook_attempts"] = {k: v for k, v in state["autobook_attempts"].items()
                                       if k.split("|", 1)[0] >= today_str}
+    for name in (autobook.LIVE_KEY, autobook.DRY_KEY, autobook.RETRY_KEY):
+        if name in state:
+            state[name] = {k: v for k, v in state[name].items() if k.split("|", 1)[0] >= today_str}
     state["last_check"] = datetime.now(TZ).isoformat()
     state["currently_open_count"] = len(currently_open)
     log(f"  currently open across watchlist: {len(currently_open)}")
 
+    status, booked_keys = "ok", set()
+    if mode in ("dry_run", "live"):
+        new_keys = {slot_key(a["date"], a["loc_id"], ANY_COURT, a["time"]) for a in new_alerts}
+        candidates = []
+        for target in active:
+            for loc in target["locations"]:
+                links = slot_links.get((target["date"], loc), {})
+                for t in sorted(x["time"] for x in target["times"] if x["autoBook"]):
+                    if t in (cache.get((target["date"], loc)) or {}) and links.get(t):
+                        candidates.append({"date": target["date"], "time": t, "loc": loc,
+                                           "loc_name": LOCATIONS.get(loc, loc), "href": links[t],
+                                           "newly_open": slot_key(target["date"], loc, ANY_COURT, t) in new_keys})
+        ctx = autobook.Context(jar, state, mode, send=lambda subj, body: send_email(subj, body, *email),
+                               save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS)
+        try:
+            autobook.process(ctx, candidates)
+        except autobook.SessionStopped:
+            log("      🔴 login redirect during auto-book — bot session expired, stopping")
+            status = "login"
+        # In live mode a starred slot whose result email went out isn't repeated in the "slot open" email.
+        booked_keys = ctx.emailed_keys if mode == "live" else set()
+    new_alerts = [a for a in new_alerts if not (a["starred"] and autobook.key_for(a["date"], a["time"]) in booked_keys)]
+
     if not new_alerts:
         log("  no new openings this iteration")
-        return "ok"
+        return status
 
     log(f"🎾 {len(new_alerts)} NEW opening(s) detected")
     lines = [f"🎾 {len(new_alerts)} tennis slot(s) just opened up:\n"]
@@ -358,9 +396,9 @@ def run_check_pass(state, config, jar, email):
         for a in items:
             lines.append(f"    {a['date']} {a['time']} — {a['loc']} ({format_free(a['free'])})"
                          + ("  ★" if a["starred"] else ""))
-            if a["starred"] and not AUTOBOOK_ENABLED:
-                lines.append(f"      {AUTOBOOK_PAUSED_NOTE}")
-            lines.append(f"      {booking_link(a['date'], a['loc_id'])}")
+            if a["starred"]:
+                lines.append(f"      {AUTOBOOK_NOTES[mode]}")
+            lines.append(f"      {BASE + a['href'] if a['href'] else booking_link(a['date'], a['loc_id'])}")
         lines.append("")
     lines.append(f"Book here: {BOOKING_URL}")
     try:
@@ -368,7 +406,7 @@ def run_check_pass(state, config, jar, email):
         log("✉ alert email sent")
     except Exception as e:
         log(f"⚠ alert email failed: {e}")
-    return "ok"
+    return status
 
 
 def note_unreadable_pass(state, problems, email):
@@ -424,9 +462,7 @@ def current_jar_path():
 
 
 def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None):
-    if AUTOBOOK_ENABLED:
-        log("ERROR: AUTOBOOK_ENABLED is True but there is no auto-book code for the new site yet.")
-        return EXIT_SETUP
+    mode = autobook.mode_from_env(log)
     config = load_config()
     email = email_settings(config)
     if email is None:
@@ -440,6 +476,10 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
         log(f"ERROR: couldn't open the bot session ({e.kind}) — no requests sent.")
         return EXIT_SETUP
 
+    autobook.notify_interrupted(autobook.Context(
+        jar, state, mode, send=lambda subj, body: send_email(subj, body, *email),
+        save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS))
+
     prev = state.get("session_alert")
     if prev and prev.get("jar_sha256") == bot_session.file_fingerprint(jar.path):
         log(f"🔴 bot session marked {prev.get('kind')} at {prev.get('sent_at')} and {jar.path.name} hasn't "
@@ -447,12 +487,12 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
         try_save_state(state)
         return EXIT_OK
 
-    log(f"Running {iterations} check pass(es), {interval}s apart — notify-only, auto-book paused")
+    log(f"Running {iterations} check pass(es), {interval}s apart — auto-book mode: {mode}")
     state_write_failed = False
     for i in range(iterations):
         log(f"--- iteration {i + 1}/{iterations} ---")
         try:
-            status = run_check_pass(state, config, jar, email)
+            status = run_check_pass(state, config, jar, email, mode)
         except bot_session.JarSaveError as e:
             try_save_state(state)
             if not e.changes:

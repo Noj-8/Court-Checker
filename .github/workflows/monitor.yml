@@ -41,6 +41,9 @@ jobs:
           BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          # Repository VARIABLE (Settings → Secrets and variables → Actions → Variables):
+          # "off" (default when unset), "dry_run" or "live". See autobook.py.
+          AUTOBOOK_MODE: ${{ vars.AUTOBOOK_MODE }}
           LOOP_ITERATIONS: '4'         # 4 polls per run
           LOOP_INTERVAL_SECONDS: '60'  # 60s between polls = ~60s effective polling
         run: |

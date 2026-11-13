@@ -63,7 +63,7 @@ import requests
 import bot_session
 from booking_page import FIRST_INT, THAI_CHARS, PageParser, login_page_markers, parse_page  # noqa: F401 (re-exported)
 from bot_session import (  # noqa: F401 (re-exported)
-    BASE, BOOKING_PATH, CULTURE_COOKIE, ENC_FILE, FORBIDDEN_PATH_FRAGMENTS, HOST, JAR_FILE,
+    BASE, BOOKING_PATH, CULTURE_COOKIE, ENC_FILE, HOST, JAR_FILE,
     JAR_KEY_ENV, JAR_VERSION, LOGIN_REDIRECT_MARKERS, OPTIONAL_SEED, SEED_ENV, TZ, USER_AGENT,
     JarError, JarSaveError, SessionOpenError, _secrets, cookie_expiries, cookie_values,
     create_cookie, describe_expiry, diff_cookies, fingerprint, fmt_duration, handed_off_files,
@@ -72,6 +72,8 @@ from bot_session import (  # noqa: F401 (re-exported)
 )
 
 LOCATIONS = {"LOC001": "Crystal Sports", "LOC002": "Crystal Sports G"}
+# The probe itself only ever GETs /booking; it never touches these.
+FORBIDDEN_PATH_FRAGMENTS = ("/booking/review", "/booking/confirm")
 CHALLENGE_BODY_MARKERS = (
     "just a moment", "challenge-platform", "cf-turnstile",
     "challenges.cloudflare.com/turnstile",

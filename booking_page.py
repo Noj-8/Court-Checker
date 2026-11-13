@@ -97,7 +97,7 @@ class PageParser(HTMLParser):
             return
         if self._slot is None:
             if is_slot:
-                self._slot = {"classes": classes, "time": "", "meta": ""}
+                self._slot = {"classes": classes, "time": "", "meta": "", "href": attrs.get("href") or ""}
                 self._slot_depth = 1
             return
         self._slot_depth += 1
@@ -192,6 +192,7 @@ def parse_page(html):
             "available": "is-disabled" not in s["classes"] and "is-locked" not in s["classes"],
             "free": int(m.group()) if m else None,
             "meta": meta,
+            "href": s["href"],            # the slot's own link (only on available slots)
         })
     thai = any(THAI_CHARS.search(s["meta"]) for s in slots) or bool(THAI_CHARS.search(p.title))
     opens = None if slots else OPENS_AT_RE.search(" ".join(" ".join(p.text).split()))
@@ -200,3 +201,217 @@ def parse_page(html):
             "locked": p.locked,           # the court map's is-locked: diagnostics only
             "opens_at": opens_at,         # only looked for when there are no slots
             "not_open_yet": not slots and opens_at is not None}
+
+
+# ---------------------------------------------------------------------------
+# Auto-book pages: a minimal DOM, the slot page (with a time selected), the
+# review/confirm form, and the My bookings lists. Built from pages saved from
+# the live site on 2026-11-13 (scrubbed copies in tests/fixtures/).
+# ---------------------------------------------------------------------------
+
+class Node:
+    __slots__ = ("tag", "attrs", "children", "parent")
+
+    def __init__(self, tag, attrs, parent):
+        self.tag, self.attrs, self.children, self.parent = tag, attrs, [], parent
+
+    @property
+    def classes(self):
+        return (self.attrs.get("class") or "").split()
+
+    def text(self):
+        out = []
+        for c in self.children:
+            out.append(c if isinstance(c, str) else ("" if c.tag in ("script", "style") else c.text()))
+        return " ".join(" ".join(out).split())
+
+    def iter(self):
+        for c in self.children:
+            if isinstance(c, Node):
+                yield c
+                yield from c.iter()
+
+    def find_all(self, tag=None, cls=None, **attrs):
+        return [n for n in self.iter()
+                if (tag is None or n.tag == tag) and (cls is None or cls in n.classes)
+                and all(n.attrs.get(k) == v for k, v in attrs.items())]
+
+    def find(self, tag=None, cls=None, **attrs):
+        found = self.find_all(tag, cls, **attrs)
+        return found[0] if found else None
+
+
+class _TreeBuilder(HTMLParser):
+    VOID = PageParser.VOID
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = Node("#root", {}, None)
+        self.cur = self.root
+
+    def handle_starttag(self, tag, attrs):
+        node = Node(tag, {k: (v if v is not None else "") for k, v in attrs}, self.cur)
+        self.cur.children.append(node)
+        if tag not in self.VOID:
+            self.cur = node
+
+    def handle_startendtag(self, tag, attrs):
+        self.cur.children.append(Node(tag, {k: (v if v is not None else "") for k, v in attrs}, self.cur))
+
+    def handle_endtag(self, tag):
+        n = self.cur
+        while n is not self.root and n.tag != tag:  # tolerate unclosed tags
+            n = n.parent
+        if n is not self.root:
+            self.cur = n.parent
+
+    def handle_data(self, data):
+        self.cur.children.append(data)
+
+
+def dom(html):
+    b = _TreeBuilder()
+    b.feed(html or "")
+    b.close()
+    return b.root
+
+
+def query_of(href):
+    """The query of a relative link as a dict (blank values kept), plus its path."""
+    from urllib.parse import parse_qsl
+    parts = urlsplit(href or "")
+    return parts.path, dict(parse_qsl(parts.query, keep_blank_values=True))
+
+
+def parse_slot_page(html):
+    """/booking?date=..&loc=..&time=N&sel= — the page after a time is chosen.
+    Returns what is selected (date label, branch, time) and the court tiles,
+    in site order: [{name, sel, available}]."""
+    root = dom(html)
+    date_chip = next((n for n in root.find_all("a", "date-chip") if "is-selected" in n.classes), None)
+    branch = next((n for n in root.find_all("a", "choice-card") if "is-selected" in n.classes), None)
+    slot = next((n for n in root.find_all("a", "slot") if "is-selected" in n.classes), None)
+    courts = []
+    for tile in root.find_all("a", "court-tile"):
+        name_el = tile.find("span", "court-name")
+        _, q = query_of(tile.attrs.get("href", ""))
+        available = "is-disabled" not in tile.classes and tile.attrs.get("aria-disabled") != "true" and bool(q.get("sel"))
+        courts.append({"name": name_el.text() if name_el else "", "sel": q.get("sel", ""), "available": available})
+    return {
+        "date_label": date_chip.attrs.get("aria-label", "") if date_chip else "",
+        "branch": (branch.find("span", "choice-title").text() if branch and branch.find("span", "choice-title") else ""),
+        "time": slot_time(slot.find("span", "slot-time").text()) if slot and slot.find("span", "slot-time") else None,
+        "courts": courts,
+    }
+
+
+PRICE_RE = re.compile(r"฿\s*([\d,]+(?:\.\d+)?)")
+
+
+def _field_info(n):
+    a = n.attrs
+    info = {"tag": n.tag, "name": a.get("name", ""), "type": (a.get("type") or ("text" if n.tag == "input" else n.tag)).lower(),
+            "value": a.get("value", ""), "required": "required" in a, "disabled": "disabled" in a,
+            "checked": "checked" in a}
+    if n.tag == "select":
+        opts = n.find_all("option")
+        chosen = next((o for o in opts if "selected" in o.attrs), opts[0] if opts else None)
+        info["value"] = chosen.attrs.get("value", "") if chosen else ""
+    if n.tag == "textarea":
+        info["value"] = n.text()
+    return info
+
+
+def parse_review(html):
+    """/booking/review?sel=.. — the confirm form. Returns the booking forms
+    (action /booking/confirm), and for the first one: method, every named
+    field (inputs, selects, textareas, named buttons — including any outside
+    the form that point at it with form="id"), and the booked item cards
+    (title "Branch · Court", date/time line, price)."""
+    root = dom(html)
+    forms = [f for f in root.find_all("form") if urlsplit(f.attrs.get("action", "")).path == "/booking/confirm"]
+    out = {"form_count": len(forms), "method": "", "fields": [], "items": [], "total": None, "page_date": ""}
+    h1 = root.find("h1", "page-title")
+    if h1 is not None:
+        sib = h1.parent.find("p", "text-muted") if h1.parent else None
+        out["page_date"] = sib.text() if sib else ""
+    if not forms:
+        return out
+    form = forms[0]
+    out["method"] = (form.attrs.get("method") or "get").lower()
+    fid = form.attrs.get("id")
+    members = [n for n in form.iter() if n.tag in ("input", "select", "textarea", "button")]
+    if fid:
+        members += [n for n in root.iter() if n.tag in ("input", "select", "textarea", "button")
+                    and n.attrs.get("form") == fid and n not in members]
+    out["fields"] = [_field_info(n) for n in members if n.attrs.get("name")]
+    for card in form.find_all("div", "card"):
+        title = card.find("b")
+        sub = card.find("div", "text-muted")
+        bolds = card.find_all("b")
+        price = next((PRICE_RE.search(b.text()) for b in bolds if PRICE_RE.search(b.text())), None)
+        if title is not None and sub is not None and " · " in title.text():
+            out["items"].append({"title": title.text(), "when": sub.text(),
+                                 "price": price.group(1).replace(",", "") if price else None})
+    total = root.find("b", **{"data-rv-total": ""})
+    m = PRICE_RE.search(total.text()) if total is not None else None
+    out["total"] = m.group(1).replace(",", "") if m else None
+    return out
+
+
+ERROR_CLASSES = ("alert-danger", "alert-error", "validation-summary-errors", "field-validation-error",
+                 "toast-error", "is-error")
+
+
+def page_error_messages(html):
+    """Text of explicit error elements on a page (a re-rendered form that
+    refused the booking). Empty list = no explicit error shown."""
+    root = dom(html)
+    return [n.text() for n in root.iter() if any(c in n.classes for c in ERROR_CLASSES) and n.text()]
+
+
+ROW_RANGE_RE = re.compile(r"(\d{1,2}):(\d{2})\s*[–—-]\s*(\d{1,2}):(\d{2})")
+MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+DATE_RES = (
+    (re.compile(r"(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{4})"), lambda m: (int(m[3]), MONTHS.get(m[2].lower()), int(m[1]))),
+    (re.compile(r"(\d{4})-(\d{2})-(\d{2})"), lambda m: (int(m[1]), int(m[2]), int(m[3]))),
+    (re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})"), lambda m: (int(m[3]), int(m[2]), int(m[1]))),
+)
+
+
+def _play_slot(text):
+    """('YYYY-MM-DD', 'HH:MM') if the text shows a played date AND a time
+    RANGE ("Sun 15 Nov 2026 · 23:00 – 24:00"), else None. A bare time such
+    as the "Booked on 13 Nov 2026 11:23" cell is not a played slot."""
+    r = ROW_RANGE_RE.search(text)
+    if not r:
+        return None
+    for rx, conv in DATE_RES:
+        for m in rx.finditer(text):
+            y, mo, d = conv(m)
+            if mo:
+                return f"{y:04d}-{mo:02d}-{d:02d}", f"{int(r[1]):02d}:{r[2]}"
+    return None
+
+
+def parse_bookings_list(html):
+    """/bookings (Upcoming) or /bookings?tab=pending (Awaiting payment).
+    Returns {"tab": active tab href query, "rows": [{ref, status, text,
+    slot}]} where slot is ('YYYY-MM-DD','HH:MM') only if the row itself
+    shows the played date and time range — the live Awaiting-payment rows
+    (2026-11-13) show only ref, booked-on time and status, so slot is None."""
+    root = dom(html)
+    active = next((n for n in root.find_all("a", "tab") if "active" in n.classes), None)
+    tab = query_of(active.attrs.get("href", ""))[1].get("tab", "") if active is not None else ""
+    lst = root.find(id="bookingList")
+    rows = []
+    for row in (lst.iter() if lst is not None else ()):
+        ref = row.attrs.get("data-ref") or ""
+        if not ref or row.tag != "a":
+            continue
+        badge = row.find("span", "badge")
+        text = row.text()
+        rows.append({"ref": ref, "status": badge.text() if badge is not None else "",
+                     "text": text, "slot": _play_slot(text)})
+    empty = root.find("div", "empty-state") is not None
+    return {"tab": tab, "rows": rows, "empty": empty and not rows, "recognised": lst is not None}

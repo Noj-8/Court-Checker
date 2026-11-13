@@ -14,10 +14,13 @@ presenting a superseded cs.member kills the whole login session. So:
     (gitignored, mode 600) — and never in Actions.
   * When the server reissues a cookie under a different domain/path, the
     stale copy is dropped so it can't be sent alongside the new one.
-  * Requests are strictly sequential (a concurrent call raises), GET only,
-    /booking only (never /booking/review or /booking/confirm), redirects
-    never followed. A login redirect is reported to the caller, who must
-    stop — replaying older cookies is exactly what kills a session.
+  * Requests are strictly sequential (a concurrent call raises) and
+    redirects are never followed. Every request goes through _send(), which
+    allows exactly: GET /booking, GET /booking/review, GET /bookings, and
+    POST /booking/confirm — the last only via post_booking_confirm(), and
+    only when the caller passes mode == "live". A login redirect is
+    reported to the caller, who must stop — replaying older cookies is
+    exactly what kills a session.
   * Cookie values are never printed: only names and fingerprints (length +
     first 8 hex chars of SHA-256), and every line goes through redact().
 """
@@ -40,8 +43,11 @@ from requests.cookies import create_cookie
 HOST = "crystalsports-booking.kegroup.co.th"
 BASE = f"https://{HOST}"
 BOOKING_PATH = "/booking"
-ALLOWED_GET_PATHS = frozenset({BOOKING_PATH})
-FORBIDDEN_PATH_FRAGMENTS = ("/booking/review", "/booking/confirm")
+REVIEW_PATH = "/booking/review"
+BOOKINGS_PATH = "/bookings"
+CONFIRM_PATH = "/booking/confirm"
+ALLOWED_GET_PATHS = frozenset({BOOKING_PATH, REVIEW_PATH, BOOKINGS_PATH})
+ALLOWED_REQUESTS = frozenset({("GET", p) for p in ALLOWED_GET_PATHS} | {("POST", CONFIRM_PATH)})
 TZ = ZoneInfo("Asia/Bangkok")
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -406,7 +412,24 @@ def is_login_redirect(resp):
 
 
 def fetch(jar, path, params):
-    """GET one allowed page on the bot's session. The jar is saved before
+    """GET one allowed page (ALLOWED_GET_PATHS) on the bot's session."""
+    return _send(jar, "GET", path, params=params)
+
+
+def post_booking_confirm(jar, fields, mode, referer):
+    """THE ONLY function that POSTs, ever: to /booking/confirm, with the
+    given form fields (a list of (name, value) pairs), and only when mode ==
+    "live". Redirects are not followed; the jar is saved after the response
+    exactly as for GETs."""
+    if mode != "live":
+        raise RuntimeError(f"refusing to POST {CONFIRM_PATH} in mode {mode!r} — only 'live' may book")
+    return _send(jar, "POST", CONFIRM_PATH, data=list(fields),
+                 headers={"Origin": BASE, "Referer": referer,
+                          "Content-Type": "application/x-www-form-urlencoded"})
+
+
+def _send(jar, method, path, params=None, data=None, headers=None):
+    """One request on the bot's session. The jar is saved before
     this returns — before the caller parses or prints anything about the
     response — and it is saved even when the request or the body read
     raises, so a Set-Cookie that arrived is never lost: the headers (and
@@ -417,8 +440,10 @@ def fetch(jar, path, params):
     headers are already on disk). Fetched.login=True means the session is
     no longer valid: stop."""
     url = BASE + path
-    if path not in ALLOWED_GET_PATHS or urlsplit(url).path != path or any(f in url for f in FORBIDDEN_PATH_FRAGMENTS):
-        raise RuntimeError(f"refusing to request {path!r} — the bot session is GET /booking only")
+    if (method, path) not in ALLOWED_REQUESTS or urlsplit(url).path != path:
+        raise RuntimeError(f"refusing to {method} {path!r} — not an allowed request on the bot session")
+    if (method == "POST") != (data is not None) or (method == "GET" and data is not None):
+        raise RuntimeError("only the booking POST may carry a body")
     if not _request_lock.acquire(blocking=False):
         raise RuntimeError("concurrent request on the bot session — requests must be strictly sequential")
     try:
@@ -430,8 +455,9 @@ def fetch(jar, path, params):
             # stored in the jar — the jar holds only what the server issued.
             # stream=True: return as soon as the headers (and Set-Cookie)
             # are in, so the jar is saved before the body is read.
-            resp = jar.session.get(url, params=params, cookies=CULTURE_COOKIE,
-                                   allow_redirects=False, timeout=20, stream=True)
+            resp = jar.session.request(method, url, params=params, data=data, headers=headers,
+                                       cookies=CULTURE_COOKIE, allow_redirects=False,
+                                       timeout=20, stream=True)
             merge_set_cookies(jar.session, resp)
         except BaseException as e:  # saved below regardless, then re-raised
             request_error = e

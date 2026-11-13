@@ -476,28 +476,32 @@ class TestLoginDetector(unittest.TestCase):
 
 class TestNoPost(MonitorTestCase):
     def test_full_run_with_starred_open_slot_never_posts(self):
+        # Mode off (unset or explicit). dry_run's no-POST run is in
+        # test_autobook.TestModes, which has the pages auto-book reads.
+        for env in ({}, {"AUTOBOOK_MODE": "off"}, {"AUTOBOOK_MODE": "not-a-mode"}):
+            with self.subTest(env=env):
+                self.state_file.unlink(missing_ok=True)
+                self._full_run_never_posts(env)
+
+    def _full_run_never_posts(self, env):
         self.write_config([target(self.date, [("20:00", True), ("22:00", False)], locations=("LOC001", "LOC002"))])
         script = [ok(GRID_EN), ok(GRID_TH), ok(GRID_EN), ok(GRID_TH)]
-        code, out, adapter, sent = self.run_monitor(script, iterations=2)
+        code, out, adapter, sent = self.run_monitor(script, iterations=2, env=env)
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual(len(adapter.sent), 4)
         self.assertEqual({r["method"] for r in adapter.sent}, {"GET"})
         self.assertTrue(all(r["url"].startswith(f"{bot_session.BASE}/booking?") for r in adapter.sent))
-        self.assertFalse(any(f in r["url"] for r in adapter.sent for f in bot_session.FORBIDDEN_PATH_FRAGMENTS))
+        self.assertFalse(any(f in r["url"] for r in adapter.sent for f in ("/booking/review", "/booking/confirm", "/bookings")))
         self.assertEqual(len(sent), 1, "one email for the pass that found the openings, none on the repeat")
         body = sent[0]["body"]
         self.assertEqual(body.count(monitor.AUTOBOOK_PAUSED_NOTE), 2, "once under each location's starred 20:00")
         self.assertIn("20:00 — Crystal Sports (2 free)  ★", body)
         self.assertNotIn("autobook_attempts", self.state())
 
-    def test_autobook_cannot_be_switched_on_without_code(self):
-        with mock.patch.object(monitor, "AUTOBOOK_ENABLED", True):
-            code, _, adapter, _ = self.run_monitor([ok()])
-        self.assertEqual((code, adapter.sent), (monitor.EXIT_SETUP, []))
-
-    def test_fetch_refuses_anything_but_get_booking(self):
+    def test_fetch_refuses_anything_but_the_allowed_gets(self):
         jar = bot_session.Jar(session=requests.Session(), path=self.jar)
-        for path in ("/booking/review", "/booking/confirm", "/account/login", "/booking/../booking/confirm"):
+        for path in ("/booking/confirm", "/account/login", "/account/logout", "/wallet/topup/1",
+                     "/booking/../booking/confirm", "/bookings/SPORTS-1/sheet"):
             with self.subTest(path=path), self.assertRaises(RuntimeError):
                 bot_session.fetch(jar, path, {})
 

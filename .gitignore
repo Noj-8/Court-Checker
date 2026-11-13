@@ -32,3 +32,7 @@ __pycache__/
 .bot_session.*.tmp
 # The Mac's copy after seal_session.py handed the session to GitHub Actions.
 .bot_session.json.handed-off-*
+
+# Raw pages saved from the live booking site (personal data) — never commit.
+# Scrubbed copies for tests live in tests/fixtures/.
+fixtures_raw/
