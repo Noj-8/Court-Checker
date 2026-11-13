@@ -21,6 +21,9 @@ import io
 import json
 import os
 import re
+import smtplib
+import subprocess
+import sys
 import unittest
 from datetime import date as _date, timedelta
 from pathlib import Path
@@ -89,12 +92,12 @@ class Pages:
         return re.sub(r'<a class="bk-row" role="row".*?</a>', "", fixture("5_bookings_awaiting.html"), flags=re.S)
 
     def upcoming_filled(self, ref=REF2, d=None, time="23:00", loc_name="Crystal Sports G", court="G South-1",
-                        status="Paid"):
+                        status="Paid", end=None):
         """The REAL filled Upcoming page (one Paid row: 15 Nov, 23:00–24:00,
         G South-1, Crystal Sports G). With arguments it is DERIVED: the same
         row moved to another ref/day/time/location/court/status."""
         d = d or self.d
-        end = f"{int(time[:2]) + 1:02d}:{time[3:]}"
+        end = end or f"{int(time[:2]) + 1:02d}:{time[3:]}"
         return (fixture("6_bookings_upcoming_filled.html")
                 .replace(REF2, ref)
                 .replace("<b>15</b><span>Nov</span>", f"<b>{d.day}</b><span>{MONTH_ABBR[d.month - 1]}</span>")
@@ -102,14 +105,23 @@ class Pages:
                 .replace(f"Crystal Sports G · {ref}", f"{loc_name} · {ref}")
                 .replace('badge-dot">Paid<', f'badge-dot">{status}<'))
 
-    def detail(self, ref, d=None, time="23:00", loc_name="Crystal Sports G", court="G South-1"):
+    def detail(self, ref, d=None, time="23:00", loc_name="Crystal Sports G", court="G South-1", end=None):
         """A booking's own page /bookings/SPORTS-… — the REAL page (15 Nov,
         23:00–24:00, G South-1), DERIVED to another ref/date/time/court."""
         d = d or self.d
-        end = f"{int(time[:2]) + 1:02d}:{time[3:]}"
+        end = end or f"{int(time[:2]) + 1:02d}:{time[3:]}"
         return (fixture("7_booking_detail.html").replace(REF2, ref)
                 .replace(autobook.date_label("2026-11-15") + " · 23:00–24:00", f"{autobook.date_label(d.isoformat())} · {time}–{end}")
                 .replace("Crystal Sports G · G South-1", f"{loc_name} · {court}"))
+
+    def grid_with_2200_open(self):
+        """DERIVED: the real grid with 22:00 open as well (1 free)."""
+        html = self.grid().replace(
+            '<a class="slot is-disabled" aria-disabled="true">\n                        <span class="slot-time">22:00</span>\n                        <span class="slot-meta">Full</span>',
+            '<a class="slot" href="/booking?date=' + self.iso + '&amp;loc=LOC002&amp;time=17&amp;sel=#step-court">\n'
+            '                        <span class="slot-time">22:00</span>\n                        <span class="slot-meta">1 free</span>')
+        assert html != self.grid()
+        return html
 
     def refused(self, sel=None):
         """SYNTHETIC: the review form re-rendered with an error (court taken)."""
@@ -166,7 +178,8 @@ class FakeSite(requests.adapters.BaseAdapter):
             return make_response(request, *(page if isinstance(page, tuple) else (200, [("Content-Type", "text/html")], page)))
         if u.path == "/bookings":
             queue = self.pending if q.get("tab") == "pending" else self.upcoming
-            return make_response(request, 200, [("Content-Type", "text/html")], self._next(queue))
+            page = self._next(queue)
+            return make_response(request, *(page if isinstance(page, tuple) else (200, [("Content-Type", "text/html")], page)))
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     def close(self):
@@ -197,7 +210,7 @@ class AutobookTestCase(MonitorTestCase):
         self.write_config([target(self.date, [("23:00", True)], locations=("LOC002",))])
         self.site = FakeSite(self.p)
 
-    def run_mode(self, mode, iterations=1, raise_ok=False):
+    def run_mode(self, mode, iterations=1, raise_ok=False, fail_subjects=()):
         session = requests.Session()
         session.mount("https://", self.site)
         sent = []
@@ -206,12 +219,18 @@ class AutobookTestCase(MonitorTestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
              mock.patch.object(monitor, "STATE_FILE", self.state_file), \
-             mock.patch.object(monitor, "send_email", side_effect=lambda s, b, *a: sent.append({"subject": s, "body": b})), \
+             mock.patch.object(monitor, "send_email", side_effect=lambda s, b, *a: self._send(sent, fail_subjects, s, b)), \
              mock.patch.object(monitor.time, "sleep"), \
              contextlib.redirect_stdout(out):
             code = monitor.run(iterations=iterations, interval=0, jar_path=self.jar, enc_path=self.enc, session=session)
         self.out = out.getvalue()
         return code, sent
+
+    @staticmethod
+    def _send(sent, fail_subjects, subject, body):
+        if subject.startswith(tuple(fail_subjects)) if fail_subjects else False:
+            raise smtplib.SMTPServerDisconnected("smtp down (test) for someone@example.com")
+        sent.append({"subject": subject, "body": body})
 
     def subjects(self, sent):
         return [m["subject"] for m in sent]
@@ -295,7 +314,8 @@ class TestOutcomes(AutobookTestCase):
         self.assertEqual([dict(p["form"])["sel"] for p in posts], [self.p.sel, self.p.sel2])
         self.assertEqual(self.subjects(sent), [f"🟡 Parked — pay within 15 min: Crystal Sports G G South-3 {self.date} 23:00 ฿500"])
         rec = self.record()
-        self.assertEqual([a["court"] for a in rec["attempts"]], ["G South-1", "G South-3"])
+        self.assertEqual([(a["n"], a["court_index"]) for a in rec["attempts"]], [(1, 7), (2, 9)],
+                         "the courts' positions in site order (G South-1, G South-3), not their names")
 
     def test_both_courts_taken_is_failed(self):
         self.site.posts = [refused_page(self.p.refused()), refused_page(self.p.refused(self.p.sel2))]
@@ -538,7 +558,7 @@ class TestListParsing(unittest.TestCase):
         page = booking_page.parse_bookings_list(fixture("6_bookings_upcoming_filled.html"), today=_date(2026, 11, 13))
         self.assertEqual(page["tab"], "upcoming")
         self.assertEqual(page["rows"], [{
-            "ref": REF2, "status": "Paid", "slot": ("2026-11-15", "23:00"), "loc_name": "Crystal Sports G",
+            "ref": REF2, "status": "Paid", "slot": ("2026-11-15", "23:00", "24:00"), "loc_name": "Crystal Sports G",
             "court": "G South-1", "text": page["rows"][0]["text"]}])
 
     def test_the_year_is_the_next_occurrence_on_or_after_today(self):
@@ -551,14 +571,14 @@ class TestListParsing(unittest.TestCase):
                 self.assertEqual(booking_page.parse_bookings_list(html, today=today)["rows"][0]["slot"][0], want)
         jan = html.replace("<b>15</b><span>Nov</span>", "<b>2</b><span>Jan</span>")
         self.assertEqual(booking_page.parse_bookings_list(jan, today=_date(2026, 12, 30))["rows"][0]["slot"],
-                         ("2027-01-02", "23:00"), "Dec -> Jan")
+                         ("2027-01-02", "23:00", "24:00"), "Dec -> Jan")
         self.assertEqual(booking_page.infer_play_date(29, 2, _date(2026, 3, 1)), _date(2028, 2, 29))
         self.assertIsNone(booking_page.infer_play_date(31, 2, _date(2026, 3, 1)))
 
     def test_bangkok_today_is_the_default(self):
         with mock.patch.object(booking_page, "bangkok_today", return_value=_date(2026, 11, 16)):
             row = booking_page.parse_bookings_list(fixture("6_bookings_upcoming_filled.html"))["rows"][0]
-        self.assertEqual(row["slot"], ("2027-11-15", "23:00"))
+        self.assertEqual(row["slot"], ("2027-11-15", "23:00", "24:00"))
 
     def test_real_awaiting_payment_row_has_no_slot(self):
         rows = booking_page.parse_bookings_list(fixture("5_bookings_awaiting.html"))["rows"]
@@ -567,7 +587,7 @@ class TestListParsing(unittest.TestCase):
     def test_real_booking_page(self):
         page = booking_page.parse_booking_detail(fixture("7_booking_detail.html"))
         self.assertEqual(page, {"ref": REF2, "status": "Paid", "lines": [
-            {"loc_name": "Crystal Sports G", "court": "G South-1", "slot": ("2026-11-15", "23:00")}]})
+            {"loc_name": "Crystal Sports G", "court": "G South-1", "slot": ("2026-11-15", "23:00", "24:00")}]})
 
 
 class TestRedirectHint(AutobookTestCase):
@@ -631,13 +651,27 @@ class TestCrashAfterWriteAhead(AutobookTestCase):
         self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
         code, sent = self.run_mode("live")
         self.assertEqual(self.site.posts_sent(), [])
-        self.assertEqual(self.subjects(sent)[0], f"🟠 Unclear — check My bookings: Crystal Sports G G South-1 {self.date} 23:00 ฿500")
+        self.assertEqual(self.subjects(sent)[0], f"🟠 Unclear — check My bookings: Crystal Sports G {self.date} 23:00")
         self.assertEqual(len([m for m in sent if m["subject"].startswith("🟠")]), 1)
         self.assertEqual(self.record()["status"], "interrupted")
 
         code, sent = self.run_mode("live")
         self.assertEqual(self.site.posts_sent(), [])
         self.assertEqual([m for m in sent if m["subject"].startswith("🟠")], [], "🟠 only once")
+
+    def test_interrupted_email_that_fails_is_sent_on_a_later_run(self):
+        self.site.on_post = lambda n: (_ for _ in ()).throw(KeyboardInterrupt())
+        self.site.posts = [parked_redirect()]
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_mode("live")
+        self.site.on_post = None
+        self.site.sent.clear()
+        code, sent = self.run_mode("live", fail_subjects=("🟠",))
+        self.assertEqual(self.record()["status"], "in_progress", "not marked interrupted: nobody was told yet")
+        self.assertEqual(self.site.posts_sent(), [], "still never retried")
+        code, sent = self.run_mode("live")
+        self.assertEqual(len([m for m in sent if m["subject"].startswith("🟠")]), 1)
+        self.assertEqual(self.record()["status"], "interrupted")
 
     def test_write_ahead_that_cannot_be_saved_means_no_post(self):
         real_save = monitor.save_state
@@ -711,6 +745,463 @@ class TestModes(AutobookTestCase):
         self.assertNotIn("23:00", slot_email[0]["body"])
         self.assertIn(f"{bot_session.BASE}/booking?date={self.date}&loc=LOC002&time=17&sel=#step-court", slot_email[0]["body"],
                       "deep link: the slot's own href")
+
+
+# --- third review ------------------------------------------------------------------
+
+THAI = re.compile("[฀-๿]")
+OTHER = "SPORTS-900000000099"
+
+
+def page_texts():
+    """Every text node and attribute value of 8+ characters in the scrubbed
+    fixtures — "page text" that must never end up in state.json."""
+    out = set()
+    for f in FIX.glob("*.html"):
+        for n in booking_page.dom(f.read_text(encoding="utf-8")).iter():
+            for c in n.children:
+                if isinstance(c, str) and len(" ".join(c.split())) >= 8:
+                    out.add(" ".join(c.split()))
+            if n.tag not in ("script", "style"):
+                out.update(v for k, v in n.attrs.items() if k not in ("class", "style") and v and len(v) >= 8)
+    ours = set(monitor.LOCATIONS.values())  # our own constants (the site shows them too)
+    return {t for t in out if t not in ours}
+
+
+def strings_in(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k)
+            yield from strings_in(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from strings_in(v)
+    elif isinstance(obj, str):
+        yield obj
+
+
+class TestPrivacy(AutobookTestCase):
+    def test_logs_carry_no_refs_or_ref_paths(self):
+        self.site.details[OTHER] = self.p.detail(OTHER, time="20:00")   # someone else's booking, other time
+        both = self.p.pending_with_ref(OTHER).replace(
+            '<a class="bk-row"', self.p.pending_with_ref().split('<div id="bookingList">')[1].split("</div>")[0]
+            + '<a class="bk-row"', 1)
+        self.site.pending = [self.p.pending_with_ref(OTHER), both]
+        self.site.posts = [parked_redirect(TOPUP_NOV11)]
+        code, sent = self.run_mode("live")
+        self.assertTrue(sent[0]["subject"].startswith("🟡"))
+        for secret in (REF, OTHER, "/bookings/SPORTS", "100000000000000001", "SPORTS-"):
+            self.assertNotIn(secret, self.out)
+        self.assertIn(f"booking ref:{autobook.ref_fp(OTHER)}: http 200", self.out)
+        self.assertIn(REF, sent[0]["body"], "the email (private) still carries the ref")
+
+    def test_a_failing_booking_page_is_logged_by_fingerprint_and_status_only(self):
+        for label, page, want in (("http error", (503, [], "busy"), "http_503"),
+                                  ("network error", requests.exceptions.ConnectionError(
+                                      f"Max retries exceeded with url: /bookings/{OTHER} (someone@example.com)"),
+                                   "network_error")):
+            with self.subTest(label):
+                self.setUp()
+                if isinstance(page, BaseException):
+                    original = self.site.send
+
+                    def send(request, _orig=original, _exc=page, **kw):
+                        if request.url.endswith(f"/bookings/{OTHER}"):
+                            self.site.sent.append({"method": "GET", "path": f"/bookings/{OTHER}", "query": {}, "url": "", "form": []})
+                            raise _exc
+                        return _orig(request, **kw)
+                    self.site.send = send
+                else:
+                    self.site.details[OTHER] = page
+                self.site.pending = [self.p.pending_with_ref(OTHER)]
+                code, sent = self.run_mode("live")
+                self.assertIn(f"booking ref:{autobook.ref_fp(OTHER)}: {want}", self.out)
+                for secret in (OTHER, "/bookings/SPORTS", "Max retries", "example.com", "busy"):
+                    self.assertNotIn(secret, self.out)
+
+    def test_redact_fingerprints_booking_and_payment_refs(self):
+        text = bot_session.redact(f"GET /bookings/{REF} then {bot_session.BASE}{TOPUP_NOV11}")
+        self.assertNotIn("SPORTS-", text)
+        self.assertNotIn("100000000000000001", text)
+        self.assertIn(f"ref:{autobook.ref_fp(REF)}", text)
+
+    def test_no_log_line_prints_an_exception_message_or_page_text(self):
+        # Static: log()/say() calls and the probe's diagnostic lines never
+        # interpolate a bare exception ({e}) or a page title.
+        root = Path(__file__).resolve().parent
+        offenders = []
+        for name in ("monitor.py", "autobook.py", "booking_page.py", "probe_new_site.py"):
+            for i, line in enumerate((root / name).read_text(encoding="utf-8").splitlines(), 1):
+                if re.search(r"\b(log|say|diag\.append)\(f?['\"].*(\{e\}|\{e!r\}|\{e!s\}|\['title'\]\}|\[\"title\"\]\})", line):
+                    offenders.append(f"{name}:{i}: {line.strip()}")
+        self.assertEqual(offenders, [])
+
+    def test_an_unexpected_page_is_logged_without_its_text(self):
+        self.site.grid["LOC002"] = "<html><head><title>Hello Test Member SECRET-TITLE</title></head><body>?</body></html>"
+        self.run_mode("off")
+        self.assertIn("unexpected page", self.out)
+        self.assertNotIn("SECRET-TITLE", self.out)
+
+    def test_email_failure_is_logged_without_the_smtp_message(self):
+        code, sent = self.run_mode("off", fail_subjects=("🎾",))
+        self.assertIn("alert email failed: SMTPServerDisconnected", self.out)
+        self.assertNotIn("example.com", self.out)
+
+
+class TestStateHoldsNoSiteText(AutobookTestCase):
+    """state.json is public: our own values and fixed codes only."""
+
+    def assert_state_clean(self, label):
+        texts = page_texts()
+        state = self.state()
+        for s in strings_in(state):
+            with self.subTest(label, value=s[:60]):
+                self.assertIsNone(re.search(r"SPORTS-\d+", s), "a booking ref in state")
+                self.assertIsNone(THAI.search(s), "Thai page text in state")
+                self.assertNotIn("100000000000000001", s)
+                for t in texts:
+                    self.assertNotIn(t, s, "page text in state")
+                for injected in ("PREFILLED-SECRET-VALUE", "Sorry, this court", "someone@example.com", "FAKE-ANTIFORGERY"):
+                    self.assertNotIn(injected, s)
+        return state
+
+    def test_page_texts_are_actually_collected(self):
+        texts = page_texts()
+        for expected in ("Hi Test Member", "Awaiting payment", "I have read and accept the terms of service"):
+            self.assertTrue(any(expected in t for t in texts), expected)
+
+    def test_every_outcome_writes_only_codes(self):
+        r = self.p.review()
+        scenarios = {
+            "parked": lambda: (setattr(self.site, "posts", [parked_redirect()]),
+                               setattr(self.site, "pending", [self.p.pending_empty(), self.p.pending_with_ref()])),
+            "refused twice": lambda: setattr(self.site, "posts", [refused_page(self.p.refused()), refused_page(self.p.refused(self.p.sel2))]),
+            "unclear (network)": lambda: setattr(self.site, "posts", [requests.exceptions.ConnectionError(f"reset /bookings/{REF}")]),
+            "unexpected pre-filled field": lambda: self.site.reviews.__setitem__(self.p.sel, r.replace(
+                '<input type="hidden" name="sel"', '<input type="hidden" name="promo code!" value="PREFILLED-SECRET-VALUE" />'
+                                                   '<input type="hidden" name="sel"')),
+            "coach pre-selected": lambda: self.site.reviews.__setitem__(self.p.sel, r.replace('<option value="1001"', '<option selected value="1001"')),
+            "different date": lambda: self.site.reviews.__setitem__(self.p.sel, r.replace(f"{self.p.label} · 23:00", "Mon 1 Jan 2029 · 23:00")),
+            "existing booking": lambda: setattr(self.site, "upcoming", [self.p.upcoming_filled()]),
+            "unreadable booking": lambda: (self.site.details.__setitem__(OTHER, (500, [], "x")),
+                                           setattr(self.site, "pending", [self.p.pending_with_ref(OTHER)])),
+            "paid": lambda: (setattr(self.site, "posts", [(302, [("Location", "/bookings")], "")]),
+                             setattr(self.site, "upcoming", [self.p.upcoming_empty(), self.p.upcoming_filled("SPORTS-900000000077")])),
+        }
+        codes = {}
+        for label, arrange in scenarios.items():
+            self.setUp()
+            arrange()
+            self.run_mode("live")
+            state = self.assert_state_clean(label)
+            rec = state.get(autobook.LIVE_KEY, {}).get(self.key) or state.get(autobook.RETRY_KEY, {}).get(self.key)
+            codes[label] = (rec.get("status"), rec.get("reason"), rec.get("problems"))
+        self.assertEqual(codes["unexpected pre-filled field"], ("aborted_mismatch", None, ["unexpected_field:?"]))
+        self.assertEqual(codes["coach pre-selected"], ("aborted_mismatch", None, ["coach_preselected"]))
+        self.assertEqual(codes["different date"][2], ["page_mismatch:time"])
+        self.assertEqual(codes["unclear (network)"][:2], ("unclear", "not_listed_after:network_error"))
+        self.assertEqual(codes["refused twice"][:2], ("failed", "two_courts_refused"))
+        self.assertEqual(codes["unreadable booking"][:2], (None, "existing_booking_unreadable"))
+
+    def test_dry_run_and_interrupted_records_are_clean_too(self):
+        self.run_mode("dry_run")
+        self.assert_state_clean("dry run")
+        self.setUp()
+        self.site.on_post = lambda n: (_ for _ in ()).throw(KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_mode("live")
+        self.site.on_post = None
+        self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
+        self.run_mode("live")
+        self.assertEqual(self.assert_state_clean("interrupted")[autobook.LIVE_KEY][self.key]["status"], "interrupted")
+
+class TestDashboardMode(AutobookTestCase):
+    def test_every_run_writes_the_mode_it_uses(self):
+        for mode, want in ((None, "off"), ("off", "off"), ("dry_run", "dry_run"), ("live", "live"), ("bogus", "off")):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.run_mode(mode)
+                self.assertEqual(self.state()["autobook_mode"], want)
+
+    def test_a_run_that_stops_early_still_writes_it(self):
+        self.write_config([])
+        self.run_mode("live")
+        self.assertEqual(self.state()["autobook_mode"], "live")
+
+
+class TestDashboardWording(unittest.TestCase):
+    """No JS test runner here: pin the dashboard's per-mode wording to the
+    mode values the monitor writes (npm run build type-checks the rest)."""
+
+    def test_each_mode_has_its_wording_and_unknown_is_cautious(self):
+        src = (Path(__file__).resolve().parent / "app" / "Dashboard.tsx").read_text(encoding="utf-8")
+        for text in ("starred — notify only (auto-book off)",
+                     "starred — dry run (emails what it would book, books nothing)",
+                     "AUTO-BOOK — books with Wallet when it opens"):
+            self.assertIn(text, src)
+        self.assertNotIn("paused", src.lower(), "no fixed 'paused' text left")
+        view = src[src.index("function modeView"):src.index("const DANGER")]
+        self.assertIn('return m === "off" || m === "dry_run" || m === "live" ? m : "unknown"', view)
+        default = src[src.index("    default:", src.index("function modeText")):]
+        self.assertIn("bannerClass: DANGER", default[:800], "unknown mode looks like live")
+        live = src[src.index('    case "live":'):src.index("    default:", src.index("function modeText"))]
+        self.assertIn("DANGER", live)
+        types = (Path(__file__).resolve().parent / "lib" / "types.ts").read_text(encoding="utf-8")
+        self.assertIn('export type AutobookMode = "off" | "dry_run" | "live"', types)
+        self.assertEqual(set(autobook.MODES), {"off", "dry_run", "live"})
+
+
+class TestStateFile(AutobookTestCase):
+    def test_save_is_atomic_when_interrupted(self):
+        self.state_file.write_text(json.dumps({"known_open": {"old": True}}))
+        for where_ in ("fsync", "replace"):
+            with self.subTest(where_), mock.patch.object(monitor.os, where_,
+                                                         side_effect=KeyboardInterrupt("killed")), \
+                 mock.patch.object(monitor, "STATE_FILE", self.state_file), self.assertRaises(KeyboardInterrupt):
+                monitor.save_state({"known_open": {"new": True}, "big": "x" * 100000})
+            self.assertEqual(json.loads(self.state_file.read_text()), {"known_open": {"old": True}})
+            self.assertEqual([p.name for p in self.dir.glob(".state.json.*")], [], "temp file cleaned up")
+
+    def test_kill_9_mid_write_leaves_a_readable_state(self):
+        # A real process killed (os._exit: no cleanup at all) between writing
+        # the temp file and the rename. state.json must still be the old one.
+        self.state_file.write_text(json.dumps({"known_open": {"old": True}}))
+        script = (
+            "import os, sys, json; sys.path.insert(0, sys.argv[1]); import monitor; from pathlib import Path\n"
+            "monitor.STATE_FILE = Path(sys.argv[2])\n"
+            "real_fsync = os.fsync\n"
+            "def die(fd):\n    real_fsync(fd); os._exit(9)\n"
+            "os.fsync = die\n"
+            "monitor.save_state({'known_open': {'new': True}, 'big': 'x' * 1000000})\n")
+        r = subprocess.run([sys.executable, "-c", script, str(Path(__file__).resolve().parent), str(self.state_file)],
+                           capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 9)
+        self.assertEqual(monitor.json.loads(self.state_file.read_text()), {"known_open": {"old": True}})
+        with mock.patch.object(monitor, "STATE_FILE", self.state_file):
+            self.assertEqual(monitor.load_state(), {"known_open": {"old": True}})
+
+    def test_unreadable_state_halts_auto_book_but_keeps_notifying(self):
+        for broken in ("{not json", "[1, 2]", "\x00\x01garbage"):
+            with self.subTest(broken=broken):
+                self.setUp()
+                self.state_file.write_text(broken)
+                code, sent = self.run_mode("live")
+                self.assertEqual([s["path"] for s in self.site.sent], ["/booking"], "no auto-book requests at all")
+                self.assertEqual(self.subjects(sent)[0], monitor.STATE_UNREADABLE_SUBJECT)
+                self.assertTrue(self.subjects(sent)[1].startswith("🎾"), "notify-only still works")
+                self.assertIn(monitor.AUTOBOOK_PAUSED_NOTE, sent[1]["body"])
+                state = self.state()
+                self.assertEqual(state["autobook_halted"]["reason"], "state_unreadable")
+                self.assertEqual(state["autobook_mode"], "off")
+                self.assertTrue(list(self.dir.glob("state.json.unreadable-*")), "the unreadable file is kept")
+                # Later runs: still halted, no second 🔴 email, still no auto-book requests.
+                self.site.sent.clear()
+                self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
+                code, sent = self.run_mode("live")
+                self.assertEqual([s["path"] for s in self.site.sent], ["/booking"])
+                self.assertNotIn(monitor.STATE_UNREADABLE_SUBJECT, self.subjects(sent))
+
+    def test_the_session_lost_cli_also_survives_an_unreadable_state(self):
+        self.state_file.write_text("{oops")
+        sent = []
+        with mock.patch.dict(os.environ, EMAIL_ENV, clear=True), \
+             mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
+             mock.patch.object(monitor, "STATE_FILE", self.state_file), \
+             mock.patch.object(monitor, "send_email", side_effect=lambda s, b, *a: sent.append(s)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = monitor.main(["--alert-session-lost", "push failed"])
+        self.assertEqual(code, monitor.EXIT_JAR)
+        self.assertEqual(sent, [monitor.STATE_UNREADABLE_SUBJECT, "🔴 Bot session likely lost — reseed needed"])
+        self.assertIn("autobook_halted", self.state())
+
+    def test_halt_email_is_retried_until_it_is_sent(self):
+        self.state_file.write_text("{oops")
+        code, sent = self.run_mode("live", fail_subjects=("🔴 state.json",))
+        self.assertNotIn(monitor.STATE_UNREADABLE_SUBJECT, self.subjects(sent))
+        code, sent = self.run_mode("live")
+        self.assertEqual(self.subjects(sent).count(monitor.STATE_UNREADABLE_SUBJECT), 1)
+        code, sent = self.run_mode("live")
+        self.assertNotIn(monitor.STATE_UNREADABLE_SUBJECT, self.subjects(sent))
+
+    def test_removing_the_halt_resumes_auto_book(self):
+        self.state_file.write_text("{oops")
+        self.run_mode("live")
+        state = self.state()
+        del state["autobook_halted"]
+        state["known_open"] = {}
+        self.state_file.write_text(json.dumps(state))
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+
+    def test_a_missing_state_file_is_just_a_fresh_start(self):
+        self.assertFalse(self.state_file.exists())
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        self.assertNotIn("autobook_halted", self.state())
+        self.assertEqual(len(self.site.posts_sent()), 1)
+
+
+class TestClashUsesTimeRanges(AutobookTestCase):
+    def test_overlaps(self):
+        d = "2026-11-15"
+        yes = [((d, "22:00", "24:00"), (d, "23:00", "24:00")), ((d, "23:30", "00:30"), (d, "23:00", "24:00")),
+               ((d, "21:00", "23:30"), (d, "23:00", "24:00")), ((d, "23:00", "24:00"), (d, "23:00", "24:00"))]
+        no = [((d, "22:00", "23:00"), (d, "23:00", "24:00")), (("2026-11-16", "23:00", "24:00"), (d, "23:00", "24:00")),
+              ((d, "06:00", "08:00"), (d, "23:00", "24:00"))]
+        for a, b in yes:
+            self.assertTrue(autobook.overlaps(a, b) and autobook.overlaps(b, a), (a, b))
+        for a, b in no:
+            self.assertFalse(autobook.overlaps(a, b) or autobook.overlaps(b, a), (a, b))
+
+    def test_a_two_hour_booking_covering_the_slot_blocks_it(self):
+        for label, arrange in (
+                ("upcoming 22:00-24:00", lambda: setattr(self.site, "upcoming", [self.p.upcoming_filled(time="22:00", end="24:00")])),
+                ("pending, own page 22:00-24:00", lambda: (self.site.details.__setitem__(OTHER, self.p.detail(OTHER, time="22:00", end="24:00")),
+                                                           setattr(self.site, "pending", [self.p.pending_with_ref(OTHER)])))):
+            with self.subTest(label):
+                self.setUp()
+                arrange()
+                code, sent = self.run_mode("live")
+                self.assertEqual(self.site.posts_sent(), [])
+                self.assertEqual(self.subjects(sent), [f"ℹ️ Already booked: {self.date} 23:00 — not auto-booking"])
+
+    def test_an_adjacent_booking_does_not_block(self):
+        self.site.upcoming = [self.p.upcoming_filled(time="21:00", end="23:00")]
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+
+
+class TestErrorsNeverDropAnything(AutobookTestCase):
+    def test_result_email_that_fails_does_not_hide_the_slot_open_email(self):
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live", fail_subjects=("🟡",))
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        slot = [m for m in sent if m["subject"].startswith("🎾")]
+        self.assertEqual(len(slot), 1, "the result email failed, so the opening is still announced")
+        self.assertIn("23:00", slot[0]["body"])
+
+    def test_context_email_counts_only_sent_mail(self):
+        ctx = autobook.Context(None, {}, "live", send=mock.Mock(side_effect=OSError("smtp")), save_state=None,
+                               try_save_state=None, log=lambda m: None, locations={})
+        self.assertFalse(ctx.email("k", "🟢 x", "y"))
+        self.assertEqual(ctx.emailed_keys, set())
+
+    def test_a_crashing_auto_book_still_sends_the_slot_open_email(self):
+        for exc in (RuntimeError("bug"), KeyError("x"), bot_session.JarSaveError("disk full", [])):
+            with self.subTest(exc=type(exc).__name__):
+                self.setUp()
+                with mock.patch.object(autobook, "process", side_effect=exc):
+                    code, sent = self.run_mode("live")
+                self.assertEqual([m["subject"][:1] for m in sent], ["🎾"])
+                self.assertIn("23:00", sent[0]["body"])
+                known = self.state().get("known_open", {})
+                self.assertIn(monitor.slot_key(self.date, "LOC002", monitor.ANY_COURT, "23:00"), known)
+                if isinstance(exc, bot_session.JarSaveError):
+                    self.assertEqual(code, monitor.EXIT_ERROR, "the jar error still fails the run, after the email")
+
+    def test_an_opening_whose_email_failed_alerts_again(self):
+        code, sent = self.run_mode("off", fail_subjects=("🎾",))
+        self.assertEqual(self.state().get("known_open", {}), {}, "not marked known: its email didn't go out")
+        code, sent = self.run_mode("off")
+        self.assertEqual(len([m for m in sent if m["subject"].startswith("🎾")]), 1)
+        code, sent = self.run_mode("off")
+        self.assertEqual(sent, [], "and only once it went out is it known")
+
+    def test_write_ahead_does_not_persist_an_unannounced_opening(self):
+        k = monitor.slot_key(self.date, "LOC002", monitor.ANY_COURT, "23:00")
+
+        def die(_n):
+            self.assertNotIn(k, json.loads(self.state_file.read_text()).get("known_open", {}))
+            raise KeyboardInterrupt()
+        self.site.on_post = die
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_mode("live")
+
+    def test_a_skipped_candidate_at_one_location_does_not_block_the_other(self):
+        # 23:00 at Crystal Sports was already open (and alerted) before auto-book
+        # was switched on; now 23:00 opens at Crystal Sports G.
+        self.write_config([target(self.date, [("23:00", True)], locations=("LOC001", "LOC002"))])
+        self.state_file.write_text(json.dumps({"known_open": {
+            monitor.slot_key(self.date, "LOC001", monitor.ANY_COURT, "23:00"): True}}))
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        self.assertEqual(self.record()["loc"], "LOC002")
+
+    def two_starred(self):
+        self.write_config([target(self.date, [("22:00", True), ("23:00", True)], locations=("LOC002",))])
+        self.site.grid["LOC002"] = self.p.grid_with_2200_open()
+        return autobook.key_for(self.date, "22:00"), self.key
+
+    def test_session_stop_puts_every_remaining_candidate_into_retries(self):
+        k22, k23 = self.two_starred()
+        self.site.pending = [login_redirect()]
+        code, sent = self.run_mode("live")
+        self.assertEqual(code, monitor.EXIT_SESSION)
+        retries = self.state()[autobook.RETRY_KEY]
+        self.assertEqual({k: v["reason"] for k, v in retries.items()}, {k22: "session_stopped", k23: "session_stopped"})
+        self.assertEqual(self.state().get(autobook.LIVE_KEY, {}), {})
+
+    def test_jar_save_error_before_any_post_is_retried_next_run(self):
+        k22, k23 = self.two_starred()
+        real_save = bot_session.save_jar
+        calls = {"n": 0}
+
+        def save(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 3:   # grid, (pending) -> fails on the auto-book's first list read
+                raise OSError("disk full")
+            return real_save(*a, **kw)
+        with mock.patch.object(bot_session, "save_jar", side_effect=save):
+            code, sent = self.run_mode("live")
+        self.assertEqual(code, monitor.EXIT_ERROR)
+        self.assertEqual(self.site.posts_sent(), [])
+        retries = self.state()[autobook.RETRY_KEY]
+        self.assertEqual({k: v["reason"] for k, v in retries.items()}, {k22: "jar_save_error", k23: "jar_save_error"})
+        self.assertEqual(self.state().get(autobook.LIVE_KEY, {}), {}, "no final outcome: nothing was submitted")
+        self.assertTrue(any(m["subject"].startswith("🎾") for m in sent), "the slot-open email still went out")
+        # Next run (the jar saves again): the retried keys are booked although no longer newly open.
+        self.site.sent.clear()
+        # (The fake site serves only the 23:00 slot page, so 22:00 stops at the
+        # slot-page check; what matters is that both are attempted again.)
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        self.assertEqual(self.record(k23)["status"], "parked")
+        self.assertEqual(self.record(k22)["status"], "aborted_mismatch")
+        self.assertEqual(self.state().get(autobook.RETRY_KEY, {}), {})
+
+    def test_jar_save_error_after_the_post_is_unclear_and_never_retried(self):
+        real_save = bot_session.save_jar
+        posted = {"yes": False}
+
+        def on_post(_n):
+            posted["yes"] = True
+        self.site.on_post = on_post
+        self.site.posts = [parked_redirect()]
+
+        def save(*a, **kw):
+            if posted["yes"]:
+                raise OSError("disk full")
+            return real_save(*a, **kw)
+        with mock.patch.object(bot_session, "save_jar", side_effect=save):
+            code, sent = self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        self.assertEqual(self.record()["status"], "unclear")
+        self.assertNotIn(self.key, self.state().get(autobook.RETRY_KEY, {}))
+        self.assertTrue(any(m["subject"].startswith("🟠") for m in sent))
+        self.site.sent.clear()
+        self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
+        self.run_mode("live")
+        self.assertEqual(self.site.posts_sent(), [])
 
 
 class TestPostIsImpossibleElsewhere(unittest.TestCase):

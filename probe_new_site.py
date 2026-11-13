@@ -116,7 +116,7 @@ def probe_once(jar, loc, date):
     diag.append(f"cloudflare: cf-ray {'present' if 'CF-RAY' in resp.headers else 'absent'}, "
                 f"cf-mitigated={resp.headers.get('cf-mitigated', '(none)')}")
     if result["page"] and result["page"]["title"]:
-        diag.append(f"title:      {result['page']['title']}")
+        diag.append(f"title:      {len(result['page']['title'])} chars (text not logged: the log is public)")
     challenge_hits = [m for m in CHALLENGE_BODY_MARKERS if m in body_lower]
     if resp.headers.get("cf-mitigated"):
         challenge_hits.insert(0, f"cf-mitigated: {resp.headers['cf-mitigated']}")

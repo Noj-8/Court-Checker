@@ -567,7 +567,8 @@ class TestSessionFailures(MonitorTestCase):
         broken = ok(GRID_EN, set_cookies=[rotate]) + (requests.exceptions.ChunkedEncodingError("connection reset mid-body"),)
         code, out, adapter, sent = self.run_monitor([broken, ok(GRID_EN)], iterations=2)
         self.assertEqual(code, monitor.EXIT_OK)
-        self.assertIn("connection reset mid-body", out)
+        self.assertIn("network: ChunkedEncodingError", out)
+        self.assertNotIn("connection reset mid-body", out, "exception messages (may carry a URL) aren't logged")
         on_disk = {r["name"]: r["value"] for r in json.loads(self.jar.read_text())["cookies"]}
         self.assertEqual(on_disk["cs.member"], MEMBER_NEW)
         self.assertIn(("cs.member", MEMBER_NEW), adapter.sent[1]["cookies"])
@@ -592,7 +593,13 @@ class TestSessionFailures(MonitorTestCase):
 
     def test_rotation_that_cannot_be_saved_is_session_likely_lost(self):
         rotate = f"cs.member={MEMBER_NEW}; path=/; secure"
-        with mock.patch.object(bot_session.os, "replace", side_effect=OSError("disk full")):
+        real_replace = os.replace
+
+        def replace(src, dst):  # only the jar's disk is full: state.json (also atomic now) still saves
+            if Path(dst) == self.jar:
+                raise OSError("disk full")
+            return real_replace(src, dst)
+        with mock.patch.object(bot_session.os, "replace", side_effect=replace):
             code, out, adapter, sent = self.run_monitor([ok(GRID_EN, set_cookies=[rotate]), ok()], iterations=2)
         self.assertEqual(code, monitor.EXIT_JAR)
         self.assertEqual(len(adapter.sent), 1, "nothing may be sent after a failed save")

@@ -3,11 +3,70 @@
 import { useState, useEffect, useMemo } from "react"
 import type { ReactNode } from "react"
 import { signOut } from "next-auth/react"
-import type { Config, State, Target, LocId, TimeSlot } from "@/lib/types"
+import type { Config, State, Target, LocId, TimeSlot, AutobookMode } from "@/lib/types"
 import { LOCATIONS, ALL_TIMES } from "@/lib/types"
 
 const BOOKING_URL = "https://crystalsports-booking.kegroup.co.th/booking"
 const STALE_AFTER_MINUTES = 10
+
+// What starring means right now, from the mode the monitor's latest run
+// reported in state.json. No mode reported yet ("unknown") gets the
+// cautious, live-style wording: assume it may book.
+type ModeView = AutobookMode | "unknown"
+
+function modeView(state: State): ModeView {
+  const m = state.autobook_mode
+  return m === "off" || m === "dry_run" || m === "live" ? m : "unknown"
+}
+
+const DANGER = "bg-claylight text-clay border border-clay/30"
+const CAUTION = "bg-amberlight text-amber border border-amber/20"
+
+function modeText(mode: ModeView, halted: boolean) {
+  switch (mode) {
+    case "off":
+      return {
+        banner: halted
+          ? "Auto-book is HALTED: state.json was found unreadable, so the monitor books nothing until the " +
+            "\"autobook_halted\" entry is removed from state.json. Starred times get a normal alert — book manually."
+          : "Auto-book is off. Starred times get a normal alert — book manually.",
+        bannerClass: CAUTION,
+        label: "starred — notify only (auto-book off)",
+        labelClass: "bg-amberlight text-amber",
+        star: "Starred — notify only (auto-book off)",
+      }
+    case "dry_run":
+      return {
+        banner:
+          "Auto-book is in DRY RUN: for starred times it checks everything and emails what it would book, " +
+          "but books nothing. Starred times still get a normal alert — book manually.",
+        bannerClass: CAUTION,
+        label: "starred — dry run (emails what it would book, books nothing)",
+        labelClass: "bg-amberlight text-amber",
+        star: "Starred — dry run (emails what it would book, books nothing)",
+      }
+    case "live":
+      return {
+        banner:
+          "Auto-book is LIVE: starred times are booked automatically and paid from your Wallet as soon as " +
+          "they open. To stop it, set the AUTOBOOK_MODE repository variable to off.",
+        bannerClass: DANGER,
+        label: "AUTO-BOOK — books with Wallet when it opens",
+        labelClass: `${DANGER} font-semibold`,
+        star: "AUTO-BOOK — books with Wallet when it opens",
+      }
+    default:
+      return {
+        banner:
+          "Auto-book mode unknown — the monitor hasn't reported it yet. Assume starred times may be booked " +
+          "automatically and paid from your Wallet as soon as they open.",
+        bannerClass: DANGER,
+        label: "AUTO-BOOK (mode unknown) — may book with Wallet when it opens",
+        labelClass: `${DANGER} font-semibold`,
+        star: "AUTO-BOOK (mode unknown) — may book with Wallet when it opens",
+      }
+  }
+}
 
 type Props = {
   initialConfig: Config
@@ -24,6 +83,8 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
   const [savingMsg, setSavingMsg] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(loadError)
   const [now, setNow] = useState(() => Date.now())
+  const mode = modeView(state)
+  const modeInfo = modeText(mode, !!state.autobook_halted)
 
   // Tick clock so "last check: X min ago" stays fresh
   useEffect(() => {
@@ -201,15 +262,18 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
             )}
           </div>
 
-          <p className="mb-5 px-4 py-3 bg-amberlight border border-amber/20 rounded-lg text-sm text-amber leading-relaxed">
-            Auto-book is paused while it's rebuilt for the new Crystal Sports site. Starred slots send a
-            normal alert — book manually.
+          <p
+            className={`mb-5 px-4 py-3 rounded-lg text-sm leading-relaxed ${modeInfo.bannerClass}`}
+            data-autobook-mode={mode}
+          >
+            {modeInfo.banner}
           </p>
 
           {/* ADD FORM */}
           {showAdd && (
             <TargetForm
               initial={null}
+              mode={mode}
               onSubmit={(t) => upsertTarget(t, null)}
               onCancel={() => setShowAdd(false)}
             />
@@ -235,6 +299,7 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
                     <TargetForm
                       key={idx}
                       initial={t}
+                      mode={mode}
                       onSubmit={(updated) => upsertTarget(updated, idx)}
                       onCancel={() => setEditingIndex(null)}
                     />
@@ -244,6 +309,7 @@ export default function Dashboard({ initialConfig, initialState, loadError, user
                   <TargetRow
                     key={idx}
                     target={t}
+                    mode={mode}
                     openCount={openByTargetIndex.get(idx) || 0}
                     onEdit={() => setEditingIndex(idx)}
                     onDelete={() => deleteTarget(idx)}
@@ -326,11 +392,13 @@ function Stat({ label, value, accent = false }: { label: string; value: number; 
 
 function TargetRow({
   target,
+  mode,
   openCount,
   onEdit,
   onDelete,
 }: {
   target: Target
+  mode: ModeView
   openCount: number
   onEdit: () => void
   onDelete: () => void
@@ -344,6 +412,7 @@ function TargetRow({
       ? target.times.map((t) => t.time).join(", ")
       : `${target.times[0].time}–${target.times[target.times.length - 1].time} (${target.times.length} slots)`
   const starredTimes = target.times.filter((t) => t.autoBook).map((t) => t.time)
+  const modeInfo = modeText(mode, false)
 
   return (
     <div className="bg-white border border-line rounded-xl p-4 flex items-center justify-between gap-4 hover:border-line2 transition-colors">
@@ -357,9 +426,9 @@ function TargetRow({
             {starredTimes.map((t) => (
               <span
                 key={t}
-                className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amberlight text-amber text-[11px] font-medium rounded tabular"
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium rounded tabular ${modeInfo.labelClass}`}
               >
-                ★ {t} starred (auto-book paused — notify only)
+                ★ {t} {modeInfo.label}
               </span>
             ))}
           </div>
@@ -403,10 +472,12 @@ function TargetRow({
 
 function TargetForm({
   initial,
+  mode,
   onSubmit,
   onCancel,
 }: {
   initial: Target | null
+  mode: ModeView
   onSubmit: (t: Target) => void
   onCancel: () => void
 }) {
@@ -418,6 +489,7 @@ function TargetForm({
     initial?.locations || ["LOC001", "LOC002"],
   )
   const [times, setTimes] = useState<TimeSlot[]>(initial?.times || [])
+  const modeInfo = modeText(mode, false)
   const [submitting, setSubmitting] = useState(false)
 
   function toggleLoc(loc: LocId) {
@@ -597,15 +669,13 @@ function TargetForm({
                     }}
                     className={`absolute -top-1.5 -right-1.5 w-4 h-4 flex items-center justify-center rounded-full text-[10px] leading-none transition-colors ${
                       starred
-                        ? "bg-amber text-canvas"
+                        ? mode === "live" || mode === "unknown"
+                          ? "bg-clay text-canvas"
+                          : "bg-amber text-canvas"
                         : "bg-white text-ink3 border border-line hover:border-line2"
                     }`}
                     aria-label={starred ? `Unstar ${t}` : `Star ${t}`}
-                    title={
-                      starred
-                        ? "Starred (auto-book paused — notify only)"
-                        : "Not starred — click to star (auto-book paused — notify only)"
-                    }
+                    title={starred ? modeInfo.star : `Not starred — click to star (${modeInfo.star})`}
                   >
                     {starred ? "★" : "☆"}
                   </span>
@@ -616,7 +686,7 @@ function TargetForm({
           })}
         </div>
         <p className="text-xs text-ink3 mt-2">
-          Click a time to include it · click its star to mark it starred (auto-book paused — starred slots get a normal alert)
+          Click a time to include it · click its star to mark it starred: {modeInfo.star}
         </p>
       </div>
 

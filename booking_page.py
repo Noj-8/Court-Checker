@@ -379,18 +379,25 @@ DATE_RES = (
 )
 
 
+def _range_of(text):
+    """('HH:MM', 'HH:MM') start and end of the first time range in the text."""
+    r = ROW_RANGE_RE.search(text or "")
+    return (f"{int(r[1]):02d}:{r[2]}", f"{int(r[3]):02d}:{r[4]}") if r else None
+
+
 def _play_slot(text):
-    """('YYYY-MM-DD', 'HH:MM') if the text shows a played date AND a time
-    RANGE ("Sun 15 Nov 2026 · 23:00 – 24:00"), else None. A bare time such
-    as the "Booked on 13 Nov 2026 11:23" cell is not a played slot."""
-    r = ROW_RANGE_RE.search(text)
-    if not r:
+    """('YYYY-MM-DD', 'HH:MM' start, 'HH:MM' end) if the text shows a played
+    date AND a time RANGE ("Sun 15 Nov 2026 · 23:00 – 24:00"), else None. A
+    bare time such as the "Booked on 13 Nov 2026 11:23" cell is not a
+    played slot."""
+    rng = _range_of(text)
+    if not rng:
         return None
     for rx, conv in DATE_RES:
         for m in rx.finditer(text):
             y, mo, d = conv(m)
             if mo:
-                return f"{y:04d}-{mo:02d}-{d:02d}", f"{int(r[1]):02d}:{r[2]}"
+                return (f"{y:04d}-{mo:02d}-{d:02d}",) + rng
     return None
 
 
@@ -418,16 +425,11 @@ def infer_play_date(day, month, today):
     return None
 
 
-def _start_of_range(text):
-    r = ROW_RANGE_RE.search(text or "")
-    return f"{int(r[1]):02d}:{r[2]}" if r else None
-
-
 def parse_bookings_list(html, today=None):
     """/bookings (Upcoming) or /bookings?tab=pending (Awaiting payment).
     Returns {"tab", "rows": [{ref, status, text, slot, loc_name, court}],
-    "empty", "recognised"}. slot is ('YYYY-MM-DD', 'HH:MM' start) when the
-    row shows the played day and time:
+    "empty", "recognised"}. slot is ('YYYY-MM-DD', 'HH:MM' start, 'HH:MM'
+    end) when the row shows the played day and time range:
       - Upcoming rows (seen live 2026-11-13): a.booking-item with
         <div class="booking-date"><b>15</b><span>Nov</span></div> (no year:
         see infer_play_date), "23:00–24:00 · G South-1" and
@@ -457,10 +459,10 @@ def parse_bookings_list(html, today=None):
             day = FIRST_INT.search(day_el.text()) if day_el is not None else None
             month = MONTHS.get((mon_el.text() if mon_el is not None else "")[:3].lower())
             head = row.find("div", "fw-700")
-            start = _start_of_range(head.text() if head is not None else "")
+            rng = _range_of(head.text() if head is not None else "")
             played = infer_play_date(int(day.group(0)), month, today) if day and month else None
-            if played and start:
-                slot = (played.isoformat(), start)
+            if played and rng:
+                slot = (played.isoformat(),) + rng
             if head is not None and " · " in head.text():
                 court = head.text().split(" · ", 1)[1].strip()
             sub = row.find("div", "text-muted")
@@ -479,7 +481,7 @@ def parse_booking_detail(html):
     2026-11-13). Returns {"ref", "status", "lines": [{loc_name, court,
     slot}]} where each card.bk-group is one court booked: its title
     "Crystal Sports G · G South-1" and "Sun 15 Nov 2026 · 23:00–24:00"
-    (slot = ('2026-11-15', '23:00'), None if unreadable). The page also
+    (slot = ('2026-11-15', '23:00', '24:00'), None if unreadable). The page also
     has a cancel form; nothing here ever submits anything."""
     root = dom(html)
     h1 = root.find("h1", "section-title")

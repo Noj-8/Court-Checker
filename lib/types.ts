@@ -2,8 +2,8 @@ export type LocId = "LOC001" | "LOC002"
 
 export type TimeSlot = {
   time: string                    // "20:00"
-  autoBook: boolean               // starred. Auto-book is PAUSED (AUTOBOOK_ENABLED = False in
-                                  // monitor.py): starred slots get a normal alert. Kept for stage 3.
+  autoBook: boolean               // starred (★): what auto-book may book, depending on the
+                                  // AUTOBOOK_MODE repo variable (see State.autobook_mode)
 }
 
 export type Target = {
@@ -38,7 +38,15 @@ export type SessionAlert = {
   jar_sha256: string | null       // sha256 prefix of the bot_session.enc it was sent for
 }
 
+// The mode the monitor's latest run actually used (AUTOBOOK_MODE, or "off"
+// while auto-book is halted). Absent until a stage-3 monitor has run.
+export type AutobookMode = "off" | "dry_run" | "live"
+
 export type State = {
+  autobook_mode?: AutobookMode
+  // Set when state.json was found unreadable: auto-book stays off until the
+  // owner removes this entry from state.json.
+  autobook_halted?: { reason: string; since: string; emailed_at?: string }
   last_check?: string             // ISO datetime of the last pass that READ a booking page
   currently_open_count?: number   // watched TIME SLOTS open right now (per time, not per court)
   known_open?: Record<string, true> // keys "YYYY-MM-DD|LOC00x|any|HH:MM" — one per open time slot

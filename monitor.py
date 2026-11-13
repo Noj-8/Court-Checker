@@ -58,11 +58,14 @@ apart (default 60), then exits. Designed for GitHub Actions cron */5.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import smtplib
 import sys
+import tempfile
 import time
+import traceback
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -119,6 +122,13 @@ def log(msg):
     bot_session.say(f"[{datetime.now(TZ):%Y-%m-%d %H:%M:%S}] {msg}")
 
 
+def where(e):
+    """An exception for the (public) log: its type and the innermost
+    file:line — never its message, which may carry page text or a URL."""
+    tb = traceback.extract_tb(e.__traceback__)
+    return f"{type(e).__name__} at {Path(tb[-1].filename).name}:{tb[-1].lineno}" if tb else type(e).__name__
+
+
 def normalize_times(times):
     """Accept either a legacy plain time string or a {time, autoBook} object
     per entry, and always return the latter. Lets old and new config.json
@@ -143,17 +153,47 @@ def load_config():
     return config
 
 
+class StateUnreadable(Exception):
+    """state.json exists but isn't a readable JSON object."""
+
+
 def load_state():
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    """{} if there is no state.json yet. Raises StateUnreadable if it exists
+    but can't be read: the caller must fail closed (it holds the auto-book
+    records that stop a slot being booked twice)."""
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        raise StateUnreadable(type(e).__name__) from None
+    if not isinstance(state, dict):
+        raise StateUnreadable(f"top level is {type(state).__name__}, not an object")
+    return state
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    """Atomic: written to a temp file in the same folder, fsynced, then
+    renamed over state.json. A crash at any point leaves either the old
+    file or the new one, never a half-written one."""
+    data = json.dumps(state, indent=2)
+    fd, tmp = tempfile.mkstemp(prefix=f".{STATE_FILE.name}.", suffix=".tmp", dir=STATE_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_FILE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    with contextlib.suppress(OSError):  # make the rename itself durable (not possible everywhere)
+        dfd = os.open(STATE_FILE.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
 
 def try_save_state(state):
@@ -164,7 +204,8 @@ def try_save_state(state):
         save_state(state)
         return True
     except Exception as e:
-        log(f"⚠ couldn't write {STATE_FILE.name}: {type(e).__name__}: {e}")
+        log(f"⚠ couldn't write {STATE_FILE.name}: {type(e).__name__}"
+            + (f" ({e.strerror})" if getattr(e, "strerror", None) else ""))
         return False
 
 
@@ -205,7 +246,7 @@ def fetch_availability(jar, date, loc_id):
     try:
         fetched = bot_session.fetch(jar, BOOKING_PATH, params)
     except requests.RequestException as e:
-        return "error", None, f"network: {e}", {}
+        return "error", None, f"network: {type(e).__name__}", {}
     resp = fetched.resp
     if fetched.login:
         return "login", None, resp.headers.get("Location", ""), {}
@@ -220,12 +261,12 @@ def fetch_availability(jar, date, loc_id):
         if page["not_open_yet"]:
             return "not_open_yet", {}, page["opens_at"], {}
         return "error", None, (f"unexpected page — no slot grid and no opens-at marker "
-                               f"({len(body)} bytes, title {page['title']!r}); skipped"), {}
+                               f"({len(body)} bytes); skipped"), {}
     times = [slot_time(s["time"]) for s in page["slots"]]
     unreadable = [s["time"] for s, t in zip(page["slots"], times) if t is None]
     if unreadable:
-        return "error", None, (f"unexpected page — slot time(s) not readable unambiguously: "
-                               f"{', '.join(repr(u) for u in unreadable[:5])}; skipped"), {}
+        return "error", None, (f"unexpected page — {len(unreadable)} slot time(s) not readable "
+                               "unambiguously; skipped"), {}
     if len(set(times)) != len(times):
         return "error", None, "unexpected page — the same slot time appears twice; skipped", {}
     open_times, links = {}, {}
@@ -264,7 +305,7 @@ def alert_session(state, kind, detail, jar_fp, email):
     try:
         send_email(subject, body, *email)
     except Exception as e:
-        log(f"⚠ session email failed: {e}")
+        log(f"⚠ session email failed: {type(e).__name__}")
         return
     state["session_alert"] = {"kind": kind, "sent_at": datetime.now(TZ).isoformat(), "jar_sha256": jar_fp}
     log("✉ session email sent")
@@ -332,7 +373,8 @@ def run_check_pass(state, config, jar, email, mode="off"):
                 k = slot_key(target["date"], loc, ANY_COURT, t)
                 currently_open.add(k)
                 if k not in known_open:
-                    known_open[k] = True
+                    # Added to known_open only once its email has gone out (or
+                    # an auto-book result email replaced it): see below.
                     new_alerts.append({
                         "target": target["name"], "date": target["date"], "loc_id": loc,
                         "loc": LOCATIONS.get(loc, loc), "time": t, "free": open_times[t],
@@ -359,33 +401,51 @@ def run_check_pass(state, config, jar, email, mode="off"):
     state["currently_open_count"] = len(currently_open)
     log(f"  currently open across watchlist: {len(currently_open)}")
 
-    status, booked_keys = "ok", set()
+    status, booked_keys, jar_error = "ok", set(), None
     if mode in ("dry_run", "live"):
-        new_keys = {slot_key(a["date"], a["loc_id"], ANY_COURT, a["time"]) for a in new_alerts}
-        candidates = []
-        for target in active:
-            for loc in target["locations"]:
-                links = slot_links.get((target["date"], loc), {})
-                for t in sorted(x["time"] for x in target["times"] if x["autoBook"]):
-                    if t in (cache.get((target["date"], loc)) or {}) and links.get(t):
-                        candidates.append({"date": target["date"], "time": t, "loc": loc,
-                                           "loc_name": LOCATIONS.get(loc, loc), "href": links[t],
-                                           "newly_open": slot_key(target["date"], loc, ANY_COURT, t) in new_keys})
-        ctx = autobook.Context(jar, state, mode, send=lambda subj, body: send_email(subj, body, *email),
-                               save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS)
+        ctx = None
         try:
+            new_keys = {slot_key(a["date"], a["loc_id"], ANY_COURT, a["time"]) for a in new_alerts}
+            candidates = []
+            for target in active:
+                for loc in target["locations"]:
+                    links = slot_links.get((target["date"], loc), {})
+                    for t in sorted(x["time"] for x in target["times"] if x["autoBook"]):
+                        if t in (cache.get((target["date"], loc)) or {}) and links.get(t):
+                            candidates.append({"date": target["date"], "time": t, "loc": loc,
+                                               "loc_name": LOCATIONS.get(loc, loc), "href": links[t],
+                                               "newly_open": slot_key(target["date"], loc, ANY_COURT, t) in new_keys})
+            ctx = autobook.Context(jar, state, mode, send=lambda subj, body: send_email(subj, body, *email),
+                                   save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS)
             autobook.process(ctx, candidates)
         except autobook.SessionStopped:
             log("      🔴 login redirect during auto-book — bot session expired, stopping")
             status = "login"
+        except bot_session.JarSaveError as e:
+            jar_error = e  # re-raised after the slot-open email below
+        except Exception as e:
+            # A bug in auto-book must never cost the slot-open email.
+            log(f"      ⚠ auto-book failed ({where(e)}) — the slot-open email still goes out")
         # In live mode a starred slot whose result email went out isn't repeated in the "slot open" email.
-        booked_keys = ctx.emailed_keys if mode == "live" else set()
+        if mode == "live" and ctx is not None:
+            booked_keys = ctx.emailed_keys
+    for a in new_alerts:
+        if a["starred"] and autobook.key_for(a["date"], a["time"]) in booked_keys:
+            known_open[slot_key(a["date"], a["loc_id"], ANY_COURT, a["time"])] = True  # its result email went out
     new_alerts = [a for a in new_alerts if not (a["starred"] and autobook.key_for(a["date"], a["time"]) in booked_keys)]
 
     if not new_alerts:
         log("  no new openings this iteration")
-        return status
+    else:
+        send_slot_alert(new_alerts, known_open, email, mode)
+    if jar_error is not None:
+        raise jar_error
+    return status
 
+
+def send_slot_alert(new_alerts, known_open, email, mode):
+    """The 🎾 email. Only if it was sent do its openings go into known_open
+    (so a failed send alerts again on the next pass instead of never)."""
     log(f"🎾 {len(new_alerts)} NEW opening(s) detected")
     lines = [f"🎾 {len(new_alerts)} tennis slot(s) just opened up:\n"]
     by_target = {}
@@ -403,10 +463,13 @@ def run_check_pass(state, config, jar, email, mode="off"):
     lines.append(f"Book here: {BOOKING_URL}")
     try:
         send_email(f"🎾 {len(new_alerts)} tennis slot(s) open", "\n".join(lines), *email)
-        log("✉ alert email sent")
     except Exception as e:
-        log(f"⚠ alert email failed: {e}")
-    return status
+        log(f"⚠ alert email failed: {type(e).__name__} — these openings will alert again next pass")
+        return False
+    for a in new_alerts:
+        known_open[slot_key(a["date"], a["loc_id"], ANY_COURT, a["time"])] = True
+    log("✉ alert email sent")
+    return True
 
 
 def note_unreadable_pass(state, problems, email):
@@ -434,7 +497,7 @@ def note_unreadable_pass(state, problems, email):
     try:
         send_email("🔴 Monitor can't read the booking site", body, *email)
     except Exception as e:
-        log(f"⚠ unreadable-site email failed: {e}")
+        log(f"⚠ unreadable-site email failed: {type(e).__name__}")
         return
     state["read_alert"] = {"sent_at": now.isoformat()}
     log("✉ unreadable-site email sent")
@@ -461,13 +524,69 @@ def current_jar_path():
     return bot_session.ENC_FILE if os.environ.get(bot_session.JAR_KEY_ENV, "").strip() else bot_session.JAR_FILE
 
 
+STATE_UNREADABLE_SUBJECT = "🔴 state.json unreadable — auto-book halted"
+
+
+def recover_unreadable_state(reason):
+    """state.json exists but can't be read. It holds the auto-book records
+    ("never book this date+time twice"), so auto-book is halted — and stays
+    halted until the owner removes "autobook_halted" from state.json — while
+    notify-only carries on from a fresh state. The unreadable file is kept
+    beside it (on the runner; the workflow commits only state.json)."""
+    now = datetime.now(TZ)
+    kept = STATE_FILE.with_name(f"{STATE_FILE.name}.unreadable-{now:%Y%m%d-%H%M%S}")
+    try:
+        os.replace(STATE_FILE, kept)
+        kept_name = kept.name
+    except OSError:
+        kept_name = None
+    log(f"🔴 {STATE_FILE.name} unreadable ({reason}) — auto-book HALTED; notify-only continues from a fresh state")
+    return {"autobook_halted": {"reason": "state_unreadable", "detail": reason, "since": now.isoformat(),
+                                "kept_as": kept_name}}
+
+
+def email_halt_once(state, email):
+    """The one 🔴 email for a halt (retried on later runs until it's sent)."""
+    halted = state["autobook_halted"]
+    if halted.get("emailed_at"):
+        return
+    kept = (f"The unreadable file was kept as {halted['kept_as']} on the runner (not committed)."
+            if halted.get("kept_as") else "The unreadable file couldn't be moved aside.")
+    body = (f"{STATE_FILE.name} couldn't be read ({halted.get('detail', halted.get('reason'))}). It holds the\n"
+            "auto-book records that stop a date+time being booked twice, so auto-book is HALTED:\n"
+            "no booking requests at all, whatever AUTOBOOK_MODE says.\n\n"
+            "Slot-open emails carry on (you may get one repeat for slots that are already open).\n"
+            f"{kept}\n\n"
+            "Check My bookings for anything booked recently:\n"
+            f"  {BASE}/bookings?tab=pending\n  {BASE}/bookings\n\n"
+            'To resume auto-book: remove the "autobook_halted" entry from state.json and push.\n')
+    try:
+        send_email(STATE_UNREADABLE_SUBJECT, body, *email)
+    except Exception as e:
+        log(f"⚠ state-unreadable email failed: {type(e).__name__}")
+        return
+    halted["emailed_at"] = datetime.now(TZ).isoformat()
+    log("✉ state-unreadable email sent")
+
+
 def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None):
     mode = autobook.mode_from_env(log)
     config = load_config()
     email = email_settings(config)
     if email is None:
         return EXIT_SETUP
-    state = load_state()
+    try:
+        state = load_state()
+    except StateUnreadable as e:
+        state = recover_unreadable_state(str(e))
+    halted = state.get("autobook_halted")
+    if halted:
+        email_halt_once(state, email)
+    if halted and mode != "off":
+        log(f"🔴 auto-book HALTED since {halted.get('since')} ({halted.get('reason')}) — running notify-only. "
+            'Remove "autobook_halted" from state.json to resume.')
+        mode = "off"
+    state["autobook_mode"] = mode  # what the dashboard shows: the mode this run actually uses
     state.pop("last_session_alert", None)  # the PHPSESSID-era throttle, replaced by session_alert
 
     try:
@@ -506,7 +625,7 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
             try_save_state(state)
             return EXIT_JAR
         except Exception as e:
-            log(f"⚠ iteration {i + 1} failed: {e}")
+            log(f"⚠ iteration {i + 1} failed: {where(e)}")
             status = "ok"
         state_saved = try_save_state(state)
         if status == "login":
@@ -532,7 +651,11 @@ def alert_session_lost(reason):
     email = email_settings(load_config())
     if email is None:
         return EXIT_SETUP
-    state = load_state()
+    try:
+        state = load_state()
+    except StateUnreadable as e:
+        state = recover_unreadable_state(str(e))
+        email_halt_once(state, email)
     alert_session(state, "lost", reason, bot_session.file_fingerprint(current_jar_path()), email)
     try_save_state(state)
     return EXIT_JAR

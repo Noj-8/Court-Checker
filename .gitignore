@@ -36,3 +36,7 @@ __pycache__/
 # Raw pages saved from the live booking site (personal data) — never commit.
 # Scrubbed copies for tests live in tests/fixtures/.
 fixtures_raw/
+
+# monitor.py's atomic state.json write (temp file) and an unreadable state.json kept aside
+.state.json.*.tmp
+state.json.unreadable-*

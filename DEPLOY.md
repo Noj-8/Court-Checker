@@ -90,9 +90,15 @@ Open <https://court-checker.vercel.app> and sign in with GitHub. You should see:
 - **Status bar:** "Active" if the monitor read a booking page in the last 10
   minutes, otherwise "Idle".
 - **Watch list:** your targets, each showing either "N times open" or
-  "Monitoring". Starred times are labelled *starred (auto-book paused — notify
-  only)*. That label (and the "Auto-book is paused" note) is fixed text in the
-  dashboard and doesn't show the real mode. See *Auto-book mode* below.
+  "Monitoring". Starred times are labelled by the auto-book mode the monitor
+  last reported (`autobook_mode` in `state.json`):
+  - *starred — notify only (auto-book off)*
+  - *starred — dry run (emails what it would book, books nothing)*
+  - **AUTO-BOOK — books with Wallet when it opens** (in red)
+
+  The banner above the list says the same. Until a monitor run has reported a
+  mode, the dashboard shows "mode unknown" with the cautious, red live-style
+  wording.
 - **Bot session:** one of
   - **OK**
   - **Needs reseed**, with the time it was detected (the steps open
@@ -129,7 +135,9 @@ Vercel, and deploy again.
 
 Auto-book is switched by the **`AUTOBOOK_MODE` repository variable** on
 GitHub (`off` / `dry_run` / `live`), not by anything in Vercel. The dashboard
-can't read or change it: it only edits which times are starred (★). To check
+can't change it, and needs no extra token permission to show it: it reads the
+mode the monitor writes to `state.json`. So a change appears after the next
+monitor run. The dashboard only edits which times are starred (★). To check
 or change the mode:
 
 ```bash

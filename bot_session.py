@@ -105,12 +105,25 @@ def remember_secret(value):
         _secrets.add(value)
 
 
+def ref_fp(ref):
+    """Short fingerprint of a booking ref — what logs and state.json carry
+    instead of the ref itself (both are public)."""
+    return hashlib.sha256(ref.encode()).hexdigest()[:12]
+
+
+# Booking refs (SPORTS-<digits>) and 18-digit payment/top-up refs never
+# reach the (public) Actions log: everything printed goes through redact().
+_REF_LOG_RE = re.compile(r"SPORTS-\d+")
+_PAYREF_LOG_RE = re.compile(r"(?<!\d)\d{18}(?!\d)")
+
+
 def redact(text):
     text = str(text)
     for value in sorted(_secrets, key=len, reverse=True):
         text = text.replace(value, "<redacted>")
         text = text.replace(quote(value, safe=""), "<redacted>")
-    return text
+    text = _REF_LOG_RE.sub(lambda m: f"ref:{ref_fp(m.group(0))}", text)
+    return _PAYREF_LOG_RE.sub(lambda m: f"payref:{ref_fp(m.group(0))}", text)
 
 
 def say(text=""):

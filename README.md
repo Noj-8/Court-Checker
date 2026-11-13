@@ -94,7 +94,9 @@ gh variable list                                # check what it is now
 ```
 
 Each run reads it once at the start, so a change applies from the next run
-(within about 5 minutes). The run's log shows `auto-book mode: …`.
+(within about 5 minutes). The run's log shows `auto-book mode: …`, and the
+run writes the mode it used to `state.json` (`autobook_mode`), which the
+dashboard shows.
 
 Start with `dry_run` and read a few 🧪 emails before switching to `live`.
 
@@ -103,8 +105,8 @@ Start with `dry_run` and read a few 🧪 emails before switching to `live`.
 1. **One booking per date + time, ever,** across both locations. If 20:00 is
    starred at both Crystal Sports and Crystal Sports G, it books only one.
 2. **Checks My bookings first,** both Upcoming and Awaiting payment. If you
-   already have a booking at that date and start time (any location, any
-   court), it doesn't book. Awaiting-payment rows don't show the court time,
+   already have a booking whose time overlaps that slot on that date (any
+   location, any court; a 22:00–24:00 booking covers 23:00), it doesn't book. Awaiting-payment rows don't show the court time,
    so it opens each one's own page (`/bookings/SPORTS-…`) to read it.
    Bookings at other times never block. If a booking's date/time can't be
    read at all, it plays safe: no booking that pass, one ℹ️ email, and it
@@ -134,10 +136,32 @@ A run that dies mid-booking is never retried: the next run sends 🟠 once.
 | 🟠 Unclear — check My bookings | A booking request was sent but the result couldn't be confirmed | **Check My bookings now.** It will not be retried. |
 | ℹ️ Already booked: … | You already have a booking at that date and time | Nothing |
 | ℹ️ Not auto-booking … — can't check your bookings | A booking's date/time couldn't be read, so it didn't risk a double booking | Book manually if you want it; it keeps trying quietly |
+| 🔴 state.json unreadable — auto-book halted | `state.json` (which holds the "already booked" records) couldn't be read. Auto-book is **halted**: no booking requests at all. Slot-open emails carry on | Check My bookings, then [resume](#if-auto-book-is-halted) |
 
-Each result is sent once per date + time. `state.json` is public, so it holds
-only a fingerprint of booking refs; the full ref and payment link are only in
-your emails.
+Each result is sent once per date + time. If a result email can't be sent,
+that time is included in the normal 🎾 email instead. A failure inside
+auto-book never stops the 🎾 email.
+
+`state.json` and the Actions logs are public. They hold only fixed reason
+codes, form field names and a short fingerprint of booking refs: no page text,
+field values, refs or court names. The full ref, the court and the payment
+link are only in your emails.
+
+### If auto-book is halted
+
+When `state.json` can't be read, the monitor keeps the bad copy aside on the
+runner, starts a fresh `state.json` with an `"autobook_halted"` entry, and
+sends one 🔴 email. Auto-book stays off, whatever `AUTOBOOK_MODE` says, and
+the dashboard banner says *HALTED*. To resume, check My bookings, then:
+
+```bash
+git pull --rebase
+python3 - <<'PY'
+import json; s = json.load(open("state.json")); s.pop("autobook_halted", None)
+json.dump(s, open("state.json", "w"), indent=2)
+PY
+git commit -am "Resume auto-book" && git push
+```
 
 ### Emergency: turn it off
 
