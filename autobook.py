@@ -93,7 +93,14 @@ TERMINAL = {"skipped_existing", "aborted_mismatch", "dry_run", "in_progress", "i
 
 
 class SessionStopped(Exception):
-    """A login redirect: the session is gone; the pass must stop."""
+    """A login redirect: the session is gone; the pass must stop.
+    `page` is the page type that redirected (bot_session.page_type: grid,
+    slot page, bookings, bookings (pending), booking detail, review,
+    confirm) and `how` is "redirect" or "login page (200)" — never a ref."""
+
+    def __init__(self, page="unknown", how="redirect"):
+        super().__init__(f"{page}: {how}")
+        self.page, self.how = page, how
 
 
 class Deferred(Exception):
@@ -226,13 +233,14 @@ def _get(ctx, path, params, label=None):
         f = bot_session.fetch(ctx.jar, path, params)
     except requests.RequestException as e:
         raise Deferred("network_error", f"network error ({type(e).__name__}) on {label}") from None
+    page = bot_session.page_type("GET", path, params)
     if f.login:
-        raise SessionStopped()
+        raise SessionStopped(page, "redirect")
     if f.resp.status_code != 200:
         raise Deferred(f"http_{int(f.resp.status_code)}", f"http {f.resp.status_code} on {label}")
     body = f.resp.text or ""
     if booking_page.is_login_page(body, f.resp.url):
-        raise SessionStopped()
+        raise SessionStopped(page, "login page (200)")
     return body
 
 
@@ -606,7 +614,7 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
     ctx.log(f"    POST /booking/confirm -> {attempt.get('http', '-')} ({hint})")
     ctx.try_save_state(ctx.state)
     if hint == "login":
-        raise SessionStopped()
+        raise SessionStopped("confirm", "redirect")
 
     # 7. verify
     lists = read_lists(ctx)

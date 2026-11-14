@@ -2064,6 +2064,87 @@ class TestWhenItFires(AutobookTestCase):
                 self.assertTrue(any(m["subject"].startswith("🎾") for m in sent), "the reopening is still alerted")
 
 
+LOGIN_PAGE_200 = '<html><body><form action="/account/login"><input type="password"></form></body></html>'
+
+
+class TestLoginRedirectNamesThePage(AutobookTestCase):
+    """When a login redirect ends a run, the log names the page TYPE that
+    redirected (grid / slot page / bookings / booking detail / review /
+    confirm) — never a ref or URL."""
+
+    OTHER = "SPORTS-900000000099"
+
+    def answer_with_login(self, matches, response=None):
+        """Serve `response` (default: a 302 to the login page) for the first
+        request `matches(method, path, query)` accepts; the rest as normal."""
+        real, hit = self.site.send, {"n": 0}
+
+        def send(request, **kw):
+            u = urlsplit(request.url)
+            q = dict(parse_qsl(u.query, keep_blank_values=True))
+            if not hit["n"] and matches(request.method, u.path, q):
+                hit["n"] += 1
+                self.site.sent.append({"method": request.method, "path": u.path, "query": q,
+                                       "url": request.url, "form": []})
+                return make_response(request, *(response or login_redirect()))
+            return real(request, **kw)
+        self.site.send = send
+        return hit
+
+    CASES = {
+        "grid": lambda m, p, q: p == "/booking" and q.get("time") == "0",
+        "bookings (pending)": lambda m, p, q: p == "/bookings" and q.get("tab") == "pending",
+        "bookings": lambda m, p, q: p == "/bookings" and "tab" not in q,
+        "booking detail": lambda m, p, q: p.startswith("/bookings/SPORTS-"),
+        "slot page": lambda m, p, q: p == "/booking" and q.get("time") not in (None, "0"),
+        "review": lambda m, p, q: p == "/booking/review",
+        "confirm": lambda m, p, q: m == "POST",
+    }
+
+    def run_case(self, page, response=None):
+        self.setUp()
+        if page == "booking detail":
+            self.site.pending = [self.p.pending_with_ref(self.OTHER)]
+            self.site.details[self.OTHER] = self.p.detail(self.OTHER, time="20:00")
+        hit = self.answer_with_login(self.CASES[page], response)
+        code, sent = self.run_mode("live")
+        self.assertEqual(hit["n"], 1, "the redirect was served where intended")
+        self.assertEqual(len(self.site.posts_sent()), int(page == "confirm"),
+                         "no POST unless the redirect answered the POST itself")
+        self.assertEqual(code, monitor.EXIT_SESSION)
+        return self.out
+
+    def test_each_page_type_that_redirects_is_named_in_the_log(self):
+        for page in self.CASES:
+            with self.subTest(page):
+                out = self.run_case(page)
+                if page == "grid":
+                    self.assertIn("🔴 login redirect on the grid page (", out)
+                else:
+                    self.assertIn(f"🔴 login redirect during auto-book on the {page} page (redirect)", out)
+                lines = [l for l in out.splitlines() if "🔴 login redirect" in l]
+                self.assertEqual(len(lines), 1, lines)
+                for secret in (REF, self.OTHER, *COOKIES.values()):
+                    self.assertNotIn(secret, out)
+
+    def test_a_login_page_served_as_200_is_named_too(self):
+        for page in ("bookings (pending)", "slot page", "review"):
+            with self.subTest(page):
+                out = self.run_case(page, (200, [("Content-Type", "text/html")], LOGIN_PAGE_200))
+                self.assertIn(f"🔴 login redirect during auto-book on the {page} page (login page (200))", out)
+
+    def test_page_type_classifies_every_allowed_request(self):
+        pt = bot_session.page_type
+        self.assertEqual(pt("GET", "/booking", {"date": "x", "loc": "LOC001", "time": "0", "sel": ""}), "grid")
+        self.assertEqual(pt("GET", "/booking", {"date": "x", "loc": "LOC001", "time": "23"}), "slot page")
+        self.assertEqual(pt("GET", "/booking/review", {"sel": "abc"}), "review")
+        self.assertEqual(pt("GET", "/bookings", {}), "bookings")
+        self.assertEqual(pt("GET", "/bookings", {"tab": "pending"}), "bookings (pending)")
+        self.assertEqual(pt("GET", f"/bookings/{REF}", {}), "booking detail")
+        self.assertEqual(pt("POST", "/booking/confirm"), "confirm")
+        self.assertEqual(pt("GET", "/somewhere-else"), "unknown")
+
+
 class TestPostIsImpossibleElsewhere(unittest.TestCase):
     def setUp(self):
         self.jar = bot_session.Jar(session=requests.Session(), path=Path("/nonexistent/never-written"))

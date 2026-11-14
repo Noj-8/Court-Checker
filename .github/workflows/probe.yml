@@ -7,6 +7,11 @@ name: Probe new booking site
 # superseded copy kills the session, so every change is committed back.
 on:
   workflow_dispatch:
+    inputs:
+      check_account:
+        description: "Also GET /bookings and /bookings?tab=pending after the first round (status + ok/login redirect only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write              # to commit the rotated bot_session.enc
@@ -40,12 +45,17 @@ jobs:
       - name: Run probe
         env:
           BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
+          CHECK_ACCOUNT: ${{ inputs.check_account }}
         run: |
           if [ -z "$BOT_JAR_KEY" ]; then
             echo "::error::BOT_JAR_KEY secret is not set."
             exit 1
           fi
-          python probe_new_site.py --repeat 4 --interval 300
+          if [ "$CHECK_ACCOUNT" = "true" ]; then
+            python probe_new_site.py --repeat 4 --interval 300 --check-account
+          else
+            python probe_new_site.py --repeat 4 --interval 300
+          fi
 
       - name: Save rotated bot session
         if: always()

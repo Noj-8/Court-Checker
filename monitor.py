@@ -394,7 +394,7 @@ def run_check_pass(state, config, jar, email, mode="off"):
         log(f"  → {LOCATIONS.get(loc, loc)} / {date}")
         kind, open_times, info, links = fetch_availability(jar, date, loc)
         if kind == "login":
-            log(f"      🔴 login redirect ({info}) — bot session expired, stopping")
+            log(f"      🔴 login redirect on the grid page ({info}) — bot session expired, stopping")
             clear_unreadable_streak(state)  # the session email takes over from here
             return "login"
         if kind == "error":
@@ -477,8 +477,8 @@ def run_check_pass(state, config, jar, email, mode="off"):
                                    save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS,
                                    note_attempt=note_run_attempt)
             autobook.process(ctx, candidates)
-        except autobook.SessionStopped:
-            log("      🔴 login redirect during auto-book — bot session expired, stopping")
+        except autobook.SessionStopped as e:
+            log(f"      🔴 login redirect during auto-book on the {e.page} page ({e.how}) — bot session expired, stopping")
             status = "login"
         except bot_session.JarSaveError as e:
             jar_error = e  # re-raised after the slot-open email below

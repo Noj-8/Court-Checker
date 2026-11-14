@@ -31,16 +31,24 @@ requests are strictly sequential.
                came back in English; parsing doesn't depend on it.
   Options:     --repeat N rounds (default 1), --interval SECONDS between
                rounds (default 300). --repeat 12 --interval 300 = one hour.
+               --check-account: after the first round's grids, also GET
+               /bookings and /bookings?tab=pending (the account pages
+               auto-book reads first) and print, for each, the status and
+               "ok" or "login redirect" — never page text or refs. Stops
+               at the first login redirect, like everything else.
   Exit code:   0  grid parsed for both locations in every round
-               1  at least one location/round returned no grid
+               1  at least one location/round returned no grid, or an
+                  account page (--check-account) wasn't ok
                2  no jar file yet and CS_DID or CS_MEMBER is missing
-               3  stopped on a login redirect (session no longer valid)
+               3  stopped on a login redirect (session no longer valid —
+                  or, with --check-account, an account page refused it)
                4  the jar file couldn't be read or written (incl. a wrong or
                   invalid BOT_JAR_KEY, or Actions without BOT_JAR_KEY)
                5  the session was handed off to GitHub Actions
 
-Hard rules, enforced in code: GET only, /booking only (never
-/booking/review or /booking/confirm), never follow a redirect, stop on
+Hard rules, enforced in code: GET only, /booking only — plus /bookings
+(both tabs) with --check-account; never /booking/review, /booking/confirm
+or a booking's own page — never follow a redirect, stop on
 the first login redirect and never retry, never print a cookie value —
 only names and fingerprints (length + first 8 hex chars of SHA-256).
 Every output line also goes through redact() in case the server ever
@@ -61,9 +69,9 @@ from datetime import datetime, timedelta
 import requests
 
 import bot_session
-from booking_page import FIRST_INT, THAI_CHARS, PageParser, login_page_markers, parse_page  # noqa: F401 (re-exported)
+from booking_page import FIRST_INT, THAI_CHARS, PageParser, is_login_page, login_page_markers, parse_page  # noqa: F401 (re-exported)
 from bot_session import (  # noqa: F401 (re-exported)
-    BASE, BOOKING_PATH, CULTURE_COOKIE, ENC_FILE, HOST, JAR_FILE,
+    BASE, BOOKING_PATH, BOOKINGS_PATH, CULTURE_COOKIE, ENC_FILE, HOST, JAR_FILE,
     JAR_KEY_ENV, JAR_VERSION, LOGIN_REDIRECT_MARKERS, OPTIONAL_SEED, SEED_ENV, TZ, USER_AGENT,
     JarError, JarSaveError, SessionOpenError, _secrets, cookie_expiries, cookie_values,
     create_cookie, describe_expiry, diff_cookies, fingerprint, fmt_duration, handed_off_files,
@@ -72,7 +80,8 @@ from bot_session import (  # noqa: F401 (re-exported)
 )
 
 LOCATIONS = {"LOC001": "Crystal Sports", "LOC002": "Crystal Sports G"}
-# The probe itself only ever GETs /booking; it never touches these.
+# The probe itself only ever GETs /booking (and /bookings with
+# --check-account); it never touches these.
 FORBIDDEN_PATH_FRAGMENTS = ("/booking/review", "/booking/confirm")
 CHALLENGE_BODY_MARKERS = (
     "just a moment", "challenge-platform", "cf-turnstile",
@@ -138,6 +147,46 @@ def probe_once(jar, loc, date):
     return result
 
 
+ACCOUNT_PAGES = (("/bookings", {}), ("/bookings?tab=pending", {"tab": "pending"}))
+
+
+def check_account_page(jar, params):
+    """One GET of /bookings (params {} or {"tab": "pending"}). Returns
+    (status or None, verdict): verdict is "ok", "login redirect",
+    "login page (200)", or a short reason — never page text or a ref."""
+    try:
+        fetched = bot_session.fetch(jar, BOOKINGS_PATH, params)
+    except requests.RequestException as e:
+        return None, f"network error ({type(e).__name__})"
+    resp = fetched.resp
+    if fetched.login:
+        return resp.status_code, "login redirect"
+    if resp.status_code != 200:
+        return resp.status_code, "not ok (unexpected status)"
+    if is_login_page(resp.text or "", resp.url):
+        return resp.status_code, "login page (200)"
+    return resp.status_code, "ok"
+
+
+def check_account(jar):
+    """--check-account: the account pages, in order, stopping at the first
+    login. Returns EXIT_OK, EXIT_NO_GRID (a page wasn't ok) or EXIT_LOGIN.
+    Raises JarSaveError like probe_once's fetch would."""
+    worst = EXIT_OK
+    for label, params in ACCOUNT_PAGES:
+        status, verdict = check_account_page(jar, params)
+        say(f"[{stamp()}] account {label}: status={'ERR' if status is None else status} {verdict}")
+        if verdict.startswith("login"):
+            say()
+            say(f"STOPPED at account page {label}: {verdict}. The grid read fine on this same session,")
+            say("so account pages refuse something the grid doesn't need — e.g. a cookie the jar")
+            say("lacks (see the cookie names above: is cs_auth there?). Not retrying.")
+            return EXIT_LOGIN
+        if verdict != "ok":
+            worst = EXIT_NO_GRID
+    return worst
+
+
 def summary_line(rnd, repeat, result):
     head = f"[{stamp()}] round {rnd}/{repeat} {result['loc']}"
     if result["error"]:
@@ -161,7 +210,7 @@ def summary_line(rnd, repeat, result):
     return line
 
 
-def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FILE):
+def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FILE, check_account_pages=False):
     try:
         jar = bot_session.open_jar(jar_path, enc_path, session=session)
     except SessionOpenError as e:
@@ -169,7 +218,7 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FI
     jar_path = jar.path
     say()
 
-    all_ok = True
+    all_ok, account_ok = True, True
     for rnd in range(1, repeat + 1):
         date = (datetime.now(TZ) + timedelta(days=1)).date().isoformat()
         for loc in LOCATIONS:
@@ -194,23 +243,40 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FI
                 say(f"delete {jar_path.name}, and reseed.")
                 return EXIT_LOGIN
             all_ok = all_ok and result["ok"]
+        if check_account_pages and rnd == 1:
+            try:
+                account = check_account(jar)
+            except JarSaveError as e:
+                say(f"[{stamp()}] account pages: FAILED TO WRITE {jar_path.name} ({e.error}).")
+                if e.changes:
+                    say(f"  {len(e.changes)} cookie change(s) from that response were NOT saved — the copy")
+                    say("  on disk is now superseded and presenting it will kill the session.")
+                say("STOPPED. Delete the jar and reseed from a fresh login before running again.")
+                return EXIT_JAR
+            if account == EXIT_LOGIN:
+                return EXIT_LOGIN
+            account_ok = account == EXIT_OK
         if rnd < repeat:
             say(f"  sleeping {interval:g}s before round {rnd + 1}/{repeat}...")
             time.sleep(interval)
 
     say()
     say(f"Done: {repeat} round(s) — " + ("grid parsed every time." if all_ok else "at least one location had NO GRID."))
-    return EXIT_OK if all_ok else EXIT_NO_GRID
+    if check_account_pages:
+        say("Account pages: " + ("both ok." if account_ok else "at least one was NOT ok (see above)."))
+    return EXIT_OK if all_ok and account_ok else EXIT_NO_GRID
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Read-only probe of the new Crystal Sports booking site.")
     ap.add_argument("--repeat", type=int, default=1, help="number of rounds (default 1)")
     ap.add_argument("--interval", type=float, default=300, help="seconds between rounds (default 300)")
+    ap.add_argument("--check-account", action="store_true",
+                    help="after the first round, also GET /bookings and /bookings?tab=pending")
     args = ap.parse_args(argv)
     if args.repeat < 1 or args.interval < 0:
         ap.error("--repeat must be >= 1 and --interval >= 0")
-    return run(repeat=args.repeat, interval=args.interval)
+    return run(repeat=args.repeat, interval=args.interval, check_account_pages=args.check_account)
 
 
 if __name__ == "__main__":

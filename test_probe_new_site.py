@@ -22,6 +22,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlsplit
 
 import requests
 
@@ -131,7 +132,7 @@ class ProbeTestCase(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_probe(self, script, env=None, repeat=1, on_send=None):
+    def run_probe(self, script, env=None, repeat=1, on_send=None, check_account=False):
         adapter = ScriptedAdapter(script, on_send=on_send)
         session = requests.Session()
         session.mount("https://", adapter)
@@ -140,7 +141,7 @@ class ProbeTestCase(unittest.TestCase):
              mock.patch.object(probe.time, "sleep") as sleep, \
              contextlib.redirect_stdout(out):
             code = probe.run(repeat=repeat, interval=0, jar_path=self.jar, session=session,
-                             enc_path=self.enc)
+                             enc_path=self.enc, check_account_pages=check_account)
         return code, out.getvalue(), adapter, sleep
 
     def jar_cookies(self):
@@ -357,6 +358,132 @@ class TestStopsOnLoginRedirect(ProbeTestCase):
         self.assertNotIn("cs_auth", self.jar_cookies(), "the server's deletion must be persisted")
         self.assertIn("REMOVED cs_auth", out)
         self.assert_no_secret_leak(out)
+
+
+ACCOUNT_REF = "SPORTS-202611219999"
+ACCOUNT_PAGE = (f'<html><body><h1>My bookings</h1><a class="bk-row" href="/bookings/{ACCOUNT_REF}">'
+                'Private Member Name</a></body></html>')
+
+
+def account_ok():
+    return ok(body=ACCOUNT_PAGE)
+
+
+def account_login_redirect():
+    return (302, [("Location", f"{probe.BASE}/account/login?ReturnUrl=%2Fbookings")], "")
+
+
+class TestCheckAccount(ProbeTestCase):
+    """--check-account: after the first round's grids, GET /bookings then
+    /bookings?tab=pending and print status + ok/login redirect — never page
+    text or refs; stop at the first login."""
+
+    def account_lines(self, out):
+        return [l.split("] ", 1)[1] for l in out.splitlines() if "] account " in l]
+
+    def requests_made(self, adapter):
+        return [(r["method"], urlsplit(r["url"]).path, urlsplit(r["url"]).query) for r in adapter.sent]
+
+    def test_both_ok(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok()], env=SEED,
+                                               check_account=True)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual(self.requests_made(adapter)[2:], [("GET", "/bookings", ""), ("GET", "/bookings", "tab=pending")])
+        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 ok",
+                                                   "account /bookings?tab=pending: status=200 ok"])
+        self.assertIn("Account pages: both ok.", out)
+        self.assertNotIn(ACCOUNT_REF, out)
+        self.assertNotIn("Private Member Name", out)
+        self.assertNotIn("My bookings", out)
+        self.assert_no_secret_leak(out)
+
+    def test_login_redirect_on_bookings_stops_before_the_pending_tab(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), account_login_redirect()], env=SEED,
+                                               repeat=2, check_account=True)
+        self.assertEqual(code, probe.EXIT_LOGIN)
+        self.assertEqual(len(adapter.sent), 3, "no pending tab, no round 2")
+        self.assertEqual(self.account_lines(out), ["account /bookings: status=302 login redirect"])
+        self.assertIn("STOPPED at account page /bookings: login redirect.", out)
+        self.assertIn("is cs_auth there?", out)
+        self.assertNotIn("ReturnUrl", out, "the Location isn't printed")
+        self.assert_no_secret_leak(out)
+
+    def test_login_redirect_on_the_pending_tab(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_login_redirect()], env=SEED,
+                                               check_account=True)
+        self.assertEqual(code, probe.EXIT_LOGIN)
+        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 ok",
+                                                   "account /bookings?tab=pending: status=302 login redirect"])
+
+    def test_login_page_served_as_200(self):
+        login = ok(body='<html><body><form action="/account/login"><input type="password"></form></body></html>')
+        code, out, adapter, _ = self.run_probe([ok(), ok(), login], env=SEED, check_account=True)
+        self.assertEqual(code, probe.EXIT_LOGIN)
+        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 login page (200)"])
+
+    def test_not_ok_status_is_reported_and_the_other_page_still_checked(self):
+        err = (500, [("Content-Type", "text/html")], f"<html>error for {ACCOUNT_REF}</html>")
+        code, out, adapter, _ = self.run_probe([ok(), ok(), err, account_ok()], env=SEED, check_account=True)
+        self.assertEqual(code, probe.EXIT_NO_GRID)
+        self.assertEqual(self.account_lines(out), ["account /bookings: status=500 not ok (unexpected status)",
+                                                   "account /bookings?tab=pending: status=200 ok"])
+        self.assertIn("Account pages: at least one was NOT ok", out)
+        self.assertNotIn(ACCOUNT_REF, out)
+
+    def test_network_error(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), (200, [], "", requests.ConnectionError("boom")),
+                                                account_ok()], env=SEED, check_account=True)
+        self.assertEqual(code, probe.EXIT_NO_GRID)
+        self.assertEqual(self.account_lines(out)[0], "account /bookings: status=ERR network error (ConnectionError)")
+
+    def test_runs_once_after_round_one_only(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok(), ok(), ok()], env=SEED,
+                                               repeat=2, check_account=True)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual([p for _, p, _ in self.requests_made(adapter)],
+                         ["/booking", "/booking", "/bookings", "/bookings", "/booking", "/booking"])
+
+    def test_skipped_when_the_grid_redirects(self):
+        code, out, adapter, _ = self.run_probe([login_redirect()], env=SEED, check_account=True)
+        self.assertEqual(code, probe.EXIT_LOGIN)
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(self.account_lines(out), [])
+
+    def test_off_by_default_and_only_gets(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual({p for _, p, _ in self.requests_made(adapter)}, {"/booking"})
+        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok()], env=SEED, check_account=True)
+        self.assertEqual({m for m, _, _ in self.requests_made(adapter)}, {"GET"})
+
+    def test_jar_save_failure_on_an_account_page_stops(self):
+        real, calls = probe.bot_session.save_jar, {"n": 0}
+
+        def save(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 4:   # seed, grid, grid, then /bookings
+                raise OSError("disk full")
+            return real(*a, **kw)
+        with mock.patch.object(probe.bot_session, "save_jar", side_effect=save):
+            code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok()], env=SEED,
+                                                   check_account=True)
+        self.assertEqual(code, probe.EXIT_JAR)
+        self.assertEqual(len(adapter.sent), 3, "nothing after the failed save")
+        self.assertIn("account pages: FAILED TO WRITE", out)
+
+    def test_cli_flag(self):
+        with mock.patch.object(probe, "run", return_value=0) as run:
+            probe.main(["--check-account"])
+            self.assertTrue(run.call_args.kwargs["check_account_pages"])
+            probe.main([])
+            self.assertFalse(run.call_args.kwargs["check_account_pages"])
+
+    def test_works_without_cs_auth_seeded(self):
+        env = {"CS_DID": SEED["CS_DID"], "CS_MEMBER": SEED["CS_MEMBER"]}
+        code, out, adapter, _ = self.run_probe([ok(), ok(), account_login_redirect()], env=env, check_account=True)
+        self.assertEqual(code, probe.EXIT_LOGIN)
+        self.assertIn("cs_auth absent (not seeded)", out)
+        self.assertNotIn("cs_auth", [n for n, _ in adapter.sent[2]["cookies"]])
 
 
 class TestSeedingRules(ProbeTestCase):

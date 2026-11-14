@@ -445,6 +445,23 @@ def is_login_redirect(resp):
     return 300 <= resp.status_code < 400 and any(m in location.lower() for m in LOGIN_REDIRECT_MARKERS)
 
 
+def page_type(method, path, params=None):
+    """What kind of page a request is for, for logs: never a ref or URL.
+    /booking with time=0 is the grid; with a time it's that time's court
+    list ("slot page", same path)."""
+    if path == CONFIRM_PATH:  # only ever the one booking request
+        return "confirm"
+    if path == BOOKING_PATH:
+        return "grid" if str((params or {}).get("time", "0")) == "0" else "slot page"
+    if path == REVIEW_PATH:
+        return "review"
+    if path == BOOKINGS_PATH:
+        return "bookings (pending)" if (params or {}).get("tab") == "pending" else "bookings"
+    if BOOKING_DETAIL_RE.fullmatch(path):
+        return "booking detail"
+    return "unknown"
+
+
 def fetch(jar, path, params):
     """GET one allowed page (ALLOWED_GET_PATHS, or a booking's own page
     matching BOOKING_DETAIL_RE) on the bot's session."""
