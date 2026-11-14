@@ -1,7 +1,22 @@
 {
-  "known_open": {},
-  "last_check": "2026-11-15T00:03:41.709629+07:00",
-  "currently_open_count": 0,
+  "known_open": {
+    "2026-11-15|LOC001|any|23:00": true,
+    "2026-11-15|LOC002|any|23:00": true
+  },
+  "last_check": "2026-11-15T00:05:19.352736+07:00",
+  "currently_open_count": 2,
   "autobook_attempts": {},
-  "autobook_mode": "dry_run"
+  "autobook_mode": "dry_run",
+  "autobook_dry_run": {},
+  "autobook_retry": {
+    "2026-11-15|23:00": {
+      "since": "2026-11-15T00:05:19+07:00",
+      "reason": "session_stopped"
+    }
+  },
+  "session_alert": {
+    "kind": "expired",
+    "sent_at": "2026-11-15T00:05:28.143234+07:00",
+    "jar_sha256": "71f50091012500da"
+  }
 }
