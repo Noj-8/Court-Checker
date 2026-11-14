@@ -54,4 +54,5 @@ Each file starts with a `<!-- SCRUBBED copy … -->` line.
 | The POST responses | SYNTHETIC | Apart from the two parked redirect Locations, which are real: `/wallet/topup/<id>?then=SPORTS-…` (Nov 11) and `/payment/SPORTS-…/topup-shortfall` (Nov 13) |
 | An Awaiting-payment list with its row removed | DERIVED | |
 | A review page for the other free court | DERIVED | |
+| The review page in the live no-coach shape (no coach block, all 5 payment radios `required`, none checked) | DERIVED | From page 2, matching the live form read on 2026-11-15 |
 | Crystal Sports (LOC001) versions of the G pages | DERIVED | |
