@@ -3,15 +3,17 @@
     "2026-11-15|LOC001|any|23:00": true,
     "2026-11-15|LOC002|any|23:00": true
   },
-  "last_check": "2026-11-15T02:35:43.423340+07:00",
+  "last_check": "2026-11-15T02:39:09.540612+07:00",
   "currently_open_count": 2,
   "autobook_attempts": {},
-  "autobook_mode": "off",
+  "autobook_mode": "dry_run",
   "autobook_dry_run": {},
   "autobook_retry": {
     "2026-11-15|23:00": {
       "since": "2026-11-15T00:05:19+07:00",
-      "reason": "session_stopped"
+      "reason": "existing_booking_unreadable",
+      "unreadable": 1,
+      "notified": "2026-11-15T02:36:06+07:00"
     }
   }
 }
