@@ -82,6 +82,18 @@ class Pages:
             html = html.replace(self.sel, self.sel2).replace("G South-1", "G South-3")
         return html
 
+    def review_live_no_coach(self, sel=None):
+        """DERIVED from the real review page (2), in the shape of the LIVE form
+        read on 2026-11-15 for a slot with no coaches: no coach block at all
+        (no coach_/type_ selects), every payment radio `required`, none
+        checked; sel, acceptTerms (required, "true") and the token as before."""
+        html, n = re.subn(r'\s*<details class="mt-2">.*?</details>', "", self.review(sel), count=1, flags=re.S)
+        assert n == 1
+        html = html.replace(' checked="checked"', "")
+        html, n = re.subn(r'(<input class="visually-hidden" type="radio" name="method" value="\w+")', r"\1 required", html)
+        assert n == 5
+        return html
+
     def pending_with_ref(self, ref=REF):     # real Awaiting-payment page with one row
         return fixture("5_bookings_awaiting.html").replace(REF, ref)
 
@@ -313,6 +325,64 @@ class TestParkedEndToEnd(AutobookTestCase):
         self.assertNotIn("/booking/review", [s["path"] for s in self.site.sent])
 
 
+class TestLiveReviewFormShape(AutobookTestCase):
+    """The live review form (2026-11-15, a slot with no coaches): required
+    payment radios with none checked, no coach field. A browser submits
+    sel, method=WALLET, acceptTerms=true and the token — and so do we."""
+
+    def test_no_coach_required_radios_nothing_checked_passes_and_builds_the_browser_body(self):
+        page = booking_page.parse_review(self.p.review_live_no_coach())
+        self.assertFalse(any(f["name"].startswith(("coach_", "type_")) for f in page["fields"]))
+        radios = [f for f in page["fields"] if f["name"] == "method"]
+        self.assertEqual([(f["value"], f["required"], f["checked"]) for f in radios],
+                         [(v, True, False) for v in ("WALLET", "QR", "CREDITCARD", "ALIPAY", "WECHAT")])
+
+        self.site.reviews[self.p.sel] = self.p.review_live_no_coach()
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        posts = self.site.posts_sent()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["form"], [("sel", self.p.sel), ("method", "WALLET"), ("acceptTerms", "true"),
+                                            ("__RequestVerificationToken", TOKEN)])
+        self.assertEqual(self.record()["status"], "parked")
+
+    def test_same_shape_in_dry_run_has_no_problems(self):
+        self.site.reviews[self.p.sel] = self.p.review_live_no_coach()
+        code, sent = self.run_mode("dry_run")
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertEqual(self.record(store=autobook.DRY_KEY)["status"], "dry_run")
+        self.assertNotIn("page mismatch", " ".join(self.subjects(sent)))
+
+    def test_coach_present_still_sends_no_coach_empty(self):
+        # The real page 2: a coach select left on "No coach", radios not
+        # required, QR checked by default — the browser body of 2026-11-13.
+        problems, post, _ = autobook.check_review(booking_page.parse_review(self.p.review()),
+                                                   {"date": self.date, "time": "23:00", "loc_name": "Crystal Sports G"},
+                                                   {"sel": self.p.sel, "name": "G South-1"})
+        self.assertEqual(problems, [])
+        self.assertEqual(post, [("sel", self.p.sel), (f"coach_{self.p.sel}", ""), ("method", "WALLET"),
+                                ("acceptTerms", "true"), ("__RequestVerificationToken", TOKEN)])
+
+    def test_coach_present_and_required_radios_also_pass(self):
+        html, n = re.subn(r'(<input class="visually-hidden" type="radio" name="method" value="\w+")', r"\1 required",
+                          self.p.review())
+        problems, post, _ = autobook.check_review(booking_page.parse_review(html),
+                                                   {"date": self.date, "time": "23:00", "loc_name": "Crystal Sports G"},
+                                                   {"sel": self.p.sel, "name": "G South-1"})
+        self.assertEqual((n, problems), (5, []))
+        self.assertEqual([k for k, _ in post], ["sel", f"coach_{self.p.sel}", "method", "acceptTerms", "__RequestVerificationToken"])
+
+    def test_no_coach_but_coach_type_select_enabled_aborts(self):
+        html = self.p.review_live_no_coach().replace(
+            '<input type="checkbox" name="acceptTerms"',
+            f'<select name="type_{self.p.sel}"><option value="1">1</option></select><input type="checkbox" name="acceptTerms"')
+        self.site.reviews[self.p.sel] = html
+        self.run_mode("live")
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertEqual(self.record()["problems"], ["coach_type_enabled"])
+
+
 class TestOutcomes(AutobookTestCase):
     def test_paid_path(self):
         # The new booking shows up as the REAL Paid Upcoming row (moved to this
@@ -409,8 +479,7 @@ class TestNoPostWhenThePageIsWrong(AutobookTestCase):
         r = self.p.review()
         variants = {
             "coach pre-selected": (r.replace('<option value="1001"', '<option selected value="1001"'), "is pre-selected"),
-            "coach field missing": (re.sub(r'<select class="input" name="coach_[^"]*">.*?</select>', "", r, flags=re.S), "coach field"),
-            "coach field renamed": (r.replace(f'name="coach_{self.p.sel}"', 'name="coach"'), "coach field"),
+            "coach field renamed": (r.replace(f'name="coach_{self.p.sel}"', 'name="coach"'), "unexpected field 'coach'"),
             "coach field disabled": (r.replace(f'name="coach_{self.p.sel}"', f'name="coach_{self.p.sel}" disabled'), "coach field"),
             "coach-type select enabled": (r.replace(f'name="type_{self.p.sel}" disabled', f'name="type_{self.p.sel}"'), "a browser would send it"),
             "terms value changed": (r.replace('name="acceptTerms" value="true"', 'name="acceptTerms" value="on"'), "terms checkbox"),
@@ -418,7 +487,18 @@ class TestNoPostWhenThePageIsWrong(AutobookTestCase):
             "no Wallet option": (r.replace('value="WALLET"', 'value="WALLET2"'), "no WALLET"),
             "posts somewhere else": (r.replace('action="/booking/confirm"', 'action="/booking/confirm2"'), "0 forms"),
             "token missing": (re.sub(r'<input name="__RequestVerificationToken"[^>]*/></form>', "</form>", r), "anti-forgery"),
-            "coach now required": (r.replace(f'name="coach_{self.p.sel}"', f'name="coach_{self.p.sel}" required'), "now required"),
+            "coach now required": (r.replace(f'name="coach_{self.p.sel}"', f'name="coach_{self.p.sel}" required'), "is required"),
+            "Wallet radio disabled": (r.replace('value="WALLET"', 'value="WALLET" disabled'), "no WALLET"),
+            "terms disabled": (r.replace('name="acceptTerms"', 'name="acceptTerms" disabled'), "terms checkbox"),
+            "another required checkbox": (r.replace('<input type="checkbox" name="acceptTerms"',
+                                                    '<input type="checkbox" name="newsletter" value="yes" required />'
+                                                    '<input type="checkbox" name="acceptTerms"'), "unexpected field 'newsletter'"),
+            "an unexpected field with a default": (r.replace('<input type="checkbox" name="acceptTerms"',
+                                                             '<input type="hidden" name="promo" value="X1" />'
+                                                             '<input type="checkbox" name="acceptTerms"'), "pre-filled 'X1'"),
+            "an unexpected required field": (r.replace('<input type="checkbox" name="acceptTerms"',
+                                                       '<input type="text" name="phone" required />'
+                                                       '<input type="checkbox" name="acceptTerms"'), "unexpected field 'phone' (text, required)"),
             "a second court in the cart": (r.replace('<div class="card">\n            <div class="card-title">Payment method',
                                                      '<div class="card"><div><b>Crystal Sports G · G South-3</b>'
                                                      f'<div class="text-muted text-sm">{self.p.label} · 23:00 – 24:00</div></div>'
@@ -431,6 +511,19 @@ class TestNoPostWhenThePageIsWrong(AutobookTestCase):
                 self.assertNotEqual(html, r, "the variant must actually change the page")
                 self.setUp()
                 self.assert_mismatch(html, expected)
+
+    def test_each_problem_is_reported_once_not_per_radio(self):
+        r = self.p.review_live_no_coach()
+        html = r.replace('value="WALLET"', 'value="WALLET2"').replace(
+            '<input type="checkbox" name="acceptTerms"',
+            "".join(f'<input type="radio" name="tip" value="{v}" required />' for v in ("10", "20", "30"))
+            + '<input type="checkbox" name="acceptTerms"')
+        self.site.reviews[self.p.sel] = html
+        code, sent = self.run_mode("live")
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertEqual(self.record()["problems"], ["unexpected_field", "no_wallet"])
+        self.assertEqual(sent[0]["body"].count("unexpected field 'tip'"), 1)
+        self.assertEqual(sent[0]["body"].count("no WALLET"), 1)
 
     def test_review_for_a_different_slot(self):
         r = self.p.review()
@@ -1838,8 +1931,8 @@ class TestNoSiteFieldNamesInState(AutobookTestCase):
         self.site.reviews[self.p.sel] = self.p.review().replace(
             f'name="coach_{self.p.sel}"', f'name="coach_{self.p.sel}" required')
         self.run_mode("live")
-        self.assertEqual(self.record()["problems"], ["field_required"])
-        self.assertNotIn("coach_", self.state_file.read_text())
+        self.assertEqual(self.record()["problems"], ["coach_required"])
+        self.assertNotIn(f"coach_{self.p.sel}", self.state_file.read_text(), "the site's field name stays out of state")
 
 
 

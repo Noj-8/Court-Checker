@@ -385,53 +385,70 @@ def check_review(review, cand, court):
     if review["page_date"] and review["page_date"] != date_label(cand["date"]):
         problems.append(("page_mismatch:date", f"page date is {review['page_date']!r}, expected {date_label(cand['date'])!r}"))
 
+    # The form is checked the way a browser submits it: what we send must be
+    # exactly what a browser would send with "Wallet" picked, the terms box
+    # ticked and no coach — and nothing the page asks for may be left out.
     coach_name, type_name = f"coach_{sel}", f"type_{sel}"
     allowed = {"sel", "method", "acceptTerms", "__RequestVerificationToken", coach_name, type_name}
-    fields = review["fields"]
     by_name = {}
-    for f in fields:
+    for f in review["fields"]:
         by_name.setdefault(f["name"], []).append(f)
-        if f["name"] not in allowed:
+    for name, group in by_name.items():   # each field (a radio group is ONE field) reported once
+        if name not in allowed:
+            f = group[0]
             problems.append(("unexpected_field",
-                             f"unexpected field {f['name']!r} ({f['type']}"
-                             + (", required" if f["required"] else "")
-                             + (f", pre-filled {f['value']!r}" if f["value"] else "") + ")"))
-        elif f["required"] and f["name"] != "acceptTerms" and not f["disabled"]:
-            problems.append(("field_required", f"field {f['name']!r} is now required"))
+                             f"unexpected field {name!r} ({f['type']}"
+                             + (", required" if any(g["required"] for g in group) else "")
+                             + (f", pre-filled {f['value']!r}" if any(g["value"] for g in group) else "") + ")"))
 
     sels = by_name.get("sel", [])
     if len(sels) != 1 or sels[0]["type"] != "hidden" or sels[0]["value"] != sel:
         problems.append(("sel_changed", f"sel field is {[(s['type'], s['value']) for s in sels]}, expected one hidden {sel!r}"))
+
+    # Coach: optional. Absent (no coaches for this slot) -> a browser sends
+    # no coach field, and neither do we. Present -> it must be the one
+    # enabled, optional select left on "No coach" (sent empty, as a browser does).
     coaches = by_name.get(coach_name, [])
-    if len(coaches) != 1 or coaches[0]["tag"] != "select" or coaches[0]["disabled"]:
-        problems.append(("coach_missing", f"coach field {coach_name!r} missing or changed "
-                                          f"({[(c['tag'], c['disabled']) for c in coaches]})"))
-    elif coaches[0]["value"]:
-        problems.append(("coach_preselected", f"{coach_name} is pre-selected ({coaches[0]['value']!r}), expected no coach"))
+    if coaches:
+        c = coaches[0]
+        if len(coaches) != 1 or c["tag"] != "select" or c["disabled"]:
+            problems.append(("coach_changed", f"coach field {coach_name!r} changed "
+                                              f"({[(x['tag'], x['disabled']) for x in coaches]})"))
+        elif c["required"]:
+            problems.append(("coach_required", f"{coach_name} is required — a coach would have to be chosen"))
+        elif c["value"]:
+            problems.append(("coach_preselected", f"{coach_name} is pre-selected ({c['value']!r}), expected no coach"))
     for t in by_name.get(type_name, []):
         # A browser leaves the coach-type select out while it's disabled; if it
         # were enabled it would be sent too, and the body would differ.
         if not t["disabled"] or t["value"]:
             problems.append(("coach_type_enabled", f"{type_name} is enabled or pre-filled ({t['value']!r}) — a browser would send it"))
+            break
+
+    # Payment method: one radio group; we pick WALLET, so "required" on the
+    # group is satisfied — whatever (if anything) is checked by default.
     methods = by_name.get("method", [])
-    if not any(m["type"] == "radio" and m["value"] == "WALLET" for m in methods):
-        problems.append(("no_wallet", "no WALLET payment-method radio"))
     if any(m["type"] != "radio" for m in methods):
         problems.append(("method_not_radio", "a non-radio 'method' field"))
+    elif not any(m["value"] == "WALLET" and not m["disabled"] for m in methods):
+        problems.append(("no_wallet", "no WALLET payment-method radio (enabled)"))
+
+    # Terms: the one required checkbox we may tick; it must send "true".
     terms = by_name.get("acceptTerms", [])
-    if len(terms) != 1 or terms[0]["type"] != "checkbox" or terms[0]["value"] != "true":
+    if len(terms) != 1 or terms[0]["type"] != "checkbox" or terms[0]["value"] != "true" or terms[0]["disabled"]:
         problems.append(("terms_changed", f"terms checkbox missing or changed ({[(t['type'], t['value']) for t in terms]})"))
     tokens = by_name.get("__RequestVerificationToken", [])
     if len(tokens) != 1 or tokens[0]["type"] != "hidden" or not tokens[0]["value"]:
         problems.append(("token_missing", "anti-forgery token missing or changed"))
 
     if problems:
-        return problems, None, price
-    # Exactly the body a real browser sent on 2026-11-13 (DevTools payload),
-    # in that order and nothing else: the court, "No coach", Wallet, the
-    # terms box ticked, the anti-forgery token.
-    post = [("sel", sel), (coach_name, ""), ("method", "WALLET"), ("acceptTerms", "true"),
-            ("__RequestVerificationToken", tokens[0]["value"])]
+        return list(dict.fromkeys(problems)), None, price
+    # What a browser sends, in form order: the court, "No coach" (only if the
+    # coach field exists), Wallet, the terms box ticked, the anti-forgery
+    # token. Matches the DevTools payload seen live on 2026-11-13 (with a
+    # coach field) and the live no-coach form of 2026-11-15.
+    post = [("sel", sel)] + ([(coach_name, "")] if coaches else []) + [
+        ("method", "WALLET"), ("acceptTerms", "true"), ("__RequestVerificationToken", tokens[0]["value"])]
     return [], post, price
 
 
