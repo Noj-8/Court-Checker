@@ -244,13 +244,19 @@ def _get(ctx, path, params, label=None):
     return body
 
 
+UNRECOGNISED_LIST = "bookings_page_unrecognised"
+
+
 def read_lists(ctx):
-    """Both lists, as {"pending": [...rows], "upcoming": [...rows]}."""
+    """Both lists, as {"pending": [...rows], "upcoming": [...rows]}. Fails
+    closed: a 200 page that isn't the list asked for (no #bookingList, or
+    a different tab active) raises Deferred(UNRECOGNISED_LIST:<name>) —
+    never read as "no bookings"."""
     out = {}
     for name, params in (("pending", {"tab": "pending"}), ("upcoming", {})):
         page = booking_page.parse_bookings_list(_get(ctx, BOOKINGS_PATH, params))
-        if not page["recognised"]:
-            raise Deferred(f"bookings_page_unrecognised:{name}", f"the My bookings page ({name}) didn't look as expected")
+        if not page["recognised"] or page["tab"] != name:
+            raise Deferred(f"{UNRECOGNISED_LIST}:{name}", f"the My bookings page ({name}) didn't look as expected")
         out[name] = page["rows"]
     return out
 
@@ -507,7 +513,22 @@ def _after_error(ctx, key, rec, code, text, retry):
 
 def _flow(ctx, key, cand, rec):
     # 2. existing bookings
-    lists = read_lists(ctx)
+    try:
+        lists = read_lists(ctx)
+    except Deferred as e:
+        if not e.code.startswith(UNRECOGNISED_LIST):
+            raise  # network / http errors: deferred quietly, as before
+        retry = ctx.defer(key, e.code)
+        if not retry.get("notified"):
+            if ctx.email(key, f"ℹ️ Not auto-booking {cand['date']} {cand['time']} — can't check your bookings",
+                         f"A starred time opened ({cand['loc_name']} {cand['date']} {cand['time']}), but {e.text},\n"
+                         "so I can't rule out that you already have this slot.\n"
+                         "Not booking — book manually if you want it:\n\n"
+                         f"  {BASE}{cand['href']}\n  {BOOKINGS_URL}\n\nI'll try again while it stays open; no more emails about it.\n"):
+                retry["notified"] = now_iso()
+        del ctx.records()[key]
+        ctx.log(f"    not booking: {e.code} (My bookings page not recognised)")
+        return
     own = ctx.own_ref_fps()
     others = [r for r in lists["pending"] + lists["upcoming"] if ref_fp(r["ref"]) not in own]
     clash, unreadable = existing_at(ctx, others, slot_range(cand["date"], cand["time"]))

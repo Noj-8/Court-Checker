@@ -565,6 +565,83 @@ class TestExistingBookings(AutobookTestCase):
         self.assertIn(f"🧪 Would have booked Crystal Sports G G South-1 {self.date} 23:00 ฿500", self.subjects(sent))
 
 
+# SYNTHETIC: a 200 page that is none of the site's pages (a verification /
+# interstitial page). It has a form and a hidden input, but no login form.
+INTERSTITIAL = ('<html lang="en"><head><title>One moment</title></head><body><h1>Checking your browser</h1>'
+                '<form action="/verify" method="post"><input type="hidden" name="t" value="x" />'
+                '<button type="submit">Continue</button></form></body></html>')
+
+
+class TestUnrecognisedPagesFailClosed(AutobookTestCase):
+    """Any 200 page that isn't the page asked for is UNREADABLE: no booking
+    that pass, never "you have no bookings"."""
+
+    def assert_not_booked_info_once(self, reason):
+        code, sent = self.run_mode("live", iterations=2)
+        self.assertNotEqual(code, monitor.EXIT_SESSION, "not a login page")
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertNotIn("/booking/review", [s["path"] for s in self.site.sent])
+        info = [m for m in sent if m["subject"].startswith("ℹ️ Not auto-booking")]
+        self.assertEqual([m["subject"] for m in info],
+                         [f"ℹ️ Not auto-booking {self.date} 23:00 — can't check your bookings"], "ℹ️ exactly once")
+        self.assertIn("didn't look as expected", info[0]["body"])
+        self.assertNotIn("Checking your browser", info[0]["body"])
+        self.assertIsNone(self.record(), "not a final outcome — nothing was submitted")
+        self.assertEqual(self.state()[autobook.RETRY_KEY][self.key]["reason"], reason)
+        self.assertGreaterEqual([s["path"] for s in self.site.sent].count("/bookings"), 2, "re-checked on the second pass")
+        self.assertIn(f"not booking: {reason}", self.out)
+
+    def test_pending_list_is_an_unrelated_page(self):
+        self.site.pending = [INTERSTITIAL]
+        self.assert_not_booked_info_once("bookings_page_unrecognised:pending")
+
+    def test_upcoming_list_is_an_unrelated_page(self):
+        self.site.upcoming = [INTERSTITIAL]
+        self.assert_not_booked_info_once("bookings_page_unrecognised:upcoming")
+
+    def test_pending_request_answered_with_the_upcoming_tab(self):
+        self.site.pending = [self.p.upcoming_empty()]   # a real list, but not the one asked for
+        self.assert_not_booked_info_once("bookings_page_unrecognised:pending")
+
+    def test_upcoming_request_answered_with_the_pending_tab(self):
+        self.site.upcoming = [self.p.pending_empty()]
+        self.assert_not_booked_info_once("bookings_page_unrecognised:upcoming")
+
+    def test_booked_once_the_lists_are_readable_again(self):
+        self.site.pending = [INTERSTITIAL]
+        self.run_mode("live")
+        self.assertIn(self.key, self.state()[autobook.RETRY_KEY])
+        self.site = FakeSite(self.p)
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        self.assertEqual(self.record()["status"], "parked")
+
+    def test_review_page_is_an_unrelated_page(self):
+        self.site.reviews[self.p.sel] = INTERSTITIAL
+        code, sent = self.run_mode("live")
+        self.assertEqual(self.site.posts_sent(), [], "no POST")
+        self.assertEqual(self.record()["status"], "aborted_mismatch")
+        self.assertIn("booking form changed / page mismatch", sent[0]["subject"])
+
+    def test_slot_page_is_an_unrelated_page(self):
+        self.site.slot_pages = [INTERSTITIAL]
+        code, sent = self.run_mode("live")
+        self.assertEqual(self.site.posts_sent(), [], "no POST")
+        self.assertNotIn("/booking/review", [s["path"] for s in self.site.sent])
+        self.assertNotEqual(code, monitor.EXIT_SESSION)
+        self.assertIn(self.record()["status"], autobook.TERMINAL)
+
+    def test_lists_unrelated_after_the_post_is_unclear_never_retried(self):
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), INTERSTITIAL]
+        code, sent = self.run_mode("live", iterations=2)
+        self.assertEqual(len(self.site.posts_sent()), 1, "never a second POST")
+        self.assertEqual(self.record()["status"], "unclear")
+        self.assertNotIn(self.key, self.state().get(autobook.RETRY_KEY, {}))
+
+
 class TestListParsing(unittest.TestCase):
     """The real filled Upcoming row and booking page, parsed directly."""
 
