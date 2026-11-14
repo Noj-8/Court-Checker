@@ -88,6 +88,9 @@ class MonitorTestCase(unittest.TestCase):
         marker = mock.patch.object(monitor, "STATE_ALERT_MARKER", self.dir / ".state_alert.json")
         marker.start()
         self.addCleanup(marker.stop)
+        run_file = mock.patch.object(monitor, "RUN_FILE", self.dir / ".autobook_run.json")
+        run_file.start()
+        self.addCleanup(run_file.stop)
         self.date = day(1)
         self.write_config([target(self.date, [("20:00", False), ("22:00", False)])])
 
@@ -643,7 +646,9 @@ class TestEncryptedSession(MonitorTestCase):
         self.assertEqual({c.name: c.value for c in s.cookies}["cs.member"], MEMBER_NEW)
         self.assertNotIn(MEMBER_NEW, out)
         self.assertNotIn(key, out)
-        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["bot_session.enc", "config.json", "state.json"])
+        # .autobook_run.json holds only this run's auto-book date|time keys (no secrets).
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()),
+                         [".autobook_run.json", "bot_session.enc", "config.json", "state.json"])
 
 
 if __name__ == "__main__":

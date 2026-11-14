@@ -59,6 +59,7 @@ apart (default 60), then exits. Designed for GitHub Actions cron */5.
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import smtplib
@@ -66,6 +67,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -175,6 +177,7 @@ STATE_SHAPE = {
     "autobook_dry_run": _is_dict_of(_is_record),
     "autobook_retry": _is_dict_of(lambda x: isinstance(x, dict)),
     "autobook_attempts": lambda v: isinstance(v, dict),  # old site's, only ever pruned
+    "push_failures_handled": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
     "session_alert": lambda v: isinstance(v, dict),
     "read_alert": lambda v: isinstance(v, dict),
 }
@@ -471,7 +474,8 @@ def run_check_pass(state, config, jar, email, mode="off"):
                                                "loc_name": LOCATIONS.get(loc, loc), "href": links[t],
                                                "newly_open": slot_key(target["date"], loc, ANY_COURT, t) in new_keys})
             ctx = autobook.Context(jar, state, mode, send=lambda subj, body: send_email(subj, body, *email),
-                                   save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS)
+                                   save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS,
+                                   note_attempt=note_run_attempt)
             autobook.process(ctx, candidates)
         except autobook.SessionStopped:
             log("      🔴 login redirect during auto-book — bot session expired, stopping")
@@ -516,7 +520,7 @@ def autobook_note(a, mode, emailed, state):
     if other is None:
         rec = state.get(autobook.LIVE_KEY, {}).get(key)
         if rec and rec.get("loc") and rec["loc"] != a["loc_id"]:
-            other = (rec["loc"], autobook.RESULT_EMOJI.get(rec.get("status"), "?"))
+            other = (rec["loc"], autobook.RESULT_TEXT.get(rec.get("status"), autobook.RESULT_UNKNOWN))
     if other is None:
         return AUTOBOOK_NOTES[mode]
     return f"auto-book already attempted at {LOCATIONS.get(other[0], other[0])} (result: {other[1]}) — see that email"
@@ -664,7 +668,15 @@ def email_halt_once(state, email):
         halted = state["autobook_halted"] = {"reason": "set_in_state_json", "value_was": type(halted).__name__}
     if halted.get("emailed_at"):
         return
-    if halted.get("reason") == "state_unreadable":
+    if halted.get("reason") == PUSH_HALT_REASON:
+        keys = halted.get("keys") or []
+        why = ("An earlier run made auto-book attempts but its state.json couldn't be saved to the repo,\n"
+               "so the records of those attempts are lost. Affected date|time(s):\n"
+               + ("\n".join(f"  {k}" for k in keys) if keys else "  (unknown — check every starred time)")
+               + "\n\nCheck My bookings for those times first: anything booked there is real. Auto-book\n"
+               "is HALTED")
+        kept = ""
+    elif halted.get("reason") == "state_unreadable":
         why = (f"{STATE_FILE.name} couldn't be used ({halted.get('detail')}). It holds the auto-book records\n"
                "that stop a date+time being booked twice, so auto-book is HALTED")
         kept = ("The unreadable file was kept as " + halted["kept_as"] + " on the runner (not committed).\n"
@@ -688,6 +700,7 @@ def email_halt_once(state, email):
 def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None):
     mode = autobook.mode_from_env(log)
     state = open_state()  # first: a halt is on disk before any early return below
+    marker_block = handle_push_marker(state)  # a push-failure halt, too, is on disk before any early return
     config = load_config()
     email = email_settings(config)
     if email is None:
@@ -698,9 +711,9 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
             log('🔴 auto-book HALTED ("autobook_halted" is in state.json) — running notify-only. '
                 "Run restore_state.py to resume (see the email).")
             mode = "off"
-    if push_failure_block(state) and mode != "off":
-        log(f"🔴 auto-book PAUSED: an earlier run's state.json wasn't saved "
-            f"({state['autobook_blocked']['reason']}) — running notify-only until a later push succeeds.")
+    if marker_block and mode != "off":
+        log("🔴 no auto-book this run: " + (state.get("autobook_blocked") or {}).get(
+            "reason", "an earlier run's state.json wasn't saved after auto-book attempts"))
         mode = "off"
     state["autobook_mode"] = mode  # what the dashboard shows: the mode this run actually uses
     state.pop("last_session_alert", None)  # the PHPSESSID-era throttle, replaced by session_alert
@@ -777,74 +790,120 @@ def alert_session_lost(reason):
 
 STATE_NOT_SAVED_SUBJECT = "🔴 state not saved — check before trusting auto-book"
 # Kept in the Actions cache by monitor.yml (never committed): written when a
-# run's state.json couldn't be pushed, with the blob id of the repo's
-# state.json at that moment. While the repo's state.json is still that blob,
-# no push has succeeded since, so auto-book stays off.
+# run's state.json couldn't be pushed. It records whether that run made any
+# auto-book attempt (a write-ahead record), and for which date|time keys.
+# The next run turns an attempt into a durable autobook_halted in state.json.
 STATE_ALERT_MARKER = ROOT / ".state_alert.json"
+# This run's auto-book attempts, for the marker (never committed). Written
+# at the start of every run and BEFORE each write-ahead record.
+RUN_FILE = ROOT / ".autobook_run.json"
 PUSH_MARKER_STATUS_ENV = "PUSH_MARKER_STATUS"  # the cache-restore step's outcome, set by monitor.yml
 REPO_STATE_BLOB_ENV = "REPO_STATE_BLOB"        # blob id of state.json in the checked-out commit
-UNKNOWN_BASELINE_MINUTES = 60  # a marker with no blob id pauses auto-book for this long
+HANDLED_KEY = "push_failures_handled"         # marker episodes already turned into a halt (in git)
+PUSH_HALT_REASON = "state_push_failed_after_autobook"
 
 
 def read_push_marker():
-    """(marker or None, problem or None)."""
+    """(marker or None, problem or None, episode id of an unreadable marker or None)."""
     status = os.environ.get(PUSH_MARKER_STATUS_ENV)
     if status is not None and status.strip() != "success":
-        return None, f"the marker cache couldn't be read ({status.strip() or 'no outcome'})"
+        return None, f"the marker cache couldn't be read ({status.strip() or 'no outcome'})", None
     try:
-        marker = json.loads(STATE_ALERT_MARKER.read_text(encoding="utf-8"))
+        raw = STATE_ALERT_MARKER.read_bytes()
     except FileNotFoundError:
-        return None, None
-    except (OSError, ValueError) as e:
-        return None, f"the marker couldn't be read ({type(e).__name__})"
-    if not isinstance(marker, dict):
-        return None, "the marker isn't an object"
-    return marker, None
+        return None, None, None
+    except OSError as e:
+        return None, f"the marker couldn't be read ({type(e).__name__})", None
+    episode = "unreadable-" + hashlib.sha256(raw).hexdigest()[:12]
+    try:
+        marker = json.loads(raw.decode("utf-8"))
+    except ValueError as e:
+        return None, f"the marker couldn't be read ({type(e).__name__})", episode
+    if not isinstance(marker, dict) or not marker.get("episode"):
+        return None, "the marker isn't the expected shape", episode
+    return marker, None, None
 
 
-def push_failure_block(state):
-    """True (and state["autobook_blocked"] set) while an earlier run's failed
-    state push hasn't been followed by a successful one, or if that can't be
-    told (assume the worst). Clears itself once the repo's state.json changes."""
-    marker, problem = read_push_marker()
-    reason = None
-    if problem:
-        reason = problem
-    elif marker is not None:
-        baseline = marker.get("remote_blob")
-        current = os.environ.get(REPO_STATE_BLOB_ENV, "").strip()
-        if baseline and baseline != "unknown":
-            if not current or current == "unknown":
-                reason = "can't tell whether state.json has been saved since"
-            elif current == baseline:
-                reason = "state_push_failed"
-        else:
-            since = _parse_time(marker.get("sent_at"))
-            if since is None or (datetime.now(TZ) - since).total_seconds() < UNKNOWN_BASELINE_MINUTES * 60:
-                reason = "state_push_failed (no baseline)"
-    if reason:
-        state["autobook_blocked"] = {"reason": reason, "since": (marker or {}).get("sent_at") or datetime.now(TZ).isoformat()}
-        return True
-    state.pop("autobook_blocked", None)
-    return False
+def write_run_file(info):
+    save_state(info, RUN_FILE)  # atomic, like state.json
+
+
+def note_run_attempt(key):
+    """Called before each write-ahead record: this run made an auto-book
+    attempt for `key`. Raises if it can't be recorded (then no POST)."""
+    info = json.loads(RUN_FILE.read_text(encoding="utf-8"))
+    info["attempt_keys"] = sorted(set(info.get("attempt_keys", [])) | {key})
+    write_run_file(info)
+
+
+def handle_push_marker(state):
+    """Run start. Returns True if auto-book must stay off this run (a halt
+    was written, or the marker/cache can't be read, or this run's attempts
+    can't be recorded). A marker from a failed push that made auto-book
+    attempts becomes a durable autobook_halted (reason, keys, no refs),
+    recorded as handled so it is never re-applied once the halt is deleted.
+    A failed push without attempts pauses nothing."""
+    marker, problem, bad_episode = read_push_marker()
+    handled = state.get(HANDLED_KEY) if isinstance(state.get(HANDLED_KEY), list) else []
+    carry_keys, carry_attempted, block = [], False, False
+    if problem and bad_episode is None:
+        # Can't see the marker at all (cache down): no auto-book this run. If a
+        # real one is there, the next run with a working cache handles it.
+        state["autobook_blocked"] = {"reason": problem, "since": datetime.now(TZ).isoformat()}
+        block = True
+    else:
+        state.pop("autobook_blocked", None)
+        if bad_episode is not None:  # an unreadable marker: assume it recorded attempts
+            marker = {"episode": bad_episode, "autobook_attempted": True, "autobook_keys": [], "keys_unknown": True,
+                      "sent_at": datetime.now(TZ).isoformat()}
+        if marker and marker.get("autobook_attempted") and marker["episode"] not in handled:
+            keys = sorted({k for k in marker.get("autobook_keys", []) if isinstance(k, str)})
+            unknown = bool(marker.get("keys_unknown"))
+            if is_halted(state):
+                h = state["autobook_halted"]
+                if not isinstance(h, dict):
+                    h = state["autobook_halted"] = {"reason": "set_in_state_json", "value_was": type(h).__name__}
+                h["push_failed_keys"] = sorted(set(h.get("push_failed_keys", [])) | set(keys))
+            else:
+                state["autobook_halted"] = {"reason": PUSH_HALT_REASON, "keys": keys, "keys_unknown": unknown,
+                                            "since": marker.get("sent_at") or datetime.now(TZ).isoformat()}
+            state[HANDLED_KEY] = (handled + [marker["episode"]])[-20:]
+            log(f"🔴 an earlier run's state.json wasn't saved after auto-book attempts ({', '.join(keys) or 'keys unknown'}) "
+                "— auto-book HALTED")
+            try_save_state(state)  # durable before anything else
+            # Until this run's state (with the halt) reaches git, keep it in the next marker.
+            carry_keys, carry_attempted = keys, True
+            block = True
+    try:
+        write_run_file({"started_at": datetime.now(TZ).isoformat(), "attempt_keys": [],
+                        "carry_keys": carry_keys, "carry_attempted": carry_attempted})
+    except Exception as e:
+        log(f"⚠ couldn't write {RUN_FILE.name} ({type(e).__name__}) — no auto-book this run")
+        block = True
+    return block
 
 
 def alert_state_not_saved(reason, remote_blob=None):
-    """Called by monitor.yml when this run's state.json couldn't be pushed:
-    the next run starts from the older state.json in the repo, which may
-    lack the auto-book records written in this run. Writes the marker that
-    keeps auto-book off until a push succeeds (even if the email fails), and
-    emails once per episode: not again while the repo's state.json
-    (remote_blob, its git blob id) is the one already emailed about."""
+    """Called by monitor.yml when this run's state.json couldn't be pushed.
+    Writes the marker FIRST (whether this run — or an unhandled earlier
+    one — made auto-book attempts, and which keys; unknown = assume yes),
+    then emails once per episode (deduped by the repo's state.json blob)."""
     blob = remote_blob if remote_blob and remote_blob != "unknown" else (
         os.environ.get(REPO_STATE_BLOB_ENV, "").strip() or None)
     if blob == "unknown":
         blob = None
-    marker, _ = read_push_marker()
-    same_episode = bool(blob) and isinstance(marker, dict) and marker.get("remote_blob") == blob
-    new_marker = {"remote_blob": blob,
-                  "sent_at": marker.get("sent_at") if same_episode else datetime.now(TZ).isoformat(),
-                  "emailed": bool(same_episode and marker.get("emailed"))}
+    try:
+        run = json.loads(RUN_FILE.read_text(encoding="utf-8"))
+        keys = sorted(set(run.get("attempt_keys", [])) | set(run.get("carry_keys", [])))
+        attempted = bool(run.get("attempt_keys")) or bool(run.get("carry_attempted"))
+        keys_unknown = False
+    except (OSError, ValueError, AttributeError, TypeError):
+        keys, attempted, keys_unknown = [], True, True  # can't tell: assume the worst
+    prev, _, _ = read_push_marker()
+    same_episode = bool(blob) and isinstance(prev, dict) and prev.get("remote_blob") == blob
+    new_marker = {"episode": uuid.uuid4().hex[:16], "remote_blob": blob, "sent_at": datetime.now(TZ).isoformat(),
+                  "emailed": bool(same_episode and prev.get("emailed") and not attempted),
+                  "autobook_attempted": attempted, "autobook_keys": keys, "keys_unknown": keys_unknown}
 
     def write_marker():
         try:
@@ -852,27 +911,24 @@ def alert_state_not_saved(reason, remote_blob=None):
         except OSError as e:
             log(f"⚠ couldn't write {STATE_ALERT_MARKER.name}: {type(e).__name__}")
 
-    write_marker()  # first: the pause must not depend on the email or the config
+    write_marker()  # first: the halt must not depend on the email or the config
     if new_marker["emailed"]:
-        log(f"state-not-saved email already sent for this episode (since {new_marker['sent_at']}) — not resending")
+        log("state-not-saved email already sent for this episode — not resending")
         return EXIT_OK
     email = email_settings(load_config())
     if email is None:
         return EXIT_SETUP
-    try:
-        records = {k: v.get("status") for k, v in load_state().get(autobook.LIVE_KEY, {}).items()}
-    except StateUnreadable:
-        records = None
-    lines = ([f"  {k}: {v}" for k, v in sorted(records.items())] or ["  (none)"]) if records is not None \
-        else ["  (this run's state.json couldn't be read either)"]
-    body = (f"This run's {STATE_FILE.name} couldn't be saved to the repo ({reason}).\n\n"
-            "The next runs start from the older state.json in the repo, which may not know what this\n"
-            "run auto-booked. So auto-book is PAUSED (notify-only) until a later run saves\n"
-            "state.json; it then resumes by itself. Check My bookings now:\n\n"
+    if attempted:
+        what = ("This run made auto-book attempts for:\n" + "\n".join(f"  {k}" for k in keys)
+                if keys else "This run may have made auto-book attempts (couldn't tell which).") + (
+            "\n\nTheir records are NOT in the repo. The next run halts auto-book (durably, in\n"
+            "state.json) and emails you the restore steps. Check My bookings now for those times:\n")
+    else:
+        what = ("This run made no auto-book attempt, so nothing important was lost; auto-book carries\n"
+                "on. For reference, My bookings:\n")
+    body = (f"This run's {STATE_FILE.name} couldn't be saved to the repo ({reason}).\n\n{what}\n"
             f"  {BASE}/bookings?tab=pending\n  {BASE}/bookings\n\n"
-            "Auto-book records this run held (date|time: status):\n" + "\n".join(lines) + "\n\n"
-            "Then check the Actions log for why the push failed.\n\n"
-            "You get this email once per episode.\n")
+            "Then check the Actions log for why the push failed.\n")
     try:
         send_email(STATE_NOT_SAVED_SUBJECT, body, *email)
     except Exception as e:

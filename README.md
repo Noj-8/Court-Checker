@@ -146,7 +146,7 @@ the 🎾 line for this location says *auto-book already attempted at
 | ℹ️ Already booked: … | You already have a booking at that date and time | Nothing |
 | ℹ️ Not auto-booking … — can't check your bookings | A booking's date/time couldn't be read, so it didn't risk a double booking | Book manually if you want it; it keeps trying quietly |
 | 🔴 state.json unreadable — auto-book halted | `state.json` (which holds the "already booked" records) is missing, couldn't be read, or isn't the shape the monitor writes. Auto-book is **halted**: no booking requests at all. Slot-open emails carry on | Follow the [restore steps](#if-auto-book-is-halted) (they're in the email too) |
-| 🔴 state not saved — check before trusting auto-book | A run's `state.json` couldn't be pushed to the repo, so the next runs start from an older one. Auto-book is **paused** (notify-only) until a later run saves `state.json`, then resumes by itself. It lists the auto-book records that run held | Check My bookings, then the Actions log for why the push failed. Sent once per episode |
+| 🔴 state not saved — check before trusting auto-book | A run's `state.json` couldn't be pushed to the repo. It lists any auto-book attempts that run made. Without attempts nothing is paused; with attempts the next run **halts** auto-book (see [below](#if-a-runs-statejson-couldnt-be-saved)) | Check My bookings, then the Actions log for why the push failed. Sent once per episode |
 
 Each result is sent once per date + time. If a result email can't be sent,
 that time is included in the normal 🎾 email instead. A failure inside
@@ -168,7 +168,8 @@ writes, the monitor keeps the bad copy aside on the runner and writes a fresh
 🔴 email. Auto-book stays off, whatever `AUTOBOOK_MODE` says, and the
 dashboard banner says *HALTED*. Slot-open emails carry on.
 
-Auto-book is halted whenever the `"autobook_halted"` key is in `state.json`,
+A failed `state.json` push after an auto-book attempt halts it the same way
+(see below). Auto-book is halted whenever the `"autobook_halted"` key is in `state.json`,
 whatever its value (`{}` and `null` included). The only way to clear it is
 to delete the key, which `restore_state.py` does. The email contains these
 steps (plain commands, the same in bash and zsh):
@@ -197,14 +198,40 @@ To restore and resume (on the Mac, in court-checker-live):
 
 ### If a run's state.json couldn't be saved
 
-If a run can't push `state.json`, the next runs start from an older copy that
-may not know what that run auto-booked. So the workflow keeps a small marker
-in the Actions cache: the id of the repo's `state.json` at the moment of the
-failure. While the repo's `state.json` is still that one, no later push has
-succeeded, and auto-book is **paused** (notify-only). The dashboard says
-*PAUSED*, and `state.json` has `"autobook_blocked"`. It resumes by itself
-once a push succeeds. If the marker or the cache can't be read, that run
-doesn't auto-book. You get one 🔴 "state not saved" email per episode.
+If a run can't push `state.json`, the workflow records in a small marker (in
+the Actions cache) whether that run made any auto-book attempt, and for which
+date|time keys.
+
+- **No attempt:** nothing important was lost, so nothing is paused. You get
+  one 🔴 "state not saved" email per episode.
+- **One or more attempts:** their records aren't in the repo. The next run
+  writes `"autobook_halted"` into `state.json` (reason
+  `state_push_failed_after_autobook`, the affected date|times, no refs), so
+  the halt is durable in git and survives later successful pushes. It sends
+  one 🔴 email listing those date|times and the restore steps above. Only
+  deleting the key (`restore_state.py`) clears it. The marker is recorded as
+  handled, so it is never applied again.
+- **The marker or the cache can't be read:** that run doesn't auto-book. An
+  unreadable marker is treated as "made attempts" and halts the same way.
+
+### If a job is killed after a booking request
+
+If the runner dies between the booking request and the workflow's commit step,
+nothing reaches the repo: no record, no marker, no email. (A cancelled job
+still runs the commit step, which is set to always run.) The guard is the
+existing-bookings check, which every attempt runs first:
+
+- A paid booking stays on the **Upcoming** list, with its date and time
+  range, so the same time is never booked again.
+- An awaiting-payment booking stays on the **Awaiting payment** list. The bot
+  can't recognise it as its own (that record was lost), so it reads the
+  booking's own page (`/bookings/SPORTS-…`) for its date and time, and the
+  overlap blocks the same time.
+- If that page can't be read, auto-book doesn't book that time (fail closed),
+  and you get one ℹ️ email.
+
+The lost booking itself still needs you: pay it within 15 minutes, or let it
+lapse.
 
 ### Emergency: turn it off
 

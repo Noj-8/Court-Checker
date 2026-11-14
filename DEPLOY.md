@@ -97,8 +97,9 @@ Open <https://court-checker.vercel.app> and sign in with GitHub. You should see:
   - **AUTO-BOOK — books with Wallet when it opens** (in red)
 
   The banner above the list says the same. It says *HALTED* while
-  `state.json` has an `"autobook_halted"` entry, and *PAUSED* after a failed
-  state push, until a later push succeeds. Until a monitor run has reported a
+  `state.json` has an `"autobook_halted"` entry (including after a failed
+  state push that followed an auto-book attempt). It says *PAUSED* for a run
+  that couldn't check the push-failure marker. Until a monitor run has reported a
   mode, the dashboard shows "mode unknown" with the cautious, red live-style
   wording.
 - **Bot session:** one of

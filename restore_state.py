@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Restore auto-book records after a halt ("🔴 state.json unreadable — auto-book
-halted"). Run on the Mac, in court-checker-live, after `git pull --rebase`:
+halted"). Run on the Mac after `git pull --rebase` (from any folder: it always works on
+the checkout it lives in, court-checker-live):
 
     python3 restore_state.py
 
@@ -19,11 +20,18 @@ current state.json can't be read (state.json is left untouched).
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-import monitor
+# Always work on the checkout this script lives in (court-checker-live),
+# whatever folder it is run from.
+HERE = Path(__file__).resolve().parent
+os.chdir(HERE)
+sys.path.insert(0, str(HERE))
+
+import monitor  # noqa: E402  (after the chdir: the repo's own monitor.py)
 
 STORES = ("autobook", "autobook_dry_run", "autobook_retry")
 MAX_VERSIONS = 500
@@ -63,8 +71,24 @@ def find_last_good(repo):
     return None, None, None, skipped
 
 
+def check_repo(repo):
+    """None if `repo` is a git checkout with state.json, else what's wrong."""
+    r = git(repo, "rev-parse", "--show-toplevel")
+    if r.returncode != 0:
+        return f"{repo} isn't a git repository (restore_state.py must stay in court-checker-live)"
+    if Path(r.stdout.strip()).resolve() != Path(repo).resolve():
+        return f"{repo} isn't the top of its git repository (restore_state.py must stay in court-checker-live)"
+    if not (Path(repo) / "state.json").exists():
+        return f"there's no state.json in {repo} — did you git pull?"
+    return None
+
+
 def main(repo=None):
-    repo = Path(repo or Path.cwd())
+    repo = Path(repo or HERE)
+    problem = check_repo(repo)
+    if problem:
+        print(f"ERROR: {problem}. Nothing changed.")
+        return 1
     path = repo / "state.json"
     try:
         current = json.loads(path.read_text(encoding="utf-8"))

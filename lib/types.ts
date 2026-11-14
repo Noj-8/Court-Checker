@@ -48,8 +48,9 @@ export type State = {
   // when state.json was found missing/unreadable/wrong shape; auto-book stays
   // off until the key is deleted (restore_state.py does that).
   autobook_halted?: unknown
-  // Set while an earlier run's state.json push failed and no later push has
-  // succeeded: auto-book is paused and resumes by itself.
+  // Set for a run that couldn't read the push-failure marker (Actions cache):
+  // that run booked nothing. A failed push after auto-book attempts becomes
+  // autobook_halted instead.
   autobook_blocked?: { reason: string; since?: string }
   last_check?: string             // ISO datetime of the last pass that READ a booking page
   currently_open_count?: number   // watched TIME SLOTS open right now (per time, not per court)

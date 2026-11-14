@@ -31,9 +31,9 @@ function modeText(mode: ModeView, halted: boolean, blocked: boolean) {
             "\"autobook_halted\" entry is removed (run restore_state.py — see the email). Starred times get a " +
             "normal alert — book manually."
           : blocked
-            ? "Auto-book is PAUSED: a run's state.json couldn't be saved to the repo, so the monitor books " +
-              "nothing until a later run saves it (it resumes by itself). Starred times get a normal alert — " +
-              "book manually."
+            ? "Auto-book was PAUSED for the latest run: it couldn't check whether an earlier run's " +
+              "state.json was saved, so it booked nothing. It retries every run. Starred times get a normal " +
+              "alert — book manually."
             : "Auto-book is off. Starred times get a normal alert — book manually.",
         bannerClass: CAUTION,
         label: "starred — notify only (auto-book off)",

@@ -682,10 +682,10 @@ class TestCrashAfterWriteAhead(AutobookTestCase):
         real_save = monitor.save_state
         calls = {"n": 0}
 
-        def save(state):
+        def save(state, *a, **kw):
             if state.get(autobook.LIVE_KEY, {}).get(self.key, {}).get("status") == "in_progress":
                 raise OSError("disk full")
-            return real_save(state)
+            return real_save(state, *a, **kw)
         with mock.patch.object(monitor, "save_state", side_effect=save):
             code, sent = self.run_mode("live")
         self.assertEqual(self.site.posts_sent(), [])
@@ -1457,6 +1457,34 @@ class TestRestoreState(unittest.TestCase):
         self.assertIn("Nothing to do", r.stdout)
         self.assertEqual(json.loads((repo / "state.json").read_text()), {"known_open": {}})
 
+    def test_it_works_on_its_own_folder_from_anywhere(self):
+        origin, repo = self.make_history()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        r = subprocess.run([sys.executable, str(repo / "restore_state.py")], cwd=elsewhere, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("autobook_halted", json.loads((repo / "state.json").read_text()))
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_outside_a_git_checkout_it_says_so(self):
+        plain = self.root / "not-a-repo"
+        plain.mkdir()
+        for f in self.CODE:
+            shutil.copy(Path(__file__).resolve().parent / f, plain / f)
+        (plain / "state.json").write_text(json.dumps({"autobook_halted": {}}))
+        r = subprocess.run([sys.executable, str(plain / "restore_state.py")], cwd=self.root, capture_output=True, text=True,
+                           env={**os.environ, "GIT_CEILING_DIRECTORIES": str(self.root)})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("isn't a git repository", r.stdout)
+        self.assertEqual(json.loads((plain / "state.json").read_text()), {"autobook_halted": {}})
+
+    def test_a_checkout_without_state_json_says_so(self):
+        origin, repo = self.make_history()
+        (repo / "state.json").unlink()
+        r = self.run_restore(repo)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("there's no state.json", r.stdout)
+
     def test_an_unreadable_current_file_is_left_alone(self):
         origin, repo = self.make_history()
         (repo / "state.json").write_text("{nope")
@@ -1504,43 +1532,61 @@ class TestAlertOnlyTheAttemptedLocation(AutobookTestCase):
 
 
 class TestStateNotSaved(MonitorTestCase):
-    def call(self, blob, fail=False):
+    def call(self, blob, fail=False, run_info=None, extra_env=None):
+        if run_info is not None:
+            (self.dir / ".autobook_run.json").write_text(json.dumps(run_info))
         sent = []
 
         def send(s, b, *a):
             if fail:
                 raise smtplib.SMTPException("down")
             sent.append({"subject": s, "body": b})
-        env = {**EMAIL_ENV, **({"REMOTE_STATE_BLOB": blob} if blob is not None else {})}
+        env = {**EMAIL_ENV, **({"REMOTE_STATE_BLOB": blob} if blob is not None else {}), **(extra_env or {})}
         with mock.patch.dict(os.environ, env, clear=True), \
              mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
              mock.patch.object(monitor, "STATE_FILE", self.state_file), \
-             mock.patch.object(monitor, "STATE_ALERT_MARKER", self.dir / ".state_alert.json"), \
              mock.patch.object(monitor, "send_email", side_effect=send), contextlib.redirect_stdout(io.StringIO()):
             code = monitor.main(["--alert-state-not-saved", "push failed"])
         return code, sent
 
-    def test_email_lists_this_runs_records_and_is_deduped_per_repo_state(self):
-        self.state_file.write_text(json.dumps({"autobook": {"2026-11-15|23:00": {"status": "parked", "attempts": []}}}))
-        code, sent = self.call("blob1")
+    def test_no_known_blob_at_all_always_emails(self):
+        unknown = {"REPO_STATE_BLOB": "unknown"}
+        self.assertEqual(len(self.call("unknown", run_info=self.NO_ATTEMPT, extra_env=unknown)[1]), 1)
+        self.assertEqual(len(self.call("unknown", run_info=self.NO_ATTEMPT, extra_env=unknown)[1]), 1,
+                         "can't tell episodes apart: always email")
+        self.assertIsNone(json.loads((self.dir / ".state_alert.json").read_text())["remote_blob"])
+
+    def test_the_checkout_blob_is_the_fallback_episode_id(self):
+        b1 = {"REPO_STATE_BLOB": "B1"}
+        self.assertEqual(len(self.call("unknown", run_info=self.NO_ATTEMPT, extra_env=b1)[1]), 1)
+        self.assertEqual(self.call("unknown", run_info=self.NO_ATTEMPT, extra_env=b1)[1], [], "same episode")
+
+    NO_ATTEMPT = {"attempt_keys": [], "carry_keys": [], "carry_attempted": False}
+
+    def test_without_attempts_one_email_per_episode(self):
+        code, sent = self.call("blob1", run_info=self.NO_ATTEMPT)
         self.assertEqual(code, monitor.EXIT_OK)
         self.assertEqual([m["subject"] for m in sent], [monitor.STATE_NOT_SAVED_SUBJECT])
-        self.assertIn("2026-11-15|23:00: parked", sent[0]["body"])
-        self.assertIn("bookings?tab=pending", sent[0]["body"])
-        self.assertEqual(self.call("blob1")[1], [], "same repo state.json: no second email")
-        self.assertEqual(len(self.call("blob2")[1]), 1, "the repo moved on: a new episode")
-        self.assertEqual(len(self.call("unknown")[1]), 1, "can't tell: always email")
-        self.assertEqual(len(self.call("unknown")[1]), 1, "... every time")
-        self.assertEqual(len(self.call(None)[1]), 1)
-        self.assertEqual(len(self.call(None)[1]), 1)
+        self.assertEqual(self.call("blob1", run_info=self.NO_ATTEMPT)[1], [], "same repo state.json: same episode")
+        self.assertEqual(len(self.call("blob2", run_info=self.NO_ATTEMPT)[1]), 1, "the repo moved on: a new episode")
+        self.assertEqual(len(self.call("unknown", run_info=self.NO_ATTEMPT)[1]), 1, "can't tell: always email")
+        self.assertEqual(len(self.call("unknown", run_info=self.NO_ATTEMPT)[1]), 1)
+
+    def test_with_attempts_the_email_lists_them_and_the_marker_records_them(self):
+        code, sent = self.call("blob1", run_info={"attempt_keys": ["2026-11-15|23:00"], "carry_keys": [], "carry_attempted": False})
+        self.assertIn("2026-11-15|23:00", sent[0]["body"])
+        self.assertIn("halts auto-book", sent[0]["body"])
+        marker = json.loads((self.dir / ".state_alert.json").read_text())
+        self.assertEqual((marker["autobook_attempted"], marker["autobook_keys"]), (True, ["2026-11-15|23:00"]))
+        self.assertNotIn("SPORTS-", (self.dir / ".state_alert.json").read_text())
 
     def test_a_failed_send_still_writes_the_marker_and_retries_the_email(self):
-        code, sent = self.call("blob1", fail=True)
+        code, sent = self.call("blob1", fail=True, run_info=self.NO_ATTEMPT)
         self.assertEqual(code, monitor.EXIT_ERROR)
         marker = json.loads((self.dir / ".state_alert.json").read_text())
-        self.assertEqual((marker["remote_blob"], marker["emailed"]), ("blob1", False), "the pause doesn't depend on the email")
-        self.assertEqual(len(self.call("blob1")[1]), 1, "not emailed yet: sent on the next failure")
-        self.assertEqual(self.call("blob1")[1], [])
+        self.assertEqual((marker["remote_blob"], marker["emailed"]), ("blob1", False))
+        self.assertEqual(len(self.call("blob1", run_info=self.NO_ATTEMPT)[1]), 1, "not emailed yet: sent next time")
+        self.assertEqual(self.call("blob1", run_info=self.NO_ATTEMPT)[1], [])
 
     def test_workflow_sends_it_when_the_push_fails(self):
         wf = (Path(__file__).resolve().parent / ".github" / "workflows" / "monitor.yml").read_text(encoding="utf-8")
@@ -1638,120 +1684,179 @@ class TestHaltIsTheKey(AutobookTestCase):
 
 
 class TestPushFailurePause(AutobookTestCase):
-    MARKER_ENV = {"PUSH_MARKER_STATUS": "success"}
+    """A failed state push: harmless without auto-book attempts; after one,
+    a durable halt in state.json that only deleting the key clears."""
 
-    def fail_push(self, blob, fail_email=False):
-        """What monitor.yml does after a failed push."""
+    def fail_push(self, blob="B1"):
+        """What monitor.yml does after this run's push failed (the run file
+        is the one the last run_mode() left behind)."""
         sent = []
-
-        def send(s, b, *a):
-            if fail_email:
-                raise smtplib.SMTPException("down")
-            sent.append(s)
         with mock.patch.dict(os.environ, {**EMAIL_ENV, "REMOTE_STATE_BLOB": blob}, clear=True), \
              mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
              mock.patch.object(monitor, "STATE_FILE", self.state_file), \
-             mock.patch.object(monitor, "send_email", side_effect=send), contextlib.redirect_stdout(io.StringIO()):
+             mock.patch.object(monitor, "send_email", side_effect=lambda s, b, *a: sent.append({"subject": s, "body": b})), \
+             contextlib.redirect_stdout(io.StringIO()):
             monitor.main(["--alert-state-not-saved", "push failed"])
         return sent
 
-    def live(self, blob, status="success"):
+    def marker(self):
+        return json.loads((self.dir / ".state_alert.json").read_text())
+
+    def live(self, status="success", repo_state=None):
+        """The next run. repo_state: what the repo's state.json is (a failed
+        push means the run's own state never got there)."""
         self.site.sent.clear()
-        self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
-        return self.run_mode("live", env={"PUSH_MARKER_STATUS": status, "REPO_STATE_BLOB": blob})
+        if repo_state is not None:
+            self.state_file.write_text(json.dumps(repo_state))
+        else:
+            self.state_file.write_text(json.dumps({**self.state(), "known_open": {}}))
+        return self.run_mode("live", env={"PUSH_MARKER_STATUS": status, "REPO_STATE_BLOB": "B1"})
 
     def book_ok(self):
         self.site.posts = [parked_redirect()]
         self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
 
-    def test_an_episode_pauses_auto_book_emails_once_then_resumes(self):
-        self.assertEqual(self.fail_push("B1"), [monitor.STATE_NOT_SAVED_SUBJECT])
-        for _ in range(3):  # the following runs: the repo's state.json is still B1
-            code, sent = self.live("B1")
+    def attempt_then_fail_push(self):
+        before = self.state()
+        self.book_ok()
+        self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        sent = self.fail_push()
+        return before, sent
+
+    def test_a_failed_push_without_an_attempt_pauses_nothing(self):
+        self.write_config([target(self.date, [("23:00", False)], locations=("LOC002",))])
+        self.run_mode("live")
+        sent = self.fail_push()
+        self.assertEqual([m["subject"] for m in sent], [monitor.STATE_NOT_SAVED_SUBJECT], "still one email")
+        self.assertIn("made no auto-book attempt", sent[0]["body"])
+        self.assertFalse(self.marker()["autobook_attempted"])
+        self.assertEqual(self.fail_push(), [], "once per episode")
+        self.write_config([target(self.date, [("23:00", True)], locations=("LOC002",))])
+        self.book_ok()
+        self.live(repo_state={})
+        self.assertEqual(len(self.site.posts_sent()), 1, "no pause")
+        self.assertNotIn("autobook_halted", self.state())
+
+    def test_a_failed_push_after_an_attempt_halts_durably(self):
+        before, sent = self.attempt_then_fail_push()
+        self.assertEqual(self.marker()["autobook_keys"], [self.key])
+        self.assertTrue(self.marker()["autobook_attempted"])
+        self.assertIn(self.key, sent[0]["body"])
+        # The next run starts from the repo's state.json, which lacks this run's records.
+        code, sent = self.live(repo_state=before)
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertNotIn("/bookings", [x["path"] for x in self.site.sent], "no auto-book requests")
+        halt = self.state()["autobook_halted"]
+        self.assertEqual((halt["reason"], halt["keys"]), (monitor.PUSH_HALT_REASON, [self.key]))
+        self.assertNotIn("SPORTS-", self.state_file.read_text(), "no refs")
+        halt_mail = [m for m in sent if m["subject"] == monitor.STATE_UNREADABLE_SUBJECT]
+        self.assertEqual(len(halt_mail), 1)
+        self.assertIn(self.key, halt_mail[0]["body"])
+        self.assertIn(monitor.HALT_RESTORE_STEPS, halt_mail[0]["body"])
+        self.assertTrue(any(m["subject"].startswith("🎾") for m in sent), "notify-only carries on")
+        # Later runs (their pushes succeed): still halted, no repeat email, the marker isn't re-applied.
+        for _ in range(3):
+            code, sent = self.live()
             self.assertEqual(self.site.posts_sent(), [])
-            self.assertNotIn("/bookings", [s["path"] for s in self.site.sent], "no auto-book requests at all")
-            self.assertTrue(any(m["subject"].startswith("🎾") for m in sent), "notify-only carries on")
-            self.assertEqual(self.state()["autobook_mode"], "off")
-            self.assertEqual(self.state()["autobook_blocked"]["reason"], "state_push_failed")
-            self.assertEqual(self.fail_push("B1"), [], "one email per episode, even if pushes keep failing")
-        # A later push succeeded: the repo's state.json is now B2.
+            self.assertIn("autobook_halted", self.state())
+            self.assertNotIn(monitor.STATE_UNREADABLE_SUBJECT, self.subjects(sent))
+        # Only deleting the key clears it — and the marker (still in the cache)
+        # isn't applied again. The lost booking is still on My bookings, so the
+        # existing-bookings check stops a second one.
+        state = self.state()
+        del state["autobook_halted"]
+        self.site.pending = [self.p.pending_with_ref()]
+        code, sent = self.live(repo_state={**state, "known_open": {}})
+        self.assertNotIn("autobook_halted", self.state())
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertIn(f"ℹ️ Already booked: {self.date} 23:00 — not auto-booking", self.subjects(sent))
+
+    def test_the_halt_is_carried_through_another_failed_push(self):
+        before, _ = self.attempt_then_fail_push()
+        self.live(repo_state=before)  # writes the halt... but this push fails too
+        self.fail_push()
+        self.assertTrue(self.marker()["autobook_attempted"], "carried into the next marker")
+        self.assertEqual(self.marker()["autobook_keys"], [self.key])
+        self.live(repo_state=before)  # the repo still has neither
+        self.assertEqual(self.state()["autobook_halted"]["keys"], [self.key])
+        self.assertEqual(self.site.posts_sent(), [])
+
+    def test_a_halt_already_there_gets_the_keys_added(self):
+        before, _ = self.attempt_then_fail_push()
+        self.live(repo_state={**before, "autobook_halted": None})
+        halt = self.state()["autobook_halted"]
+        self.assertEqual(halt["push_failed_keys"], [self.key])
+
+    def test_an_unreadable_cache_blocks_only_that_run(self):
         self.book_ok()
-        code, sent = self.live("B2")
-        self.assertEqual(len(self.site.posts_sent()), 1, "auto-book resumes by itself")
-        self.assertEqual(self.state()["autobook_mode"], "live")
+        self.live(status="failure")
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertIn("autobook_blocked", self.state())
+        self.assertNotIn("autobook_halted", self.state())
+        self.book_ok()
+        self.live()
+        self.assertEqual(len(self.site.posts_sent()), 1)
         self.assertNotIn("autobook_blocked", self.state())
 
-    def fail_push_env(self, env):
-        sent = []
-        with mock.patch.dict(os.environ, {**EMAIL_ENV, **env}, clear=True), \
-             mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
-             mock.patch.object(monitor, "STATE_FILE", self.state_file), \
-             mock.patch.object(monitor, "send_email", side_effect=lambda s, b, *a: sent.append(s)), \
-             contextlib.redirect_stdout(io.StringIO()):
-            monitor.main(["--alert-state-not-saved", "push failed"])
-        return sent
-
-    def test_no_known_blob_at_all_always_emails(self):
-        env = {"REMOTE_STATE_BLOB": "unknown", "REPO_STATE_BLOB": "unknown"}
-        self.assertEqual(self.fail_push_env(env), [monitor.STATE_NOT_SAVED_SUBJECT])
-        self.assertEqual(self.fail_push_env(env), [monitor.STATE_NOT_SAVED_SUBJECT], "can't tell episodes apart")
-        self.assertIsNone(json.loads((self.dir / ".state_alert.json").read_text())["remote_blob"])
-
-    def test_the_checkout_blob_is_the_fallback_baseline(self):
-        env = {"REMOTE_STATE_BLOB": "unknown", "REPO_STATE_BLOB": "B1"}
-        self.assertEqual(self.fail_push_env(env), [monitor.STATE_NOT_SAVED_SUBJECT])
-        self.assertEqual(self.fail_push_env(env), [], "same episode")
-        self.book_ok()
-        self.live("B1")
-        self.assertEqual(self.site.posts_sent(), [])
-        self.live("B2")
-        self.assertEqual(len(self.site.posts_sent()), 1)
-
-    def test_a_new_episode_emails_again(self):
-        self.fail_push("B1")
-        self.assertEqual(self.fail_push("B2"), [monitor.STATE_NOT_SAVED_SUBJECT])
-        self.live("B2")
-        self.assertEqual(self.site.posts_sent(), [])
-
-    def test_if_the_email_fails_the_pause_still_holds(self):
-        self.assertEqual(self.fail_push("B1", fail_email=True), [])
-        self.live("B1")
-        self.assertEqual(self.site.posts_sent(), [])
-        self.assertEqual(self.fail_push("B1"), [monitor.STATE_NOT_SAVED_SUBJECT], "sent at the next chance")
-
-    def test_unreadable_marker_or_cache_means_no_auto_book(self):
-        cases = {
-            "cache restore failed": lambda: self.live("B1", status="failure"),
-            "cache restore cancelled/skipped": lambda: self.live("B1", status="cancelled"),
-            "marker isn't JSON": lambda: ((self.dir / ".state_alert.json").write_text("{x"), self.live("B1")),
-            "marker isn't an object": lambda: ((self.dir / ".state_alert.json").write_text("[1]"), self.live("B1")),
-            "current blob unknown": lambda: (self.fail_push("B1"), self.live("unknown")),
-            "current blob not given": lambda: (self.fail_push("B1"), self.run_mode("live", env=self.MARKER_ENV)),
-        }
-        for label, go in cases.items():
-            with self.subTest(label):
+    def test_an_unreadable_marker_is_a_halt_with_unknown_keys(self):
+        for raw in ("{x", "[1]", json.dumps({"no": "episode"})):
+            with self.subTest(raw=raw):
                 self.setUp()
+                (self.dir / ".state_alert.json").write_text(raw)
                 self.book_ok()
-                go()
+                self.live()
                 self.assertEqual(self.site.posts_sent(), [])
-                self.assertIn("autobook_blocked", self.state())
-
-    def test_no_marker_books_normally(self):
-        self.book_ok()
-        self.live("B1")
-        self.assertEqual(len(self.site.posts_sent()), 1)
-        self.assertNotIn("autobook_blocked", self.state())
-
-    def test_a_marker_without_a_baseline_pauses_for_an_hour(self):
-        now = monitor.datetime.now(monitor.TZ)
-        for age, blocked in ((timedelta(minutes=10), True), (timedelta(hours=2), False)):
-            with self.subTest(age=age):
-                self.setUp()
-                (self.dir / ".state_alert.json").write_text(json.dumps(
-                    {"remote_blob": None, "sent_at": (now - age).isoformat(), "emailed": True}))
+                halt = self.state()["autobook_halted"]
+                self.assertEqual((halt["reason"], halt["keys_unknown"]), (monitor.PUSH_HALT_REASON, True))
+                state = self.state()
+                del state["autobook_halted"]
                 self.book_ok()
-                self.live("B9")
-                self.assertEqual(self.site.posts_sent() == [], blocked)
+                self.live(repo_state={**state, "known_open": {}})
+                self.assertEqual(len(self.site.posts_sent()), 1, "handled once; deleting the key resumes")
+
+    def test_a_missing_run_file_at_the_alert_is_assumed_to_have_attempts(self):
+        self.run_mode("live")
+        (self.dir / ".autobook_run.json").unlink()
+        sent = self.fail_push()
+        self.assertTrue(self.marker()["autobook_attempted"])
+        self.assertTrue(self.marker()["keys_unknown"])
+        self.live(repo_state={})
+        self.assertTrue(self.state()["autobook_halted"]["keys_unknown"])
+
+    def test_no_run_file_means_no_auto_book(self):
+        self.book_ok()
+        with mock.patch.object(monitor, "write_run_file", side_effect=OSError("disk")):
+            self.live()
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertEqual([x["path"] for x in self.site.sent], ["/booking"], "no auto-book requests at all")
+
+    def test_the_push_failure_halt_is_on_disk_before_an_early_return(self):
+        before, _ = self.attempt_then_fail_push()
+        self.state_file.write_text(json.dumps(before))
+        with mock.patch.dict(os.environ, {"PUSH_MARKER_STATUS": "success", "EMAIL_USER": "", "EMAIL_APP_PASSWORD": ""}, clear=True), \
+             mock.patch.object(monitor, "CONFIG_FILE", self.config_file), \
+             mock.patch.object(monitor, "STATE_FILE", self.state_file), contextlib.redirect_stdout(io.StringIO()):
+            code = monitor.run(iterations=1, interval=0, jar_path=self.jar, enc_path=self.enc)
+        self.assertEqual(code, monitor.EXIT_SETUP, "returned early: no email settings")
+        self.assertEqual(self.state()["autobook_halted"]["reason"], monitor.PUSH_HALT_REASON)
+
+    def test_an_attempt_that_cant_be_noted_is_never_posted(self):
+        self.book_ok()
+        with mock.patch.object(monitor, "note_run_attempt", side_effect=OSError("disk")):
+            code, sent = self.live()
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertTrue(sent[0]["subject"].startswith("🔴 Failed: "))
+        self.assertIn("did NOT send", sent[0]["body"])
+
+    def test_the_run_file_lists_this_runs_attempts_before_the_post(self):
+        def check(_n):
+            info = json.loads((self.dir / ".autobook_run.json").read_text())
+            self.assertEqual(info["attempt_keys"], [self.key], "noted before the write-ahead and the POST")
+        self.site.on_post = check
+        self.book_ok()
+        self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
 
     def test_workflow_restores_the_marker_before_the_monitor_runs(self):
         wf = (Path(__file__).resolve().parent / ".github" / "workflows" / "monitor.yml").read_text(encoding="utf-8")
@@ -1760,7 +1865,6 @@ class TestPushFailurePause(AutobookTestCase):
         self.assertLess(restore, run)
         self.assertIn("continue-on-error: true", wf[restore - 300:run])
         self.assertIn("PUSH_MARKER_STATUS: ${{ steps.push_marker.outcome }}", wf)
-        self.assertIn('REPO_STATE_BLOB="$(git rev-parse -q --verify HEAD:state.json || echo unknown)"', wf)
 
 
 class TestOtherLocationWording(AutobookTestCase):
@@ -1781,7 +1885,26 @@ class TestOtherLocationWording(AutobookTestCase):
         self.assertEqual(self.site.posts_sent(), [])
         slot = next(m for m in sent if m["subject"].startswith("🎾"))
         self.assertIn("— Crystal Sports G (", slot["body"])
-        self.assertIn("auto-book already attempted at Crystal Sports (result: 🟡) — see that email", slot["body"])
+        self.assertIn("auto-book already attempted at Crystal Sports (result: 🟡 booked, awaiting payment) — see that email",
+                      slot["body"])
+
+    def test_every_status_has_wording_never_a_question_mark(self):
+        statuses = set(autobook.TERMINAL) | {"refused", "started", "dry_run", "something new", ""}
+        for status in sorted(statuses):
+            with self.subTest(status=status):
+                a = {"starred": True, "date": self.date, "time": "23:00", "loc_id": "LOC002"}
+                state = {autobook.LIVE_KEY: {self.key: {"status": status, "loc": "LOC001"}}}
+                note = monitor.autobook_note(a, "live", {}, state)
+                self.assertIn("auto-book already attempted at Crystal Sports (result: ", note)
+                self.assertNotIn("?", note)
+                if status in autobook.RESULT_TEXT:
+                    self.assertIn(autobook.RESULT_TEXT[status], note)
+                else:
+                    self.assertIn(autobook.RESULT_UNKNOWN, note)
+        for status in ("refused", "started", "dry_run"):
+            self.assertIn(status, autobook.RESULT_TEXT)
+        for status in autobook.TERMINAL:
+            self.assertIn(status, autobook.RESULT_TEXT, "every stored status is worded")
 
     def test_no_attempt_elsewhere_keeps_the_usual_note(self):
         self.write_config([target(self.date, [("23:00", True), ("22:00", False)], locations=("LOC002",))])
@@ -1814,6 +1937,25 @@ class TestNewPendingBookingIsReadBeforeParked(AutobookTestCase):
                 self.assertTrue(sent[0]["subject"].startswith("🟠 Unclear"), sent[0]["subject"])
                 self.assertEqual(self.record()["reason"], reason)
                 self.assertIn(f"/bookings/{REF}", [x["path"] for x in self.site.sent])
+
+    def test_a_full_pre_check_budget_never_hides_the_real_booking(self):
+        # Ten pending bookings you made yourself (at other times) use up the
+        # whole pre-booking read budget; the bot's new booking is still read
+        # from its own page on the post-POST budget, and is 🟡.
+        others = [f"SPORTS-9000000001{i:02d}" for i in range(autobook.MAX_DETAIL_READS)]
+        rows = "".join(self.p.pending_with_ref(r).split('<div id="bookingList">')[1].split("</div>")[0] for r in others)
+        page = self.p.pending_empty().replace('<div id="bookingList">', '<div id="bookingList">' + rows, 1)
+        after = page.replace('<div id="bookingList">', '<div id="bookingList">' + self.p.pending_with_ref()
+                             .split('<div id="bookingList">')[1].split("</div>")[0], 1)
+        for i, r in enumerate(others):
+            self.site.details[r] = self.p.detail(r, time=f"{8 + i:02d}:00")
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [page, after]
+        code, sent = self.run_mode("live")
+        reads = [x["path"] for x in self.site.sent if x["path"].startswith("/bookings/")]
+        self.assertEqual(len(reads), autobook.MAX_DETAIL_READS + 1, "the cap was used up, then one post-POST read")
+        self.assertEqual(reads[-1], f"/bookings/{REF}")
+        self.assertTrue(sent[0]["subject"].startswith("🟡"), sent[0]["subject"])
 
     def test_matching_page_is_parked(self):
         self.site.posts = [parked_redirect()]

@@ -41,3 +41,4 @@ fixtures_raw/
 .state.json.*.tmp
 state.json.unreadable-*
 .state_alert.json
+.autobook_run.json

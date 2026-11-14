@@ -66,11 +66,28 @@ REF_RE = re.compile(r"SPORTS-\d{1,20}")
 SEL_RE = re.compile(r"\d{8}-\d{1,6}")              # a court's sel, e.g. 20261115-270
 PRICE_RE = re.compile(r"\d{1,6}(?:\.\d{1,2})?")
 SLOT_MINUTES = 60  # every grid slot is one hour
-MAX_DETAIL_READS = 10  # per pass: more unknown pending bookings than this -> fail closed
+MAX_DETAIL_READS = 10  # per pass, before booking: more unknown pending bookings than this -> fail closed
+MAX_POST_READS = 2     # per pass, after a POST: the new booking's own page (one per court tried)
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-RESULT_EMOJI = {"paid": "🟢", "parked": "🟡", "failed": "🔴", "aborted_mismatch": "🔴", "not_recorded": "🔴",
-                "unclear": "🟠", "interrupted": "🟠", "in_progress": "🟠", "skipped_existing": "ℹ️"}
+# What a stored record's status means, for the slot-open email's line about
+# the other location. Every status the flow can store has an entry; anything
+# else gets RESULT_UNKNOWN (never "?").
+RESULT_TEXT = {
+    "paid": "🟢 booked and paid",
+    "parked": "🟡 booked, awaiting payment",
+    "failed": "🔴 not booked",
+    "aborted_mismatch": "🔴 stopped: the booking form changed, nothing submitted",
+    "not_recorded": "🔴 stopped before submitting",
+    "refused": "🔴 the court was refused",
+    "unclear": "🟠 unclear — check My bookings",
+    "interrupted": "🟠 unclear (the run stopped mid-booking) — check My bookings",
+    "in_progress": "🟠 in progress or interrupted — check My bookings",
+    "started": "⏳ started, no result yet — check My bookings",
+    "skipped_existing": "ℹ️ skipped: you already had a booking then",
+    "dry_run": "🧪 dry run only, nothing booked",
+}
+RESULT_UNKNOWN = "🟠 status not recognised — check My bookings"
 TERMINAL = {"skipped_existing", "aborted_mismatch", "dry_run", "in_progress", "interrupted",
             "paid", "parked", "failed", "unclear", "not_recorded"}
 
@@ -149,8 +166,11 @@ def now_iso():
 class Context:
     """What the flow needs from monitor.py (passed in to avoid a circular import)."""
 
-    def __init__(self, jar, state, mode, send, save_state, try_save_state, log, locations):
+    def __init__(self, jar, state, mode, send, save_state, try_save_state, log, locations, note_attempt=None):
         self.jar, self.state, self.mode = jar, state, mode
+        # Records "this run made an auto-book attempt for key" outside state.json
+        # (for the push-failure marker), before the write-ahead. Raises -> no POST.
+        self.note_attempt = note_attempt or (lambda key: None)
         self.send, self.save_state, self.try_save_state, self.log = send, save_state, try_save_state, log
         self.locations = locations
         # (key, location) -> the result emoji of an email actually SENT this
@@ -159,6 +179,7 @@ class Context:
         self.emailed_slots = {}
         self.current_loc = None  # the location being attempted
         self.detail_cache = {}  # ref -> [(date, start, end)] or None (unreadable), for this pass
+        self.post_reads = 0  # the post-POST budget, separate from the pre-check cap
         # key -> {"court", "price"} as the page showed them: for this pass's
         # emails only, never written to state.json (it's public).
         self.labels = {}
@@ -235,25 +256,39 @@ def slot_page(ctx, href):
 
 # --- existing bookings ------------------------------------------------------------
 
-def booking_slots(ctx, ref):
+def booking_slots(ctx, ref, after_post=False):
     """The (date, start, end) of every court in booking `ref`, read from its
     own page (/bookings/SPORTS-…): the Awaiting-payment list doesn't show
-    them. None if unreadable. Cached for the pass. Logged by fingerprint."""
+    them. None if unreadable. Logged by fingerprint.
+    Before booking: cached for the pass and capped at MAX_DETAIL_READS.
+    after_post: the new booking's own page — a fresh read on its own budget
+    (MAX_POST_READS), so a full pre-check cap never hides a real booking."""
+    if after_post:
+        if ctx.post_reads >= MAX_POST_READS or not REF_RE.fullmatch(ref or ""):
+            return None
+        ctx.post_reads += 1
+        return _read_slots(ctx, ref)
     if ref in ctx.detail_cache:
         return ctx.detail_cache[ref]
     slots = None
     if REF_RE.fullmatch(ref or "") and len(ctx.detail_cache) < MAX_DETAIL_READS:
-        label = f"booking ref:{ref_fp(ref)}"
-        try:
-            page = booking_page.parse_booking_detail(_get(ctx, f"{BOOKINGS_PATH}/{ref}", {}, label=label))
-            ctx.log(f"    {label}: http 200")
-        except Deferred as e:
-            ctx.log(f"    {label}: {e.code}")
-            page = None
-        if page and page["ref"] == ref and page["lines"] and all(l["slot"] for l in page["lines"]):
-            slots = [l["slot"] for l in page["lines"]]
+        slots = _read_slots(ctx, ref)
     ctx.detail_cache[ref] = slots
     return slots
+
+
+def _read_slots(ctx, ref):
+    """One GET of a booking's own page: its (date, start, end) slots, or None."""
+    label = f"booking ref:{ref_fp(ref)}"
+    try:
+        page = booking_page.parse_booking_detail(_get(ctx, f"{BOOKINGS_PATH}/{ref}", {}, label=label))
+        ctx.log(f"    {label}: http 200")
+    except Deferred as e:
+        ctx.log(f"    {label}: {e.code}")
+        return None
+    if page["ref"] == ref and page["lines"] and all(l["slot"] for l in page["lines"]):
+        return [l["slot"] for l in page["lines"]]
+    return None
 
 
 def existing_at(ctx, rows, cand_range):
@@ -537,6 +572,7 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
     rec["attempts"].append(attempt)
     rec["status"] = "in_progress"
     try:
+        ctx.note_attempt(key)
         ctx.save_state(ctx.state)
     except Exception as e:
         rec["status"] = "not_recorded"
@@ -595,7 +631,7 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
     if ref and ref in pending and row["slot"] is None:
         # Awaiting-payment rows don't show the court time: read the new
         # booking's own page before calling it ours (🟡).
-        slots = booking_slots(ctx, ref)
+        slots = booking_slots(ctx, ref, after_post=True)
         if slots is None:
             return _finish(ctx, key, rec, "unclear", "new_booking_unreadable",
                            "a new booking is awaiting payment, but its own page couldn't be read to confirm "
