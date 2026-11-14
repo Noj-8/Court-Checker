@@ -180,6 +180,7 @@ STATE_SHAPE = {
     "push_failures_handled": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
     "session_alert": lambda v: isinstance(v, dict),
     "read_alert": lambda v: isinstance(v, dict),
+    autobook.LANG_RETRY_KEY: lambda v: isinstance(v, str),
 }
 # Not checked: last_check, currently_open_count, autobook_mode and the
 # unreadable-streak keys are rewritten every run, never decide a booking, and
@@ -697,6 +698,28 @@ def email_halt_once(state, email):
     try_save_state(state)  # the dedupe mark, on disk before any early return
 
 
+def set_language(state, jar):
+    """The site's EN button, once at the start of a run: GET /lang/en (via
+    bot_session.set_english) if the jar has no culture cookie from the site
+    yet, or if a page came back not in English last run (lang_retry). Its
+    Set-Cookie lands in the jar like any other. A failure here never stops
+    the run: the grid doesn't depend on the language, and account pages
+    that aren't English fail closed on their own. Raises JarSaveError."""
+    have = bot_session.site_culture_cookie(jar)
+    if have and not state.get(autobook.LANG_RETRY_KEY):
+        return
+    why = (f"a page wasn't English last run (culture cookie {have})" if have
+           else "no culture cookie from the site yet")
+    try:
+        f = bot_session.set_english(jar)
+    except requests.RequestException as e:
+        log(f"  🌐 /lang/en failed ({type(e).__name__}) — {why}; trying again next run")
+        return
+    now = bot_session.site_culture_cookie(jar)
+    log(f"  🌐 /lang/en ({why}) -> {f.resp.status_code}; culture cookie: {now or 'none set'}")
+    state.pop(autobook.LANG_RETRY_KEY, None)
+
+
 def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None):
     mode = autobook.mode_from_env(log)
     state = open_state()  # first: a halt is on disk before any early return below
@@ -740,6 +763,8 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
     for i in range(iterations):
         log(f"--- iteration {i + 1}/{iterations} ---")
         try:
+            if i == 0:
+                set_language(state, jar)
             status = run_check_pass(state, config, jar, email, mode)
         except bot_session.JarSaveError as e:
             try_save_state(state)

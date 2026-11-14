@@ -60,6 +60,10 @@ from bot_session import BASE, BOOKINGS_PATH, BOOKING_PATH, REVIEW_PATH, TZ, ref_
 
 MODES = ("off", "dry_run", "live")
 LIVE_KEY, DRY_KEY, RETRY_KEY = "autobook", "autobook_dry_run", "autobook_retry"
+# Set (to a timestamp) when a page came back not in English: the next run
+# redoes the site's /lang/en step (monitor.set_language) and clears it.
+LANG_RETRY_KEY = "lang_retry"
+NOT_ENGLISH = "page_not_english"
 PENDING_URL = f"{BASE}{BOOKINGS_PATH}?tab=pending"
 BOOKINGS_URL = f"{BASE}{BOOKINGS_PATH}"
 REF_RE = re.compile(r"SPORTS-\d{1,20}")
@@ -241,7 +245,20 @@ def _get(ctx, path, params, label=None):
     body = f.resp.text or ""
     if booking_page.is_login_page(body, f.resp.url):
         raise SessionStopped(page, "login page (200)")
+    _require_english(ctx, body, page)
     return body
+
+
+def _require_english(ctx, body, page):
+    """Every page auto-book reads (lists, booking detail, slot page, review)
+    must be English (<html lang="en">): the parsers are written against the
+    English pages. Anything else is unreadable — fail closed — and the next
+    run redoes the /lang/en step."""
+    lang = booking_page.page_lang(body)
+    if lang != "en":
+        ctx.state[LANG_RETRY_KEY] = now_iso()
+        raise Deferred(f"{NOT_ENGLISH}:{page.replace(' (', '_').rstrip(')').replace(' ', '_')}",
+                       f"the {page} page came back in {lang or 'an unmarked language'}, not English")
 
 
 UNRECOGNISED_LIST = "bookings_page_unrecognised"
@@ -486,7 +503,11 @@ def _process_one(ctx, key, cand):
         _after_error(ctx, key, rec, "session_stopped", "the session ended", retry=True)
         raise
     except Deferred as e:
+        nothing_sent = rec["status"] == "started" and not rec["attempts"]
         _after_error(ctx, key, rec, e.code, f"couldn't continue: {e.text}", retry=True)
+        if nothing_sent and e.code.startswith(NOT_ENGLISH):
+            _info_once(ctx, key, cand, f"ℹ️ Not auto-booking {cand['date']} {cand['time']} — the booking pages weren't in English",
+                       f"{e.text}, so I couldn't read it reliably")
     except bot_session.JarSaveError:
         # Before any POST: nothing was submitted, so it's retried next run.
         _after_error(ctx, key, rec, "jar_save_error", "the session jar couldn't be saved", retry=True)
@@ -511,21 +532,29 @@ def _after_error(ctx, key, rec, code, text, retry):
         ctx.log(f"    deferred ({code}) — nothing was submitted; will retry")
 
 
+def _info_once(ctx, key, cand, subject, why):
+    """The one ℹ️ email for a deferred key (nothing submitted): sent once
+    per key while it's retried. `why` must hold no page text or ref."""
+    retry = ctx.retries().get(key)
+    if retry is None or retry.get("notified"):
+        return
+    if ctx.email(key, subject,
+                 f"A starred time opened ({cand['loc_name']} {cand['date']} {cand['time']}), but {why}.\n"
+                 "Not booking — book manually if you want it:\n\n"
+                 f"  {BASE}{cand['href']}\n  {BOOKINGS_URL}\n\nI'll try again while it stays open; no more emails about it.\n"):
+        retry["notified"] = now_iso()
+
+
 def _flow(ctx, key, cand, rec):
     # 2. existing bookings
     try:
         lists = read_lists(ctx)
     except Deferred as e:
-        if not e.code.startswith(UNRECOGNISED_LIST):
+        if not e.code.startswith((UNRECOGNISED_LIST, NOT_ENGLISH)):
             raise  # network / http errors: deferred quietly, as before
-        retry = ctx.defer(key, e.code)
-        if not retry.get("notified"):
-            if ctx.email(key, f"ℹ️ Not auto-booking {cand['date']} {cand['time']} — can't check your bookings",
-                         f"A starred time opened ({cand['loc_name']} {cand['date']} {cand['time']}), but {e.text},\n"
-                         "so I can't rule out that you already have this slot.\n"
-                         "Not booking — book manually if you want it:\n\n"
-                         f"  {BASE}{cand['href']}\n  {BOOKINGS_URL}\n\nI'll try again while it stays open; no more emails about it.\n"):
-                retry["notified"] = now_iso()
+        ctx.defer(key, e.code)
+        _info_once(ctx, key, cand, f"ℹ️ Not auto-booking {cand['date']} {cand['time']} — can't check your bookings",
+                   f"{e.text},\nso I can't rule out that you already have this slot")
         del ctx.records()[key]
         ctx.log(f"    not booking: {e.code} (My bookings page not recognised)")
         return
@@ -621,6 +650,11 @@ def _book_court(ctx, key, cand, rec, court, lists_before):
             hint = "login"
         elif 300 <= f.resp.status_code < 400 and is_parked_location(location):
             hint = "parked"
+        elif f.resp.status_code == 200 and booking_page.page_lang(f.resp.text or "") != "en":
+            # Not English: unreadable. Never "refused" (that could allow a
+            # second court) — the lists alone decide, so at worst unclear.
+            hint = "not_english"
+            ctx.state[LANG_RETRY_KEY] = now_iso()
         elif f.resp.status_code == 200:
             hint = "refused" if booking_page.page_error_messages(f.resp.text or "") else "re-rendered"
         else:

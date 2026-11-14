@@ -17,6 +17,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlsplit
 
 import requests
 
@@ -33,6 +34,10 @@ except ImportError:
     Fernet = None
 
 COOKIES = {"cs.did": "DID_monitor_value_1111", "cs.member": "MEMBER_monitor_value_2222"}
+# The culture cookie the site's /lang/en sets. Test jars start with it (the
+# steady state after the first run), so /lang/en is only sent where a test
+# leaves it out on purpose.
+SITE_CULTURE = {".AspNetCore.Culture": "c=en|uic=en"}
 EMAIL_ENV = {"EMAIL_USER": "bot@example.com", "EMAIL_APP_PASSWORD": "app-password"}
 
 LOCKED_EN = """<html lang="en"><head><title>Book a court</title></head><body>
@@ -85,7 +90,7 @@ class MonitorTestCase(unittest.TestCase):
         self.enc = self.dir / "bot_session.enc"
         self.config_file = self.dir / "config.json"
         self.state_file = self.dir / "state.json"
-        self.write_jar(COOKIES)
+        self.write_jar({**COOKIES, **SITE_CULTURE})
         self.state_file.write_text("{}")  # tracked in git: always there (missing = halt, see test_autobook)
         marker = mock.patch.object(monitor, "STATE_ALERT_MARKER", self.dir / ".state_alert.json")
         marker.start()
@@ -111,11 +116,11 @@ class MonitorTestCase(unittest.TestCase):
     def state(self):
         return json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
 
-    def run_monitor(self, script, iterations=1, env=None, argv=None, send_fails=False):
+    def run_monitor(self, script, iterations=1, env=None, argv=None, send_fails=False, lang_script=None):
         """Runs monitor.run() (or main(argv)) end to end. Any attempt to send
         a non-GET request — through the session or the requests module —
         fails the test."""
-        adapter = ScriptedAdapter(script)
+        adapter = ScriptedAdapter(script, lang_script=lang_script)
         session = requests.Session()
         session.mount("https://", adapter)
         sent = []
@@ -145,7 +150,7 @@ class MonitorTestCase(unittest.TestCase):
             else:
                 code = monitor.run(iterations=iterations, interval=0, jar_path=self.jar,
                                    enc_path=self.enc, session=session)
-        self.assertTrue(all(r["method"] == "GET" for r in adapter.sent), adapter.sent)
+        self.assertTrue(all(r["method"] == "GET" for r in adapter.sent + adapter.lang_sent), adapter.sent)
         return code, out.getvalue(), adapter, sent
 
 
@@ -540,6 +545,88 @@ class TestNoPost(MonitorTestCase):
                      "/booking/../booking/confirm", "/bookings/SPORTS-1/sheet"):
             with self.subTest(path=path), self.assertRaises(RuntimeError):
                 bot_session.fetch(jar, path, {})
+
+
+class TestLanguageStep(MonitorTestCase):
+    """At the start of a run: GET /lang/en?returnUrl=/booking (the site's EN
+    button) if the jar has no culture cookie from the site, or a page wasn't
+    English last run. Its Set-Cookie is kept in the jar and sent from then
+    on. The bot never invents a cookie of its own."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_jar(COOKIES)           # a jar before its first /lang/en
+        self.write_config([target((datetime.now(monitor.TZ) + timedelta(days=2)).date().isoformat(), [("20:00", False)])])
+
+    def test_no_culture_cookie_sets_one_and_it_is_sent(self):
+        code, out, adapter, _ = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual([urlsplit(r["url"]).query for r in adapter.lang_sent], ["returnUrl=%2Fbooking"])
+        self.assertNotIn(".AspNetCore.Culture", [n for n, _ in adapter.lang_sent[0]["cookies"]])
+        self.assertIn((".AspNetCore.Culture", "c%3Den%7Cuic%3Den"), adapter.sent[0]["cookies"],
+                      "the grid request after it carries the site's cookie")
+        self.assertIn(".AspNetCore.Culture", self.jar_names(), "stored in the jar")
+        self.assertIn("🌐 /lang/en (no culture cookie from the site yet) -> 302; culture cookie: .AspNetCore.Culture", out)
+        self.assertNotIn("c%3Den", out, "cookie values are never printed")
+
+    def test_once_set_it_is_not_requested_again(self):
+        self.run_monitor([ok(GRID_EN)])
+        code, out, adapter, _ = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual(adapter.lang_sent, [])
+        self.assertIn((".AspNetCore.Culture", "c%3Den%7Cuic%3Den"), adapter.sent[0]["cookies"])
+
+    def test_once_per_run_not_per_pass(self):
+        code, out, adapter, _ = self.run_monitor([ok(GRID_EN), ok(GRID_EN)], iterations=2,
+                                                 lang_script=[(302, [("Location", "/booking")], "")] * 2)
+        self.assertEqual(len(adapter.lang_sent), 1)
+
+    def test_a_page_not_in_english_last_run_redoes_it(self):
+        self.write_jar({**COOKIES, **SITE_CULTURE})
+        self.state_file.write_text(json.dumps({"lang_retry": "2026-11-15T00:00:00+07:00"}))
+        code, out, adapter, _ = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual(len(adapter.lang_sent), 1)
+        self.assertIn("a page wasn't English last run", out)
+        self.assertNotIn("lang_retry", self.state())
+
+    def test_network_error_keeps_going_and_retries_next_run(self):
+        self.state_file.write_text(json.dumps({"lang_retry": "2026-11-15T00:00:00+07:00"}))
+        code, out, adapter, _ = self.run_monitor([ok(GRID_EN)], lang_script=[requests.ConnectionError("down")])
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(len(adapter.sent), 1, "the grid is still checked")
+        self.assertIn("/lang/en failed (ConnectionError)", out)
+        self.assertIn("lang_retry", self.state(), "not cleared without a response")
+
+    def test_a_login_redirect_on_lang_en_doesnt_stop_the_run(self):
+        # The grid decides whether the session is dead, not the EN button.
+        code, out, adapter, sent = self.run_monitor([ok(GRID_EN)], lang_script=[login_redirect()])
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual([m for m in sent if "session" in m["subject"].lower()], [])
+
+    def test_a_jar_save_failure_on_lang_en_is_handled_like_any_other(self):
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(dst) == self.jar:
+                raise OSError("disk full")
+            return real_replace(src, dst)
+        with mock.patch.object(bot_session.os, "replace", side_effect=replace):
+            code, out, adapter, sent = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual(code, monitor.EXIT_JAR, "the culture cookie changed and couldn't be saved")
+        self.assertEqual(adapter.sent, [], "nothing after a failed save")
+
+    def test_dead_session_sends_nothing_at_all(self):
+        jar_fp = bot_session.file_fingerprint(self.jar)
+        self.state_file.write_text(json.dumps({"session_alert": {"kind": "expired", "sent_at": "x", "jar_sha256": jar_fp}}))
+        code, out, adapter, _ = self.run_monitor([])
+        self.assertEqual((adapter.sent, adapter.lang_sent), ([], []))
+
+    def test_lang_retry_is_part_of_the_checked_state_shape(self):
+        self.assertEqual(monitor.shape_problems({"lang_retry": "2026-11-15T00:00:00+07:00"}), [])
+        self.assertEqual(monitor.shape_problems({"lang_retry": {"x": 1}}), ["unexpected shape: lang_retry"])
+
+    def jar_names(self):
+        return {c["name"] for c in json.loads(self.jar.read_text())["cookies"]}
 
 
 class TestSessionFailures(MonitorTestCase):

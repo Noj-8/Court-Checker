@@ -39,7 +39,7 @@ import booking_page
 import bot_session
 import monitor
 from test_monitor import COOKIES, EMAIL_ENV, MonitorTestCase, target
-from test_probe_new_site import login_redirect, make_response
+from test_probe_new_site import lang_en_redirect, login_redirect, make_response
 
 FIX = Path(__file__).resolve().parent / "tests" / "fixtures"
 FIXTURE_DATE = _date(2026, 11, 15)  # the date the live pages were saved for (a Sunday)
@@ -158,6 +158,8 @@ class FakeSite(requests.adapters.BaseAdapter):
         # booking (REF) is at the test slot: DERIVED from the real page 7.
         self.details = {REF: pages.detail(REF)}
         self.on_post = None
+        self.lang_sent = []                          # GET /lang/en (the EN button), kept apart from `sent`
+        self.lang = None                             # its response tuple; default: the real redirect + cookie
 
     @staticmethod
     def _next(queue):
@@ -166,6 +168,9 @@ class FakeSite(requests.adapters.BaseAdapter):
     def send(self, request, **kwargs):
         u = urlsplit(request.url)
         q = dict(parse_qsl(u.query, keep_blank_values=True))
+        if u.path == "/lang/en":
+            self.lang_sent.append({"method": request.method, "query": q, "cookie": request.headers.get("Cookie", "")})
+            return make_response(request, *(self.lang or lang_en_redirect()))
         body = request.body.decode() if isinstance(request.body, bytes) else (request.body or "")
         self.sent.append({"method": request.method, "path": u.path, "query": q, "url": request.url,
                           "form": parse_qsl(body, keep_blank_values=True) if body else []})
@@ -640,6 +645,117 @@ class TestUnrecognisedPagesFailClosed(AutobookTestCase):
         self.assertEqual(len(self.site.posts_sent()), 1, "never a second POST")
         self.assertEqual(self.record()["status"], "unclear")
         self.assertNotIn(self.key, self.state().get(autobook.RETRY_KEY, {}))
+
+
+def thai(html):
+    """DERIVED: a real (English) page as the site marks it in Thai —
+    <html lang="th">. Only the marker changes, so a page that is otherwise
+    perfectly parseable must STILL be refused for not being English."""
+    out, n = re.subn(r'(<html\b[^>]*?\blang=")en(")', r"\1th\2", html, count=1)
+    assert n == 1, "no <html lang> to change"
+    return out
+
+
+class TestNonEnglishPagesFailClosed(AutobookTestCase):
+    """Account and booking pages must be English (<html lang="en">). A Thai
+    (or unmarked) page is UNREADABLE: no booking that pass, ℹ️ once, retried
+    while open, and the next run redoes /lang/en."""
+
+    def assert_not_booked_info_once(self, reason, subject_end):
+        code, sent = self.run_mode("live", iterations=2)
+        self.assertNotEqual(code, monitor.EXIT_SESSION)
+        self.assertEqual(self.site.posts_sent(), [], "no POST")
+        info = [m for m in sent if m["subject"].startswith("ℹ️ Not auto-booking")]
+        self.assertEqual([m["subject"] for m in info], [f"ℹ️ Not auto-booking {self.date} 23:00 — {subject_end}"],
+                         "ℹ️ exactly once")
+        self.assertIn("not English", info[0]["body"])
+        self.assertIsNone(self.record(), "not a final outcome — nothing was submitted")
+        self.assertEqual(self.state()[autobook.RETRY_KEY][self.key]["reason"], reason)
+        self.assertIn(autobook.LANG_RETRY_KEY, self.state(), "the next run redoes /lang/en")
+
+    def test_thai_pending_list(self):
+        self.site.pending = [thai(self.p.pending_empty())]
+        self.assert_not_booked_info_once("page_not_english:bookings_pending", "can't check your bookings")
+
+    def test_thai_upcoming_list(self):
+        self.site.upcoming = [thai(self.p.upcoming_empty())]
+        self.assert_not_booked_info_once("page_not_english:bookings_upcoming", "can't check your bookings")
+
+    def test_unmarked_list_counts_as_not_english(self):
+        self.site.pending = [self.p.pending_empty().replace('<html lang="en"', "<html", 1)]
+        self.assert_not_booked_info_once("page_not_english:bookings_pending", "can't check your bookings")
+
+    def test_thai_slot_page(self):
+        self.site.slot_pages = [thai(self.p.slot())]
+        self.assert_not_booked_info_once("page_not_english:slot_page", "the booking pages weren't in English")
+        self.assertNotIn("/booking/review", [s["path"] for s in self.site.sent])
+
+    def test_thai_review_page(self):
+        self.site.reviews[self.p.sel] = thai(self.p.review())
+        self.assert_not_booked_info_once("page_not_english:review", "the booking pages weren't in English")
+
+    def test_thai_booking_detail_is_unreadable(self):
+        other = "SPORTS-900000000099"
+        self.site.pending = [self.p.pending_with_ref(other)]
+        self.site.details[other] = thai(self.p.detail(other))   # same time: would block if it were read
+        code, sent = self.run_mode("live", iterations=2)
+        self.assertEqual(self.site.posts_sent(), [])
+        self.assertEqual(len([m for m in sent if m["subject"].startswith("ℹ️ Not auto-booking")]), 1)
+        self.assertEqual(self.state()[autobook.RETRY_KEY][self.key]["reason"], "existing_booking_unreadable")
+        self.assertIn(autobook.LANG_RETRY_KEY, self.state())
+        self.assertIn("page_not_english:booking_detail", self.out)
+
+    def test_thai_confirm_result_never_tries_a_second_court(self):
+        # In English this refusal would allow one more court (see
+        # test_court_taken_tries_one_other_court). In Thai it is unreadable:
+        # the lists alone decide, and with nothing new listed it's unclear.
+        self.site.posts = [refused_page(thai(self.p.refused())), parked_redirect()]
+        self.site.pending = [self.p.pending_empty()]
+        code, sent = self.run_mode("live", iterations=2)
+        self.assertEqual(len(self.site.posts_sent()), 1, "never a second court or a second POST")
+        rec = self.record()
+        self.assertEqual(rec["status"], "unclear")
+        self.assertEqual(rec["attempts"][0]["hint"], "not_english")
+        self.assertNotIn(self.key, self.state().get(autobook.RETRY_KEY, {}), "a POSTed key is never retried")
+        self.assertIn(autobook.LANG_RETRY_KEY, self.state())
+
+    def test_thai_confirm_result_with_the_booking_listed_is_still_found(self):
+        self.site.posts = [refused_page(thai(self.p.refused()))]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        self.assertEqual(self.record()["status"], "parked", "the lists (English) still decide")
+
+    def test_next_run_redoes_lang_en_and_then_books(self):
+        self.site.pending = [thai(self.p.pending_empty())]
+        self.run_mode("live")
+        self.assertEqual(self.site.lang_sent, [], "the jar has a culture cookie: no /lang/en the first time")
+        self.assertIn(autobook.LANG_RETRY_KEY, self.state())
+        self.site = FakeSite(self.p)
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        self.assertEqual([(x["method"], x["query"]) for x in self.site.lang_sent], [("GET", {"returnUrl": "/booking"})])
+        self.assertNotIn(autobook.LANG_RETRY_KEY, self.state(), "cleared after the /lang/en step")
+        self.assertEqual(self.record()["status"], "parked")
+
+    def test_english_pages_parse_as_before(self):
+        for f in sorted(FIX.glob("*.html")):
+            if f.name != "8_login.html":
+                with self.subTest(f.name):
+                    self.assertEqual(booking_page.page_lang(f.read_text(encoding="utf-8")), "en")
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        self.run_mode("live")
+        self.assertEqual(self.record()["status"], "parked")
+        self.assertNotIn(autobook.LANG_RETRY_KEY, self.state())
+
+    def test_the_grid_stays_language_independent(self):
+        self.site.grid["LOC002"] = thai(self.p.grid())
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+        code, sent = self.run_mode("live")
+        self.assertEqual(self.record()["status"], "parked", "a Thai grid is read as before")
+        self.assertNotIn(autobook.LANG_RETRY_KEY, self.state())
 
 
 class TestListParsing(unittest.TestCase):
@@ -2257,6 +2373,35 @@ class TestPostIsImpossibleElsewhere(unittest.TestCase):
         self.assertEqual([(x["method"], x["path"], x["query"]) for x in site.sent],
                          [("GET", "/bookings", {"tab": "pending"}), ("GET", "/bookings", {"tab": "upcoming"})])
         self.assertEqual(bot_session.BOOKINGS_LISTS, (("pending", {"tab": "pending"}), ("upcoming", {"tab": "upcoming"})))
+
+    def test_lang_en_is_exactly_one_get(self):
+        for params in ({}, None, {"returnUrl": "/bookings"}, {"returnUrl": "/booking", "x": "1"},
+                       {"returnUrl": "https://evil.example/"}):
+            with self.subTest(params=params), self.assertRaises(RuntimeError):
+                bot_session.fetch(self.jar, "/lang/en", params)
+        for path in ("/lang/th", "/lang/en/", "/lang"):
+            with self.subTest(path=path), self.assertRaises(RuntimeError):
+                bot_session.fetch(self.jar, path, {"returnUrl": "/booking"})
+        with self.assertRaises(RuntimeError):
+            bot_session._send(self.jar, "POST", "/lang/en", params={"returnUrl": "/booking"}, data=[("a", "b")])
+        site = FakeSite(Pages(FIXTURE_DATE))
+        self.jar.session.mount("https://", site)
+        with mock.patch.object(bot_session, "save_jar"):
+            f = bot_session.set_english(self.jar)
+        self.assertEqual(site.lang_sent, [{"method": "GET", "query": {"returnUrl": "/booking"}, "cookie": ""}])
+        self.assertEqual(f.resp.status_code, 302, "the redirect is not followed")
+        self.assertEqual(site.sent, [], "nothing else requested")
+        self.assertEqual(bot_session.site_culture_cookie(self.jar), ".AspNetCore.Culture", "stored in the jar")
+        self.assertEqual(bot_session.page_type("GET", "/lang/en", {"returnUrl": "/booking"}), "language switch")
+
+    def test_site_culture_cookie_ignores_the_session_cookies(self):
+        s = requests.Session()
+        for name in ("cs.did", "cs.member", "cs_auth"):
+            s.cookies.set_cookie(bot_session.create_cookie(name, "v", domain=bot_session.HOST, path="/"))
+        jar = bot_session.Jar(session=s, path=Path("/nonexistent"))
+        self.assertIsNone(bot_session.site_culture_cookie(jar))
+        s.cookies.set_cookie(bot_session.create_cookie(".AspNetCore.Culture", "c=en|uic=en", domain=bot_session.HOST, path="/"))
+        self.assertEqual(bot_session.site_culture_cookie(jar), ".AspNetCore.Culture")
 
     def test_booking_pages_are_get_only_and_exactly_that_shape(self):
         refused_gets = ["/bookings/SPORTS-1/sheet", "/bookings/SPORTS-1/cancel", "/bookings/lines/1/cancel",

@@ -85,14 +85,36 @@ def make_response(request, status, headers, body, body_error=None):
     return resp
 
 
+# The site's EN button as seen live: a redirect back to returnUrl that sets
+# the site's own culture cookie.
+CULTURE_SET = ".AspNetCore.Culture=c%3Den%7Cuic%3Den; expires=Sun, 15 Nov 2027 00:00:00 GMT; path=/; samesite=lax"
+
+
+def lang_en_redirect(set_cookies=(CULTURE_SET,)):
+    return (302, [("Location", "/booking")] + [("Set-Cookie", c) for c in set_cookies], "")
+
+
 class ScriptedAdapter(requests.adapters.BaseAdapter):
-    def __init__(self, script, on_send=None):
+    """Serves `script` in order. GET /lang/en (the EN button) is answered
+    from `lang_script` (default: the real redirect + culture cookie) and
+    recorded in `lang_sent`, not `sent`, so request counts stay comparable."""
+
+    def __init__(self, script, on_send=None, lang_script=None):
         super().__init__()
         self.script = list(script)
         self.sent = []
+        self.lang_sent = []
+        self.lang_script = list(lang_script) if lang_script is not None else None
         self.on_send = on_send
 
     def send(self, request, **kwargs):
+        if requests.utils.urlparse(request.url).path == "/lang/en":
+            self.lang_sent.append({"method": request.method, "url": request.url,
+                                   "cookies": parse_cookie_header(request.headers.get("Cookie", ""))})
+            r = self.lang_script.pop(0) if self.lang_script else lang_en_redirect()
+            if isinstance(r, BaseException):
+                raise r
+            return make_response(request, *r)
         self.sent.append({"method": request.method, "url": request.url,
                           "cookies": parse_cookie_header(request.headers.get("Cookie", ""))})
         if self.on_send:
@@ -132,8 +154,8 @@ class ProbeTestCase(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_probe(self, script, env=None, repeat=1, on_send=None, check_account=False):
-        adapter = ScriptedAdapter(script, on_send=on_send)
+    def run_probe(self, script, env=None, repeat=1, on_send=None, check_account=False, lang_script=None):
+        adapter = ScriptedAdapter(script, on_send=on_send, lang_script=lang_script)
         session = requests.Session()
         session.mount("https://", adapter)
         out = io.StringIO()
@@ -198,14 +220,13 @@ class TestRotationPersists(ProbeTestCase):
         self.assertEqual(len(stored), 1)
         self.assertNotIn("WARNING: jar holds more than one", out)
 
-    def test_read_only_and_culture_cookie_on_every_request(self):
-        code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED)
+    def test_read_only_and_no_made_up_culture_cookie(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED, lang_script=[(302, [("Location", "/booking")], "")])
         self.assertEqual(code, probe.EXIT_OK)
-        for sent in adapter.sent:
+        for sent in adapter.sent + adapter.lang_sent:
             self.assertEqual(sent["method"], "GET")
-            self.assertEqual(requests.utils.urlparse(sent["url"]).path, "/booking")
-            self.assertIn((".AspNetCore.Culture", "c=en|uic=en"), sent["cookies"])
-        self.assertNotIn(".AspNetCore.Culture", self.jar_cookies(), "culture cookie must not be stored in the jar")
+            self.assertNotIn(".AspNetCore.Culture", [n for n, _ in sent["cookies"]], "the bot never invents a cookie")
+        self.assertEqual({requests.utils.urlparse(s["url"]).path for s in adapter.sent}, {"/booking"})
         self.assertIn("lang=en thai=no", out)
         self.assertIn("open: 20:00(2) 22:00(1)", out)
 
@@ -365,7 +386,7 @@ PENDING_PAGE = (FIXTURES / "5_bookings_awaiting.html").read_text(encoding="utf-8
 UPCOMING_PAGE = (FIXTURES / "6_bookings_upcoming_filled.html").read_text(encoding="utf-8")  # real, tab=upcoming
 PAGE_SECRETS = ("SPORTS-900000000001", "SPORTS-900000000002", "Test Member", "FAKE-ANTIFORGERY")
 P_LINE, U_LINE = "account /bookings?tab=pending:", "account /bookings?tab=upcoming:"
-ACCEPTED = "| #bookingList found | active tab: {}"
+ACCEPTED = "| #bookingList found | active tab: {} | lang: en"
 
 
 def page(body):
@@ -412,18 +433,18 @@ class TestCheckAccount(ProbeTestCase):
     def test_wrong_tab_or_no_list_is_reported_and_not_accepted(self):
         cases = {
             "pending answered with the upcoming tab": ([page(UPCOMING_PAGE), page(UPCOMING_PAGE)],
-                [f"{P_LINE} status=200 ok | #bookingList found | active tab: upcoming | auto-book would NOT accept this page",
+                [f"{P_LINE} status=200 ok | #bookingList found | active tab: upcoming | lang: en | auto-book would NOT accept this page",
                  f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
             "no tab marked active": ([page(PENDING_PAGE.replace("tab active", "tab")), page(UPCOMING_PAGE)],
-                [f"{P_LINE} status=200 ok | #bookingList found | active tab: none | auto-book would NOT accept this page",
+                [f"{P_LINE} status=200 ok | #bookingList found | active tab: none | lang: en | auto-book would NOT accept this page",
                  f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
             "an unknown tab is active": ([page(PENDING_PAGE.replace("?tab=pending", "?tab=SPORTS-900000000001")),
                                           page(UPCOMING_PAGE)],
-                [f"{P_LINE} status=200 ok | #bookingList found | active tab: other | auto-book would NOT accept this page",
+                [f"{P_LINE} status=200 ok | #bookingList found | active tab: other | lang: en | auto-book would NOT accept this page",
                  f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
             "an unrelated page": ([page("<html><body><h1>Checking your browser</h1><form action='/verify'></form></body></html>"),
                                    page(UPCOMING_PAGE)],
-                [f"{P_LINE} status=200 ok | #bookingList NOT found | active tab: none | auto-book would NOT accept this page",
+                [f"{P_LINE} status=200 ok | #bookingList NOT found | active tab: none | lang: none | auto-book would NOT accept this page",
                  f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
         }
         for label, (pages, want) in cases.items():
@@ -479,7 +500,7 @@ class TestCheckAccount(ProbeTestCase):
 
         def save(*a, **kw):
             calls["n"] += 1
-            if calls["n"] == 4:   # seed, grid, grid, then the first list
+            if calls["n"] == 5:   # seed, grid, /lang/en, grid, then the first list
                 raise OSError("disk full")
             return real(*a, **kw)
         with mock.patch.object(probe.bot_session, "save_jar", side_effect=save):
@@ -525,6 +546,65 @@ class TestCheckAccount(ProbeTestCase):
         self.assertNotIn("cs_auth", [n for n, _ in adapter.sent[2]["cookies"]])
 
 
+class TestLanguageStep(ProbeTestCase):
+    """No culture cookie from the site yet: the EN button (GET
+    /lang/en?returnUrl=/booking, redirect not followed) goes between round
+    1's two grids, so the log shows the language before and after."""
+
+    def test_before_and_after(self):
+        code, out, adapter, _ = self.run_probe([ok(body=GRID_TH), ok()], env=SEED)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual([urlsplit(r["url"]).query for r in adapter.lang_sent], ["returnUrl=%2Fbooking"])
+        self.assertNotIn(".AspNetCore.Culture", [n for n, _ in adapter.sent[0]["cookies"]], "LOC001: before")
+        self.assertIn(".AspNetCore.Culture", [n for n, _ in adapter.sent[1]["cookies"]], "LOC002: after, sent from the jar")
+        self.assertIn(".AspNetCore.Culture", self.jar_cookies())
+        lines = [l.strip() for l in out.splitlines()]
+        before = lines.index("language before /lang/en: lang=th")
+        step = next(i for i, l in enumerate(lines) if "/lang/en: status=302 | culture cookie now: .AspNetCore.Culture" in l)
+        after = lines.index("language after /lang/en: lang=en")
+        self.assertLess(before, step)
+        self.assertLess(step, after)
+        self.assertNotIn("c%3Den", out, "never a cookie value")
+
+    def test_skipped_when_the_jar_has_the_sites_cookie(self):
+        probe.save_jar(self.jar, session_with({**SEEDED, ".AspNetCore.Culture": "c=en|uic=en"}))
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env={})
+        self.assertEqual(adapter.lang_sent, [])
+        self.assertIn("Language: the jar has the site's culture cookie (.AspNetCore.Culture) — /lang/en not needed.", out)
+        self.assertNotIn("language before", out)
+
+    def test_only_once_even_over_several_rounds(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), ok(), ok()], env=SEED, repeat=2,
+                                               lang_script=[(302, [("Location", "/booking")], "")] * 3)
+        self.assertEqual(len(adapter.lang_sent), 1)
+
+    def test_login_redirect_on_lang_en_stops(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED, lang_script=[login_redirect()])
+        self.assertEqual(code, probe.EXIT_LOGIN)
+        self.assertEqual(len(adapter.sent), 1, "LOC002 not requested")
+        self.assertIn("STOPPED: /lang/en sent a login redirect", out)
+
+    def test_network_error_on_lang_en_carries_on(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED, lang_script=[requests.ConnectionError("x")])
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual(len(adapter.sent), 2)
+        self.assertIn("/lang/en: network error (ConnectionError)", out)
+
+    def test_a_grid_redirect_before_it_stops_first(self):
+        code, out, adapter, _ = self.run_probe([login_redirect()], env=SEED)
+        self.assertEqual(code, probe.EXIT_LOGIN)
+        self.assertEqual(adapter.lang_sent, [])
+
+    def test_check_account_reports_a_thai_list_and_doesnt_accept_it(self):
+        th = PENDING_PAGE.replace('<html lang="en"', '<html lang="th"', 1)
+        code, out, adapter, _ = self.run_probe([ok(), ok(), page(th), page(UPCOMING_PAGE)], env=SEED, check_account=True)
+        self.assertEqual(code, probe.EXIT_NO_GRID)
+        lines = [l.split("] ", 1)[1] for l in out.splitlines() if "] account " in l]
+        self.assertEqual(lines, [f"{P_LINE} status=200 ok | #bookingList found | active tab: pending | lang: th"
+                                 " | auto-book would NOT accept this page",
+                                 f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"])
+
+
 class TestSeedingRules(ProbeTestCase):
     def test_missing_required_seed_env_sends_nothing_and_creates_nothing(self):
         for env, should_name in [({"CS_AUTH": SEED["CS_AUTH"]}, ["CS_DID", "CS_MEMBER"]),
@@ -546,7 +626,8 @@ class TestSeedingRules(ProbeTestCase):
         self.assertEqual(code, probe.EXIT_OK)
         self.assertIn("cs_auth absent (not seeded)", out)
         self.assertNotIn("cs_auth", self.jar_cookies())
-        self.assertEqual(set(self.jar_cookies()), {"cs.did", "cs.member"})
+        self.assertEqual(set(self.jar_cookies()), {"cs.did", "cs.member", ".AspNetCore.Culture"},
+                         "the session cookies, plus the culture cookie the site set via /lang/en")
         sent_names = [n for n, _ in adapter.sent[0]["cookies"]]
         self.assertNotIn("cs_auth", sent_names)
         self.assertIn("cs.did", sent_names)
@@ -659,11 +740,12 @@ class TestEncryptedJar(ProbeTestCase):
                 return self._f.__exit__(*exc)
 
         with mock.patch.object(probe.os, "fdopen", lambda *a, **k: Recorder(real_fdopen(*a, **k))):
-            # Seeds from env (write 1), then a rotation (write 2), then no change (no write).
+            # Seeds from env (write 1), a rotation (write 2), the site's culture
+            # cookie from /lang/en (write 3), then no change (no write).
             code, out, _, _ = self.run_probe([ok(set_cookies=[ROTATE]), ok()],
                                              env={**SEED, "BOT_JAR_KEY": self.key})
         self.assertEqual(code, probe.EXIT_OK)
-        self.assertEqual(len(written), 2, "expected exactly the seed write and the rotation write")
+        self.assertEqual(len(written), 3, "expected exactly the seed, rotation and culture-cookie writes")
         for data in written:
             for needle in list(SEED.values()) + [MEMBER_NEW, "cs.member", '"cookies"']:
                 self.assertNotIn(needle.encode(), data, "plaintext reached the disk")
@@ -672,7 +754,7 @@ class TestEncryptedJar(ProbeTestCase):
 
     def test_unchanged_cookies_leave_the_file_byte_identical(self):
         # So "bot_session.enc changed in git" means "a cookie changed".
-        probe.save_jar(self.enc, session_with(SEEDED), Fernet(self.key.encode()))
+        probe.save_jar(self.enc, session_with({**SEEDED, ".AspNetCore.Culture": "c=en|uic=en"}), Fernet(self.key.encode()))
         before = self.enc.read_bytes()
         code, _, _, _ = self.run_probe([ok(), ok()], env={"BOT_JAR_KEY": self.key})
         self.assertEqual(code, probe.EXIT_OK)

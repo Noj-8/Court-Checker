@@ -128,6 +128,17 @@ class PageParser(HTMLParser):
             self.text.append(data)
 
 
+HTML_LANG_RE = re.compile(r"<html\b[^>]*?\blang\s*=\s*[\"']?([A-Za-z]{1,8})", re.IGNORECASE)
+
+
+def page_lang(html):
+    """The page's language from <html lang="…">, primary subtag, lowercased
+    ("en", "th"; "en-US" -> "en"), or "" if unmarked. Only letters, so it is
+    safe to log."""
+    m = HTML_LANG_RE.search(html or "")
+    return m.group(1).lower() if m else ""
+
+
 def is_login_path(url):
     """True if `url` (absolute, or a path with or without a query) is
     /account/login itself — not /account/logout, not /account/login-help,

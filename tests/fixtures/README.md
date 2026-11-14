@@ -15,7 +15,7 @@ unchanged. Only the values below were replaced with obvious fakes.
 | `6_bookings_upcoming_filled.html` | `/bookings?tab=upcoming`: one Paid booking (15 Nov, 23:00–24:00, G South-1, Crystal Sports G) |
 | `7_booking_detail.html` | `/bookings/SPORTS-…`: that booking's own page (date, time, court, and a Cancel form the bot never uses) |
 | `8_login.html` | `/account/login`: the login page, logged out (one `<form action="/account/login">` with a `mobile` field). The only page the login detector may match |
-| `8_login_en.html` | The same login page in English (the bot asks for English: `.AspNetCore.Culture=en`) |
+| `8_login_en.html` | The same login page in English (what the bot gets after the site's EN button, `/lang/en`) |
 
 ## What was scrubbed
 

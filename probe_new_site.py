@@ -26,18 +26,22 @@ requests are strictly sequential.
                .bot_session.json.handed-off-<ts> exists (seal_session.py
                moved the session to Actions), the Mac probe refuses to run.
   Requests:    each round GETs /booking?date=<tomorrow>&loc=<LOC>&time=0&sel=
-               for LOC001 then LOC002, redirects NOT followed. Also sends
-               .AspNetCore.Culture=c=en|uic=en and reports whether the page
-               came back in English; parsing doesn't depend on it.
+               for LOC001 then LOC002, redirects NOT followed, and reports
+               each page's language; grid parsing doesn't depend on it.
+  Language:    if the jar has no culture cookie from the site, the site's
+               EN button — GET /lang/en?returnUrl=/booking, redirect not
+               followed — is sent between round 1's two grids, so the log
+               shows the language before (LOC001) and after (LOC002). Its
+               Set-Cookie is stored in the jar like any other.
   Options:     --repeat N rounds (default 1), --interval SECONDS between
                rounds (default 300). --repeat 12 --interval 300 = one hour.
                --check-account: after the first round's grids, also GET
                the two lists auto-book reads, in its order:
                /bookings?tab=pending and /bookings?tab=upcoming. For each
                it prints the status, "ok" or the login verdict, whether
-               #bookingList was found and which tab is marked active
-               (pending / upcoming / none / other) — names only, never
-               page text or refs. Stops at the first login, like
+               #bookingList was found, which tab is marked active
+               (pending / upcoming / none / other) and the page's lang —
+               names only, never page text or refs. Stops at the first login, like
                everything else.
   Exit code:   0  grid parsed for both locations in every round
                1  at least one location/round returned no grid, or an
@@ -51,6 +55,7 @@ requests are strictly sequential.
                5  the session was handed off to GitHub Actions
 
 Hard rules, enforced in code: GET only, /booking only — plus
+/lang/en?returnUrl=/booking (no culture cookie yet) and
 /bookings?tab=pending and ?tab=upcoming with --check-account; never /booking/review, /booking/confirm
 or a booking's own page — never follow a redirect, stop on
 the first login redirect and never retry, never print a cookie value —
@@ -74,10 +79,10 @@ import requests
 
 import bot_session
 from booking_page import (  # noqa: F401 (re-exported)
-    FIRST_INT, THAI_CHARS, PageParser, is_login_page, login_page_markers, parse_bookings_list, parse_page,
+    FIRST_INT, THAI_CHARS, PageParser, is_login_page, login_page_markers, page_lang, parse_bookings_list, parse_page,
 )
 from bot_session import (  # noqa: F401 (re-exported)
-    BASE, BOOKING_PATH, BOOKINGS_PATH, CULTURE_COOKIE, ENC_FILE, HOST, JAR_FILE,
+    BASE, BOOKING_PATH, BOOKINGS_PATH, ENC_FILE, HOST, JAR_FILE,
     JAR_KEY_ENV, JAR_VERSION, LOGIN_REDIRECT_MARKERS, OPTIONAL_SEED, SEED_ENV, TZ, USER_AGENT,
     JarError, JarSaveError, SessionOpenError, _secrets, cookie_expiries, cookie_values,
     create_cookie, describe_expiry, diff_cookies, fingerprint, fmt_duration, handed_off_files,
@@ -178,7 +183,8 @@ def check_account_page(jar, params):
         return resp.status_code, f"login page (200: {', '.join(hits)})", None
     parsed = parse_bookings_list(resp.text or "")
     tab = parsed["tab"] if parsed["tab"] in KNOWN_TABS else ("none" if not parsed["tab"] else "other")
-    return resp.status_code, "ok", {"list": parsed["recognised"], "tab": tab}
+    return resp.status_code, "ok", {"list": parsed["recognised"], "tab": tab,
+                                    "lang": page_lang(resp.text or "") or "none"}
 
 
 def check_account(jar):
@@ -192,8 +198,9 @@ def check_account(jar):
         line = f"[{stamp()}] account {label}: status={'ERR' if status is None else status} {verdict}"
         accepted = False
         if page is not None:
-            accepted = page["list"] and page["tab"] == name
+            accepted = page["list"] and page["tab"] == name and page["lang"] == "en"
             line += (f" | #bookingList {'found' if page['list'] else 'NOT found'} | active tab: {page['tab']}"
+                     f" | lang: {page['lang']}"
                      + ("" if accepted else " | auto-book would NOT accept this page"))
         say(line)
         if verdict.startswith("login"):
@@ -205,6 +212,22 @@ def check_account(jar):
         if not accepted:
             worst = EXIT_NO_GRID
     return worst
+
+
+def lang_step(jar):
+    """The site's EN button. Returns "ok", "login" or "error"; raises
+    JarSaveError. Prints status and the culture cookie by name only."""
+    try:
+        fetched = bot_session.set_english(jar)
+    except requests.RequestException as e:
+        say(f"[{stamp()}] /lang/en: network error ({type(e).__name__})")
+        return "error"
+    if fetched.login:
+        say(f"[{stamp()}] /lang/en: status={fetched.resp.status_code} login redirect")
+        return "login"
+    say(f"[{stamp()}] /lang/en: status={fetched.resp.status_code} | culture cookie now: "
+        f"{bot_session.site_culture_cookie(jar) or 'none'}")
+    return "ok"
 
 
 def summary_line(rnd, repeat, result):
@@ -239,9 +262,24 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FI
     say()
 
     all_ok, account_ok = True, True
+    culture = bot_session.site_culture_cookie(jar)
+    need_lang = culture is None
+    if culture:
+        say(f"Language: the jar has the site's culture cookie ({culture}) — /lang/en not needed.")
     for rnd in range(1, repeat + 1):
         date = (datetime.now(TZ) + timedelta(days=1)).date().isoformat()
         for loc in LOCATIONS:
+            if need_lang and loc != next(iter(LOCATIONS)):
+                need_lang = False
+                try:
+                    step = lang_step(jar)
+                except JarSaveError as e:
+                    say(f"[{stamp()}] /lang/en: FAILED TO WRITE {jar_path.name} ({e.error}).")
+                    say("STOPPED. Delete the jar and reseed from a fresh login before running again.")
+                    return EXIT_JAR
+                if step == "login":
+                    say("STOPPED: /lang/en sent a login redirect. Not retrying.")
+                    return EXIT_LOGIN
             result = probe_once(jar, loc, date)
             if result["jar_error"]:
                 say(f"[{stamp()}] round {rnd}/{repeat} {loc}: FAILED TO WRITE {jar_path.name} "
@@ -252,6 +290,10 @@ def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FI
                 say("STOPPED. Delete the jar and reseed from a fresh login before running again.")
                 return EXIT_JAR
             say(summary_line(rnd, repeat, result))
+            if rnd == 1 and culture is None and result["status"] == 200:
+                lang = (result["page"] or {}).get("lang") or "none"
+                when = "after" if loc != next(iter(LOCATIONS)) else "before"
+                say(f"    language {when} /lang/en: lang={lang}")
             if rnd == 1 or not result["ok"]:
                 for line in result["diag"]:
                     say(f"    {line}")

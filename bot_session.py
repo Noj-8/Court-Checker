@@ -16,11 +16,19 @@ presenting a superseded cs.member kills the whole login session. So:
     stale copy is dropped so it can't be sent alongside the new one.
   * Requests are strictly sequential (a concurrent call raises) and
     redirects are never followed. Every request goes through _send(), which
-    allows exactly: GET /booking, GET /booking/review, GET /bookings, and
-    POST /booking/confirm — the last only via post_booking_confirm(), and
+    allows exactly: GET /booking, GET /booking/review, GET /bookings
+    (?tab=pending / ?tab=upcoming only), GET /bookings/SPORTS-<digits>,
+    GET /lang/en?returnUrl=/booking (set_english), and POST
+    /booking/confirm — the last only via post_booking_confirm(), and
     only when the caller passes mode == "live". A login redirect is
     reported to the caller, who must stop — replaying older cookies is
     exactly what kills a session.
+  * Language: the site ignores a made-up culture cookie; its EN button is
+    GET /lang/en?returnUrl=<path>, which sets the site's own culture
+    cookie. set_english() makes exactly that request when the jar has no
+    such cookie (site_culture_cookie), and the cookie is kept in the jar
+    like any other the server issued. Nothing language-related is added
+    to requests by the bot itself.
   * Cookie values are never printed: only names and fingerprints (length +
     first 8 hex chars of SHA-256), and every line goes through redact().
 """
@@ -74,7 +82,10 @@ JAR_KEY_ENV = "BOT_JAR_KEY"
 JAR_VERSION = 1
 SEED_ENV = {"cs_auth": "CS_AUTH", "cs.did": "CS_DID", "cs.member": "CS_MEMBER"}
 OPTIONAL_SEED = {"cs_auth"}
-CULTURE_COOKIE = {".AspNetCore.Culture": "c=en|uic=en"}
+# The site's EN button (seen live 2026-11-15): GET exactly this, redirect
+# not followed; whatever Set-Cookie it returns is stored in the jar.
+LANG_PATH = "/lang/en"
+LANG_PARAMS = {"returnUrl": "/booking"}
 
 # Calibrated against the live site on 2026-11-11: with no cookies,
 # /booking 302s to /account/login?ReturnUrl=...
@@ -464,7 +475,24 @@ def page_type(method, path, params=None):
         return f"bookings ({tab})" if tab in ("pending", "upcoming") else "bookings"
     if BOOKING_DETAIL_RE.fullmatch(path):
         return "booking detail"
+    if path == LANG_PATH:
+        return "language switch"
     return "unknown"
+
+
+def site_culture_cookie(jar):
+    """The name of the language cookie the SITE set in the jar (e.g.
+    .AspNetCore.Culture), or None. Any cookie whose name mentions culture or
+    lang counts; the session cookies (cs.did, cs.member, cs_auth) don't."""
+    names, _ = cookie_values(jar.session)
+    return next((n for n in sorted(names) if "culture" in n.lower() or "lang" in n.lower()), None)
+
+
+def set_english(jar):
+    """The site's EN button: GET /lang/en?returnUrl=/booking, redirect not
+    followed. Its Set-Cookie is merged and the jar saved like any response.
+    Raises like fetch()."""
+    return _send(jar, "GET", LANG_PATH, params=dict(LANG_PARAMS))
 
 
 def fetch(jar, path, params):
@@ -497,7 +525,8 @@ def _send(jar, method, path, params=None, data=None, headers=None):
     headers are already on disk). Fetched.login=True means the session is
     no longer valid: stop."""
     url = BASE + path
-    allowed = (method, path) in ALLOWED_REQUESTS or (method == "GET" and BOOKING_DETAIL_RE.fullmatch(path))
+    allowed = ((method, path) in ALLOWED_REQUESTS or (method == "GET" and BOOKING_DETAIL_RE.fullmatch(path))
+               or (method == "GET" and path == LANG_PATH and dict(params or {}) == LANG_PARAMS))
     if path == BOOKINGS_PATH and not any(dict(params or {}) == q for _, q in BOOKINGS_LISTS):
         allowed = False  # the list only as ?tab=pending or ?tab=upcoming, nothing else
     if not allowed or urlsplit(url).path != path:
@@ -511,13 +540,11 @@ def _send(jar, method, path, params=None, data=None, headers=None):
         before_exp = cookie_expiries(jar.session)
         resp, request_error = None, None
         try:
-            # The culture cookie goes per-request so it is sent but never
-            # stored in the jar — the jar holds only what the server issued.
+            # Only the jar's cookies are sent: what the server issued.
             # stream=True: return as soon as the headers (and Set-Cookie)
             # are in, so the jar is saved before the body is read.
             resp = jar.session.request(method, url, params=params, data=data, headers=headers,
-                                       cookies=CULTURE_COOKIE, allow_redirects=False,
-                                       timeout=20, stream=True)
+                                       allow_redirects=False, timeout=20, stream=True)
             merge_set_cookies(jar.session, resp)
         except BaseException as e:  # saved below regardless, then re-raised
             request_error = e
