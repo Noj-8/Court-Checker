@@ -419,7 +419,7 @@ class TestCheckAccount(ProbeTestCase):
         login = ok(body='<html><body><form action="/account/login"><input type="password"></form></body></html>')
         code, out, adapter, _ = self.run_probe([ok(), ok(), login], env=SEED, check_account=True)
         self.assertEqual(code, probe.EXIT_LOGIN)
-        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 login page (200)"])
+        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 login page (200: login form)"])
 
     def test_not_ok_status_is_reported_and_the_other_page_still_checked(self):
         err = (500, [("Content-Type", "text/html")], f"<html>error for {ACCOUNT_REF}</html>")

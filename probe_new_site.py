@@ -153,7 +153,8 @@ ACCOUNT_PAGES = (("/bookings", {}), ("/bookings?tab=pending", {"tab": "pending"}
 def check_account_page(jar, params):
     """One GET of /bookings (params {} or {"tab": "pending"}). Returns
     (status or None, verdict): verdict is "ok", "login redirect",
-    "login page (200)", or a short reason — never page text or a ref."""
+    "login page (200: <which markers>)", or a short reason — never page
+    text or a ref."""
     try:
         fetched = bot_session.fetch(jar, BOOKINGS_PATH, params)
     except requests.RequestException as e:
@@ -163,8 +164,9 @@ def check_account_page(jar, params):
         return resp.status_code, "login redirect"
     if resp.status_code != 200:
         return resp.status_code, "not ok (unexpected status)"
-    if is_login_page(resp.text or "", resp.url):
-        return resp.status_code, "login page (200)"
+    hits = login_page_markers(resp.text or "", resp.url)
+    if hits:
+        return resp.status_code, f"login page (200: {', '.join(hits)})"
     return resp.status_code, "ok"
 
 

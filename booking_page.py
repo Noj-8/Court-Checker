@@ -17,11 +17,16 @@ Language-independent by design — nothing depends on English or Thai text:
     booking at 21:00", "เปิดจอง 21:00 น."). Generic text such as "Opening
     hours 06:00-22:00" is not one. Neither = an unexpected page, which
     callers must log and skip — not a closed date, not a dead session.
-  * is_login_page() is the one login-page detector, shared by monitor.py
-    and probe_new_site.py.
+  * is_login_page() is the one login-page detector, shared by monitor.py,
+    autobook.py and probe_new_site.py. It matches only the real login
+    page: the URL /account/login, or the login form itself (a <form> whose
+    action is /account/login — the real page, fixture 8, posts there with
+    a `mobile` field). Nothing generic: account pages have forms (logout,
+    cancel), hidden tokens and checkboxes too, so a 200 page without the
+    login form is a normal page.
 
-The opens-at phrase and the login text are the only text-based rules (the
-site gives no class for either).
+The opens-at phrase is the only text-based rule (the site gives no class
+for it).
 """
 
 import re
@@ -45,17 +50,10 @@ OPENS_AT_RE = re.compile(
     r"[^0-9\n]{0,24}(\d{1,2})[:.](\d{2})",
     re.IGNORECASE)
 
-# Login-page detection. Strong markers alone are enough; login TEXT only
-# counts on a page that also has a <form>, so an ordinary page with a
-# "Log in" link is never mistaken for one.
+# Login-page detection: the real login page only (see the docstring). A
+# rejected session normally gets a 302 to /account/login; this catches the
+# same page served as a 200.
 LOGIN_URL_PATH = "/account/login"
-LOGIN_STRONG_MARKERS = {
-    "password input": re.compile(r"<input[^>]*\btype\s*=\s*[\"']?password\b", re.IGNORECASE),
-    "OTP input": re.compile(r"<input[^>]*(?:autocomplete\s*=\s*[\"']?one-time-code"
-                            r"|\bname\s*=\s*[\"']?[\w.-]*otp)", re.IGNORECASE),
-    "login form": re.compile(r"<form[^>]*\baction\s*=\s*[\"']?[^\"'>]*/account/login", re.IGNORECASE),
-}
-LOGIN_TEXT = re.compile(r"เข้าสู่ระบบ|\bsign[\s-]?in\b|\blog[\s-]?in\b", re.IGNORECASE)
 
 
 class PageParser(HTMLParser):
@@ -130,15 +128,38 @@ class PageParser(HTMLParser):
             self.text.append(data)
 
 
+def is_login_path(url):
+    """True if `url` (absolute, or a path with or without a query) is
+    /account/login itself — not /account/logout, not /account/login-help,
+    not a returnUrl that merely mentions it."""
+    return urlsplit(url or "").path.rstrip("/").lower() == LOGIN_URL_PATH
+
+
+class _FormActions(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.actions = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "form":
+            self.actions.append(dict(attrs).get("action") or "")
+
+
 def login_page_markers(html, url=""):
-    """Names of the login-page markers present (empty = not a login page)."""
+    """Names of the login-page markers present (empty = not a login page):
+    "login URL" (the response is /account/login) and/or "login form" (a
+    <form action="/account/login…">)."""
     hits = []
-    if LOGIN_URL_PATH in urlsplit(url or "").path.lower():
+    if is_login_path(url):
         hits.append("login URL")
-    html = html or ""
-    hits += [name for name, rx in LOGIN_STRONG_MARKERS.items() if rx.search(html)]
-    if not hits and LOGIN_TEXT.search(html) and re.search(r"<form\b", html, re.IGNORECASE):
-        hits.append("login text + form")
+    parser = _FormActions()
+    try:
+        parser.feed(html or "")
+        parser.close()
+    except Exception:
+        pass  # whatever was parsed before the error still counts
+    if any(is_login_path(a) for a in parser.actions):
+        hits.append("login form")
     return hits
 
 

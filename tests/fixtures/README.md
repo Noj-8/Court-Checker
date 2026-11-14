@@ -1,7 +1,7 @@
 # Test fixtures (scrubbed)
 
-Scrubbed copies of seven pages saved from the live Crystal Sports site on
-2026-11-13. The raw pages live in `fixtures_raw/`, which is gitignored and must
+Scrubbed copies of eight pages saved from the live Crystal Sports site
+(1–7 on 2026-11-13, 8 on 2026-11-15). The raw pages live in `fixtures_raw/`, which is gitignored and must
 never be committed. Structure, class names, form fields and URLs are
 unchanged. Only the values below were replaced with obvious fakes.
 
@@ -14,6 +14,7 @@ unchanged. Only the values below were replaced with obvious fakes.
 | `5_bookings_awaiting.html` | `/bookings?tab=pending`: one booking awaiting payment |
 | `6_bookings_upcoming_filled.html` | `/bookings?tab=upcoming`: one Paid booking (15 Nov, 23:00–24:00, G South-1, Crystal Sports G) |
 | `7_booking_detail.html` | `/bookings/SPORTS-…`: that booking's own page (date, time, court, and a Cancel form the bot never uses) |
+| `8_login.html` | `/account/login`: the login page, logged out (one `<form action="/account/login">` with a `mobile` field). The only page the login detector may match |
 
 ## What was scrubbed
 
@@ -27,8 +28,9 @@ unchanged. Only the values below were replaced with obvious fakes.
 | Coach names (real people) | `C.Alpha`, `C.Bravo` |
 | Coach ids | `1001`, `1002` |
 | Booking line id (`/bookings/lines/<id>/cancel`) | `900001` |
+| Login page: its anti-forgery token, and the 10-digit placeholder on the phone field | `FAKE-ANTIFORGERY-TOKEN-08`, `0000000000` |
 
-Checked and **not present** in any of the seven pages, so nothing to scrub:
+Checked and **not present** in any of the eight pages, so nothing to scrub:
 - your phone number
 - your email address
 - member and LINE ids

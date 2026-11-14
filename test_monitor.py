@@ -25,6 +25,8 @@ import bot_session
 import monitor
 from test_probe_new_site import GRID_EN, GRID_TH, MEMBER_NEW, ScriptedAdapter, login_redirect, ok
 
+FIXTURES = Path(__file__).resolve().parent / "tests" / "fixtures"
+
 try:
     from cryptography.fernet import Fernet
 except ImportError:
@@ -457,15 +459,29 @@ class TestStateWriteFailures(MonitorTestCase):
 
 
 class TestLoginDetector(unittest.TestCase):
+    """Only the real login page counts: its URL, or its form (a <form>
+    posting to /account/login). Generic inputs or words never do — account
+    pages have forms, tokens and checkboxes too."""
+
+    def test_the_real_login_page_is_a_login_page(self):
+        html = (FIXTURES / "8_login.html").read_text(encoding="utf-8")
+        self.assertEqual(booking_page.login_page_markers(html, f"{bot_session.BASE}/bookings"), ["login form"])
+        self.assertTrue(booking_page.is_login_page(html))
+
+    def test_every_other_real_page_is_not_a_login_page(self):
+        pages = sorted(f for f in FIXTURES.glob("*.html") if f.name != "8_login.html")
+        self.assertEqual(len(pages), 7)
+        for f in pages:
+            with self.subTest(f.name):
+                html = f.read_text(encoding="utf-8")
+                self.assertEqual(booking_page.login_page_markers(html, f"{bot_session.BASE}/bookings"), [])
+
     def test_login_pages(self):
         for label, html, url in [
-            ("password input", '<form><input type="password" name="p"></form>', ""),
-            ("OTP input", '<input autocomplete="one-time-code">', ""),
-            ("OTP by name", "<input name='otpCode'>", ""),
             ("login form action", '<form method="post" action="/account/login?ReturnUrl=%2F">', ""),
+            ("login form, absolute action", "<form action='https://x.example/Account/Login/'></form>", ""),
+            ("login form, unquoted", "<form method=post action=/account/login>", ""),
             ("login URL", "<p>hello</p>", f"{bot_session.BASE}/account/login?ReturnUrl=%2Fbooking"),
-            ("Thai text + form", "<h1>เข้าสู่ระบบ</h1><form><input name='mobile'></form>", ""),
-            ("English text + form", "<h1>Sign in</h1><form><input name='mobile'></form>", ""),
         ]:
             with self.subTest(label):
                 self.assertTrue(booking_page.is_login_page(html, url))
@@ -474,6 +490,15 @@ class TestLoginDetector(unittest.TestCase):
         for label, html in [
             ("a Log in link, no form", '<a href="/account/login">Log in</a><p>Server busy</p>'),
             ("logged-in nav", '<a href="/account/logout">Log out</a><form action="/booking/search"><input name="q"></form>'),
+            ("logout form", '<form action="/account/logout" method="post"><input type="hidden" name="__RequestVerificationToken"></form>'),
+            ("password input", '<form><input type="password" name="p"></form>'),
+            ("OTP input", '<form><input autocomplete="one-time-code"></form>'),
+            ("OTP by name", "<form><input name='otpCode'></form>"),
+            ("Thai login text + form", "<h1>เข้าสู่ระบบ</h1><form><input name='mobile'></form>"),
+            ("English login text + form", "<h1>Sign in</h1><p>Log in again</p><form action='/bookings/lines/1/cancel'></form>"),
+            ("login only in a returnUrl", '<form action="/culture/set?returnUrl=%2Faccount%2Flogin"></form>'),
+            ("a different account path", '<form action="/account/login-help"></form>'),
+            ("form markup only in a script", "<script>var t = '<form action=\"/account/login\">';</script><p>ok</p>"),
             ("the grid", GRID_EN),
             ("not open yet", LOCKED_TH),
         ]:
@@ -548,14 +573,22 @@ class TestSessionFailures(MonitorTestCase):
         self.assertEqual(len(adapter.sent), 1)
         self.assertEqual(len(sent), 1)
 
-    def test_login_or_otp_page_served_as_200_counts_as_expired(self):
-        for page in ('<html><body><form action="/account/login"><input type="password"></form></body></html>',
-                     '<html><body><h1>ยืนยัน OTP</h1><input autocomplete="one-time-code"></body></html>'):
+    def test_login_page_served_as_200_counts_as_expired(self):
+        for page in ('<html><body><form action="/account/login"><input name="mobile"></form></body></html>',
+                     (FIXTURES / "8_login.html").read_text(encoding="utf-8")):
             with self.subTest(page=page[12:40]):
                 self.state_file.write_text("{}")
                 code, _, _, sent = self.run_monitor([ok(page)])
                 self.assertEqual(code, monitor.EXIT_SESSION)
                 self.assertEqual(len(sent), 1)
+
+    def test_a_200_page_without_the_login_form_is_not_expired(self):
+        page = '<html><body><h1>ยืนยัน OTP</h1><form><input type="password"><input autocomplete="one-time-code"></form></body></html>'
+        code, out, _, sent = self.run_monitor([ok(page)])
+        self.assertNotEqual(code, monitor.EXIT_SESSION)
+        self.assertEqual(sent, [])
+        self.assertNotIn("session_alert", self.state())
+        self.assertIn("unexpected page", out)
 
     def test_save_failure_without_cookie_changes_is_transient(self):
         with mock.patch.object(bot_session.os, "replace", side_effect=OSError("disk full")):
