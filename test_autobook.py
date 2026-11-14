@@ -125,6 +125,15 @@ class Pages:
         assert html != self.grid()
         return html
 
+    def grid_with_2300_closed(self):
+        """DERIVED: the real grid with 23:00 full."""
+        html = re.sub(r'<a class="slot is-selected"\s+href="[^"]*time=18[^"]*">\s*<span class="slot-time">23:00</span>\s*'
+                      r'<span class="slot-meta">2 free</span>\s*</a>',
+                      '<a class="slot is-disabled" aria-disabled="true"><span class="slot-time">23:00</span>'
+                      '<span class="slot-meta">Full</span></a>', self.grid())
+        assert html != self.grid()
+        return html
+
     def refused(self, sel=None):
         """SYNTHETIC: the review form re-rendered with an error (court taken)."""
         return self.review(sel).replace('<div class="flow" style="--flow:16px">',
@@ -1962,6 +1971,97 @@ class TestNewPendingBookingIsReadBeforeParked(AutobookTestCase):
         self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
         code, sent = self.run_mode("live")
         self.assertTrue(sent[0]["subject"].startswith("🟡"))
+
+
+
+class TestWhenItFires(AutobookTestCase):
+    """The old monitor's trigger (attempt_autobook() only inside `if k not in
+    known_open:`): a starred time is attempted on the check where it NEWLY
+    opens. Plus stage 3's rule: an attempt that submitted nothing is retried
+    while the time stays open; anything submitted never is."""
+
+    def book_ok(self):
+        self.site.posts = [parked_redirect()]
+        self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+
+    def autobook_requests(self):
+        return [x for x in self.site.sent if x["path"] != "/booking" or x["query"].get("time") != "0"]
+
+    def run_again(self, grid=None):
+        self.site.sent.clear()
+        self.site.grid["LOC002"] = grid or self.p.grid()
+        return self.run_mode("live")
+
+    def test_starring_a_time_that_is_already_open_does_nothing_until_it_reopens(self):
+        self.write_config([target(self.date, [("23:00", False)], locations=("LOC002",))])
+        code, sent = self.run_mode("live")
+        self.assertEqual([m["subject"][:1] for m in sent], ["🎾"], "alerted while unstarred")
+        self.write_config([target(self.date, [("23:00", True)], locations=("LOC002",))])  # now starred
+        self.book_ok()
+        for _ in range(3):  # still open: not newly open
+            code, sent = self.run_again()
+            self.assertEqual(self.autobook_requests(), [], "no auto-book requests at all")
+            self.assertEqual(sent, [], "and no email")
+        code, sent = self.run_again(grid=self.p.grid_with_2300_closed())  # it closes
+        self.assertEqual(self.autobook_requests(), [])
+        code, sent = self.run_again()  # and opens again: newly open
+        self.assertEqual(len(self.site.posts_sent()), 1)
+        self.assertEqual(self.record()["status"], "parked")
+
+    def test_a_newly_open_starred_time_is_attempted_on_that_check(self):
+        self.book_ok()
+        code, sent = self.run_mode("live")
+        self.assertEqual(len(self.site.posts_sent()), 1)
+
+    def test_an_attempt_that_submitted_nothing_is_retried_while_open(self):
+        for label, first in (("site error", (503, [], "busy")),
+                             ("network error", requests.exceptions.ConnectionError("reset"))):
+            with self.subTest(label):
+                self.setUp()
+                if isinstance(first, BaseException):
+                    calls = {"n": 0}
+                    original = self.site.send
+
+                    def send(request, _orig=original, **kw):
+                        if urlsplit(request.url).path == "/bookings" and calls["n"] == 0:
+                            calls["n"] += 1
+                            raise first
+                        return _orig(request, **kw)
+                    self.site.send = send
+                    self.site.pending = [self.p.pending_empty(), self.p.pending_with_ref()]
+                else:
+                    self.site.pending = [first, self.p.pending_empty(), self.p.pending_with_ref()]
+                self.site.posts = [parked_redirect()]
+                code, sent = self.run_mode("live")  # deferred: nothing submitted
+                self.assertEqual(self.site.posts_sent(), [])
+                self.assertIn(self.key, self.state()[autobook.RETRY_KEY])
+                code, sent = self.run_again()       # still open, not newly open: retried
+                self.assertEqual(len(self.site.posts_sent()), 1)
+                self.assertEqual(self.record()["status"], "parked")
+
+    def test_anything_submitted_or_finished_is_never_tried_again_even_after_reopening(self):
+        outcomes = {
+            "unclear (submitted)": lambda: setattr(self.site, "posts", [(500, [], "oops")]),
+            "parked (submitted)": self.book_ok,
+            "form changed (finished, nothing submitted)": lambda: self.site.reviews.__setitem__(
+                self.p.sel, self.p.review().replace('name="acceptTerms"', 'name="accept"')),
+            "already booked (finished)": lambda: setattr(self.site, "upcoming", [self.p.upcoming_filled()]),
+        }
+        for label, arrange in outcomes.items():
+            with self.subTest(label):
+                self.setUp()
+                arrange()
+                self.run_mode("live")
+                status = self.record()["status"]
+                self.assertNotIn(self.key, self.state().get(autobook.RETRY_KEY, {}))
+                self.book_ok()
+                self.run_again()                                   # still open
+                self.run_again(grid=self.p.grid_with_2300_closed())  # closes
+                code, sent = self.run_again()                      # reopens: newly open
+                self.assertEqual(self.site.posts_sent(), [])
+                self.assertNotIn("/booking/review", [x["path"] for x in self.site.sent])
+                self.assertEqual(self.record()["status"], status)
+                self.assertTrue(any(m["subject"].startswith("🎾") for m in sent), "the reopening is still alerted")
 
 
 class TestPostIsImpossibleElsewhere(unittest.TestCase):

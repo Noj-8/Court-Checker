@@ -73,8 +73,28 @@ dashboard shows the session as "Needs reseed".
 
 ## Auto-book (starred times)
 
-**Real money.** In `live` mode the bot books a starred time as soon as it
-opens and pays from your **Wallet**.
+**Real money.** In `live` mode the bot books a starred time when it newly
+opens, and pays from your **Wallet**.
+
+### When it fires
+
+- **When a starred time newly opens:** the first check that finds it open
+  after it wasn't (the same check that would send its 🎾 email).
+- **Starring a time that's already open** (already emailed) **does nothing**
+  until it closes and opens again.
+- **An attempt that submitted nothing is retried** on later checks while the
+  time stays open. That covers a site or network error, no free court, a
+  booking whose date/time couldn't be read, the session ending, or the
+  session jar not saving.
+- **Anything submitted is never retried,** whatever the result. Once a
+  booking request has been sent, that date and time is done.
+- **A time that already has a result is never tried again, even if it
+  reopens.** The results that count are booked, failed, form changed, and
+  skipped because you already had a booking.
+
+(One detail: if a 🎾 email fails to send, the next check treats that opening
+as new again, so the email isn't lost. Auto-book still won't book a date and
+time that already has a result.)
 
 ### Modes
 
