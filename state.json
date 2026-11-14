@@ -13,10 +13,5 @@
       "since": "2026-11-15T00:05:19+07:00",
       "reason": "session_stopped"
     }
-  },
-  "session_alert": {
-    "kind": "expired",
-    "sent_at": "2026-11-15T00:05:28.143234+07:00",
-    "jar_sha256": "71f50091012500da"
   }
 }
