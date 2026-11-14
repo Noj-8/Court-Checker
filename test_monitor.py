@@ -463,13 +463,17 @@ class TestLoginDetector(unittest.TestCase):
     posting to /account/login). Generic inputs or words never do — account
     pages have forms, tokens and checkboxes too."""
 
+    LOGIN_FIXTURES = ("8_login.html", "8_login_en.html")   # the real login page, Thai and English
+
     def test_the_real_login_page_is_a_login_page(self):
-        html = (FIXTURES / "8_login.html").read_text(encoding="utf-8")
-        self.assertEqual(booking_page.login_page_markers(html, f"{bot_session.BASE}/bookings"), ["login form"])
-        self.assertTrue(booking_page.is_login_page(html))
+        for name in self.LOGIN_FIXTURES:
+            with self.subTest(name):
+                html = (FIXTURES / name).read_text(encoding="utf-8")
+                self.assertEqual(booking_page.login_page_markers(html, f"{bot_session.BASE}/bookings"), ["login form"])
+                self.assertTrue(booking_page.is_login_page(html))
 
     def test_every_other_real_page_is_not_a_login_page(self):
-        pages = sorted(f for f in FIXTURES.glob("*.html") if f.name != "8_login.html")
+        pages = sorted(f for f in FIXTURES.glob("*.html") if f.name not in self.LOGIN_FIXTURES)
         self.assertEqual(len(pages), 7)
         for f in pages:
             with self.subTest(f.name):
@@ -575,7 +579,8 @@ class TestSessionFailures(MonitorTestCase):
 
     def test_login_page_served_as_200_counts_as_expired(self):
         for page in ('<html><body><form action="/account/login"><input name="mobile"></form></body></html>',
-                     (FIXTURES / "8_login.html").read_text(encoding="utf-8")):
+                     (FIXTURES / "8_login.html").read_text(encoding="utf-8"),
+                     (FIXTURES / "8_login_en.html").read_text(encoding="utf-8")):
             with self.subTest(page=page[12:40]):
                 self.state_file.write_text("{}")
                 code, _, _, sent = self.run_monitor([ok(page)])

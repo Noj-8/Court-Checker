@@ -2295,8 +2295,8 @@ class TestFixturesAreScrubbed(unittest.TestCase):
                 self.assertNotIn("นจ", t)
                 for line_id in re.findall(r"/bookings/lines/(\d+)", t):
                     self.assertTrue(line_id.startswith("9000"), "real booking line id")
-        self.assertEqual(sorted(f.name for f in FIX.glob("*.html"))[-3:],
-                         ["6_bookings_upcoming_filled.html", "7_booking_detail.html", "8_login.html"])
+        self.assertEqual(sorted(f.name for f in FIX.glob("*.html"))[-4:],
+                         ["6_bookings_upcoming_filled.html", "7_booking_detail.html", "8_login.html", "8_login_en.html"])
 
 
 if __name__ == "__main__":
