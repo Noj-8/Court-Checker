@@ -32,13 +32,17 @@ requests are strictly sequential.
   Options:     --repeat N rounds (default 1), --interval SECONDS between
                rounds (default 300). --repeat 12 --interval 300 = one hour.
                --check-account: after the first round's grids, also GET
-               /bookings and /bookings?tab=pending (the account pages
-               auto-book reads first) and print, for each, the status and
-               "ok" or "login redirect" — never page text or refs. Stops
-               at the first login redirect, like everything else.
+               the two lists auto-book reads, in its order:
+               /bookings?tab=pending and /bookings?tab=upcoming. For each
+               it prints the status, "ok" or the login verdict, whether
+               #bookingList was found and which tab is marked active
+               (pending / upcoming / none / other) — names only, never
+               page text or refs. Stops at the first login, like
+               everything else.
   Exit code:   0  grid parsed for both locations in every round
                1  at least one location/round returned no grid, or an
-                  account page (--check-account) wasn't ok
+                  account page (--check-account) wasn't one auto-book
+                  would accept (not 200, no #bookingList, wrong tab)
                2  no jar file yet and CS_DID or CS_MEMBER is missing
                3  stopped on a login redirect (session no longer valid —
                   or, with --check-account, an account page refused it)
@@ -46,8 +50,8 @@ requests are strictly sequential.
                   invalid BOT_JAR_KEY, or Actions without BOT_JAR_KEY)
                5  the session was handed off to GitHub Actions
 
-Hard rules, enforced in code: GET only, /booking only — plus /bookings
-(both tabs) with --check-account; never /booking/review, /booking/confirm
+Hard rules, enforced in code: GET only, /booking only — plus
+/bookings?tab=pending and ?tab=upcoming with --check-account; never /booking/review, /booking/confirm
 or a booking's own page — never follow a redirect, stop on
 the first login redirect and never retry, never print a cookie value —
 only names and fingerprints (length + first 8 hex chars of SHA-256).
@@ -69,7 +73,9 @@ from datetime import datetime, timedelta
 import requests
 
 import bot_session
-from booking_page import FIRST_INT, THAI_CHARS, PageParser, is_login_page, login_page_markers, parse_page  # noqa: F401 (re-exported)
+from booking_page import (  # noqa: F401 (re-exported)
+    FIRST_INT, THAI_CHARS, PageParser, is_login_page, login_page_markers, parse_bookings_list, parse_page,
+)
 from bot_session import (  # noqa: F401 (re-exported)
     BASE, BOOKING_PATH, BOOKINGS_PATH, CULTURE_COOKIE, ENC_FILE, HOST, JAR_FILE,
     JAR_KEY_ENV, JAR_VERSION, LOGIN_REDIRECT_MARKERS, OPTIONAL_SEED, SEED_ENV, TZ, USER_AGENT,
@@ -147,44 +153,56 @@ def probe_once(jar, loc, date):
     return result
 
 
-ACCOUNT_PAGES = (("/bookings", {}), ("/bookings?tab=pending", {"tab": "pending"}))
+# Exactly the lists auto-book reads, in its order.
+ACCOUNT_PAGES = tuple((name, f"{BOOKINGS_PATH}?tab={name}", params) for name, params in bot_session.BOOKINGS_LISTS)
+KNOWN_TABS = {name for name, _ in bot_session.BOOKINGS_LISTS}
 
 
 def check_account_page(jar, params):
-    """One GET of /bookings (params {} or {"tab": "pending"}). Returns
-    (status or None, verdict): verdict is "ok", "login redirect",
-    "login page (200: <which markers>)", or a short reason — never page
-    text or a ref."""
+    """One GET of a /bookings list. Returns (status or None, verdict, page):
+    verdict is "ok", "login redirect", "login page (200: <markers>)", or a
+    short reason; page is None, or for an ok 200 {"list": bool (#bookingList
+    found), "tab": "pending" / "upcoming" / "none" / "other"} — names only,
+    never page text or a ref."""
     try:
         fetched = bot_session.fetch(jar, BOOKINGS_PATH, params)
     except requests.RequestException as e:
-        return None, f"network error ({type(e).__name__})"
+        return None, f"network error ({type(e).__name__})", None
     resp = fetched.resp
     if fetched.login:
-        return resp.status_code, "login redirect"
+        return resp.status_code, "login redirect", None
     if resp.status_code != 200:
-        return resp.status_code, "not ok (unexpected status)"
+        return resp.status_code, "not ok (unexpected status)", None
     hits = login_page_markers(resp.text or "", resp.url)
     if hits:
-        return resp.status_code, f"login page (200: {', '.join(hits)})"
-    return resp.status_code, "ok"
+        return resp.status_code, f"login page (200: {', '.join(hits)})", None
+    parsed = parse_bookings_list(resp.text or "")
+    tab = parsed["tab"] if parsed["tab"] in KNOWN_TABS else ("none" if not parsed["tab"] else "other")
+    return resp.status_code, "ok", {"list": parsed["recognised"], "tab": tab}
 
 
 def check_account(jar):
-    """--check-account: the account pages, in order, stopping at the first
-    login. Returns EXIT_OK, EXIT_NO_GRID (a page wasn't ok) or EXIT_LOGIN.
+    """--check-account: the lists auto-book reads, in order, stopping at the
+    first login. Returns EXIT_OK (every page is one auto-book would accept:
+    200, #bookingList, the tab asked for), EXIT_NO_GRID or EXIT_LOGIN.
     Raises JarSaveError like probe_once's fetch would."""
     worst = EXIT_OK
-    for label, params in ACCOUNT_PAGES:
-        status, verdict = check_account_page(jar, params)
-        say(f"[{stamp()}] account {label}: status={'ERR' if status is None else status} {verdict}")
+    for name, label, params in ACCOUNT_PAGES:
+        status, verdict, page = check_account_page(jar, params)
+        line = f"[{stamp()}] account {label}: status={'ERR' if status is None else status} {verdict}"
+        accepted = False
+        if page is not None:
+            accepted = page["list"] and page["tab"] == name
+            line += (f" | #bookingList {'found' if page['list'] else 'NOT found'} | active tab: {page['tab']}"
+                     + ("" if accepted else " | auto-book would NOT accept this page"))
+        say(line)
         if verdict.startswith("login"):
             say()
             say(f"STOPPED at account page {label}: {verdict}. The grid read fine on this same session,")
             say("so account pages refuse something the grid doesn't need — e.g. a cookie the jar")
             say("lacks (see the cookie names above: is cs_auth there?). Not retrying.")
             return EXIT_LOGIN
-        if verdict != "ok":
+        if not accepted:
             worst = EXIT_NO_GRID
     return worst
 
@@ -274,7 +292,7 @@ def main(argv=None):
     ap.add_argument("--repeat", type=int, default=1, help="number of rounds (default 1)")
     ap.add_argument("--interval", type=float, default=300, help="seconds between rounds (default 300)")
     ap.add_argument("--check-account", action="store_true",
-                    help="after the first round, also GET /bookings and /bookings?tab=pending")
+                    help="after the first round, also GET /bookings?tab=pending and ?tab=upcoming")
     args = ap.parse_args(argv)
     if args.repeat < 1 or args.interval < 0:
         ap.error("--repeat must be >= 1 and --interval >= 0")

@@ -12,7 +12,7 @@ The flow for a starred time that is newly open (or was deferred earlier
 without ever POSTing):
   1. Key = date|HH:MM. At most ONE booking per key across both locations,
      ever: the attempt is recorded in state before any booking request.
-  2. Read /bookings?tab=pending and /bookings. Upcoming rows show the
+  2. Read /bookings?tab=pending and /bookings?tab=upcoming. Upcoming rows show the
      played day and time (the year is inferred); Awaiting-payment rows
      don't, so for each such booking (not the bot's own, recognised by its
      ref fingerprint) its own page /bookings/SPORTS-… is read. A booking at
@@ -253,7 +253,7 @@ def read_lists(ctx):
     a different tab active) raises Deferred(UNRECOGNISED_LIST:<name>) —
     never read as "no bookings"."""
     out = {}
-    for name, params in (("pending", {"tab": "pending"}), ("upcoming", {})):
+    for name, params in bot_session.BOOKINGS_LISTS:
         page = booking_page.parse_bookings_list(_get(ctx, BOOKINGS_PATH, params))
         if not page["recognised"] or page["tab"] != name:
             raise Deferred(f"{UNRECOGNISED_LIST}:{name}", f"the My bookings page ({name}) didn't look as expected")

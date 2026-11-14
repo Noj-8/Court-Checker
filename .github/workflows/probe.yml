@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       check_account:
-        description: "Also GET /bookings and /bookings?tab=pending after the first round (status + ok/login redirect only)"
+        description: "Also GET /bookings?tab=pending and ?tab=upcoming after the first round (status, ok/login, #bookingList found, active tab)"
         type: boolean
         default: false
 

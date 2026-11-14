@@ -360,13 +360,16 @@ class TestStopsOnLoginRedirect(ProbeTestCase):
         self.assert_no_secret_leak(out)
 
 
-ACCOUNT_REF = "SPORTS-202611219999"
-ACCOUNT_PAGE = (f'<html><body><h1>My bookings</h1><a class="bk-row" href="/bookings/{ACCOUNT_REF}">'
-                'Private Member Name</a></body></html>')
+FIXTURES = Path(__file__).resolve().parent / "tests" / "fixtures"
+PENDING_PAGE = (FIXTURES / "5_bookings_awaiting.html").read_text(encoding="utf-8")    # real, tab=pending, one row
+UPCOMING_PAGE = (FIXTURES / "6_bookings_upcoming_filled.html").read_text(encoding="utf-8")  # real, tab=upcoming
+PAGE_SECRETS = ("SPORTS-900000000001", "SPORTS-900000000002", "Test Member", "FAKE-ANTIFORGERY")
+P_LINE, U_LINE = "account /bookings?tab=pending:", "account /bookings?tab=upcoming:"
+ACCEPTED = "| #bookingList found | active tab: {}"
 
 
-def account_ok():
-    return ok(body=ACCOUNT_PAGE)
+def page(body):
+    return ok(body=body)
 
 
 def account_login_redirect():
@@ -374,9 +377,10 @@ def account_login_redirect():
 
 
 class TestCheckAccount(ProbeTestCase):
-    """--check-account: after the first round's grids, GET /bookings then
-    /bookings?tab=pending and print status + ok/login redirect — never page
-    text or refs; stop at the first login."""
+    """--check-account: after the first round's grids, GET exactly the two
+    lists auto-book reads (?tab=pending, then ?tab=upcoming) and print, for
+    each: status, ok/login, whether #bookingList was found, the active tab —
+    names only, never page text or refs; stop at the first login."""
 
     def account_lines(self, out):
         return [l.split("] ", 1)[1] for l in out.splitlines() if "] account " in l]
@@ -384,61 +388,110 @@ class TestCheckAccount(ProbeTestCase):
     def requests_made(self, adapter):
         return [(r["method"], urlsplit(r["url"]).path, urlsplit(r["url"]).query) for r in adapter.sent]
 
-    def test_both_ok(self):
-        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok()], env=SEED,
-                                               check_account=True)
-        self.assertEqual(code, probe.EXIT_OK)
-        self.assertEqual(self.requests_made(adapter)[2:], [("GET", "/bookings", ""), ("GET", "/bookings", "tab=pending")])
-        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 ok",
-                                                   "account /bookings?tab=pending: status=200 ok"])
-        self.assertIn("Account pages: both ok.", out)
-        self.assertNotIn(ACCOUNT_REF, out)
-        self.assertNotIn("Private Member Name", out)
-        self.assertNotIn("My bookings", out)
+    def assert_no_page_text(self, out):
+        for secret in PAGE_SECRETS:
+            self.assertNotIn(secret, out)
         self.assert_no_secret_leak(out)
 
-    def test_login_redirect_on_bookings_stops_before_the_pending_tab(self):
+    def test_both_accepted(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), page(PENDING_PAGE), page(UPCOMING_PAGE)], env=SEED,
+                                               check_account=True)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertEqual(self.requests_made(adapter)[2:], [("GET", "/bookings", "tab=pending"),
+                                                           ("GET", "/bookings", "tab=upcoming")],
+                         "exactly the two URLs auto-book reads, in its order")
+        self.assertEqual(self.account_lines(out), [f"{P_LINE} status=200 ok {ACCEPTED.format('pending')}",
+                                                   f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"])
+        self.assertIn("Account pages: both ok", out)
+        self.assert_no_page_text(out)
+
+    def test_same_urls_as_autobook(self):
+        self.assertEqual([params for _, _, params in probe.ACCOUNT_PAGES],
+                         [params for _, params in probe.bot_session.BOOKINGS_LISTS])
+
+    def test_wrong_tab_or_no_list_is_reported_and_not_accepted(self):
+        cases = {
+            "pending answered with the upcoming tab": ([page(UPCOMING_PAGE), page(UPCOMING_PAGE)],
+                [f"{P_LINE} status=200 ok | #bookingList found | active tab: upcoming | auto-book would NOT accept this page",
+                 f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
+            "no tab marked active": ([page(PENDING_PAGE.replace("tab active", "tab")), page(UPCOMING_PAGE)],
+                [f"{P_LINE} status=200 ok | #bookingList found | active tab: none | auto-book would NOT accept this page",
+                 f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
+            "an unknown tab is active": ([page(PENDING_PAGE.replace("?tab=pending", "?tab=SPORTS-900000000001")),
+                                          page(UPCOMING_PAGE)],
+                [f"{P_LINE} status=200 ok | #bookingList found | active tab: other | auto-book would NOT accept this page",
+                 f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
+            "an unrelated page": ([page("<html><body><h1>Checking your browser</h1><form action='/verify'></form></body></html>"),
+                                   page(UPCOMING_PAGE)],
+                [f"{P_LINE} status=200 ok | #bookingList NOT found | active tab: none | auto-book would NOT accept this page",
+                 f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"]),
+        }
+        for label, (pages, want) in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                code, out, adapter, _ = self.run_probe([ok(), ok(), *pages], env=SEED, check_account=True)
+                self.assertEqual(code, probe.EXIT_NO_GRID)
+                self.assertEqual(self.account_lines(out), want)
+                self.assertIn("Account pages: at least one was NOT ok", out)
+                self.assert_no_page_text(out)
+
+    def test_login_redirect_on_the_first_list_stops_before_the_second(self):
         code, out, adapter, _ = self.run_probe([ok(), ok(), account_login_redirect()], env=SEED,
                                                repeat=2, check_account=True)
         self.assertEqual(code, probe.EXIT_LOGIN)
-        self.assertEqual(len(adapter.sent), 3, "no pending tab, no round 2")
-        self.assertEqual(self.account_lines(out), ["account /bookings: status=302 login redirect"])
-        self.assertIn("STOPPED at account page /bookings: login redirect.", out)
+        self.assertEqual(len(adapter.sent), 3, "no second list, no round 2")
+        self.assertEqual(self.account_lines(out), [f"{P_LINE} status=302 login redirect"])
+        self.assertIn("STOPPED at account page /bookings?tab=pending: login redirect.", out)
         self.assertIn("is cs_auth there?", out)
         self.assertNotIn("ReturnUrl", out, "the Location isn't printed")
         self.assert_no_secret_leak(out)
 
-    def test_login_redirect_on_the_pending_tab(self):
-        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_login_redirect()], env=SEED,
+    def test_login_redirect_on_the_second_list(self):
+        code, out, adapter, _ = self.run_probe([ok(), ok(), page(PENDING_PAGE), account_login_redirect()], env=SEED,
                                                check_account=True)
         self.assertEqual(code, probe.EXIT_LOGIN)
-        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 ok",
-                                                   "account /bookings?tab=pending: status=302 login redirect"])
+        self.assertEqual(self.account_lines(out), [f"{P_LINE} status=200 ok {ACCEPTED.format('pending')}",
+                                                   f"{U_LINE} status=302 login redirect"])
 
     def test_login_page_served_as_200(self):
-        login = ok(body='<html><body><form action="/account/login"><input type="password"></form></body></html>')
+        login = page((FIXTURES / "8_login_en.html").read_text(encoding="utf-8"))
         code, out, adapter, _ = self.run_probe([ok(), ok(), login], env=SEED, check_account=True)
         self.assertEqual(code, probe.EXIT_LOGIN)
-        self.assertEqual(self.account_lines(out), ["account /bookings: status=200 login page (200: login form)"])
+        self.assertEqual(self.account_lines(out), [f"{P_LINE} status=200 login page (200: login form)"])
 
     def test_not_ok_status_is_reported_and_the_other_page_still_checked(self):
-        err = (500, [("Content-Type", "text/html")], f"<html>error for {ACCOUNT_REF}</html>")
-        code, out, adapter, _ = self.run_probe([ok(), ok(), err, account_ok()], env=SEED, check_account=True)
+        err = (500, [("Content-Type", "text/html")], "<html>error for SPORTS-900000000001</html>")
+        code, out, adapter, _ = self.run_probe([ok(), ok(), err, page(UPCOMING_PAGE)], env=SEED, check_account=True)
         self.assertEqual(code, probe.EXIT_NO_GRID)
-        self.assertEqual(self.account_lines(out), ["account /bookings: status=500 not ok (unexpected status)",
-                                                   "account /bookings?tab=pending: status=200 ok"])
+        self.assertEqual(self.account_lines(out), [f"{P_LINE} status=500 not ok (unexpected status)",
+                                                   f"{U_LINE} status=200 ok {ACCEPTED.format('upcoming')}"])
         self.assertIn("Account pages: at least one was NOT ok", out)
-        self.assertNotIn(ACCOUNT_REF, out)
+        self.assert_no_page_text(out)
 
     def test_network_error(self):
         code, out, adapter, _ = self.run_probe([ok(), ok(), (200, [], "", requests.ConnectionError("boom")),
-                                                account_ok()], env=SEED, check_account=True)
+                                                page(UPCOMING_PAGE)], env=SEED, check_account=True)
         self.assertEqual(code, probe.EXIT_NO_GRID)
-        self.assertEqual(self.account_lines(out)[0], "account /bookings: status=ERR network error (ConnectionError)")
+        self.assertEqual(self.account_lines(out)[0], f"{P_LINE} status=ERR network error (ConnectionError)")
+
+    def test_jar_save_failure_on_an_account_page_stops(self):
+        real, calls = probe.bot_session.save_jar, {"n": 0}
+
+        def save(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 4:   # seed, grid, grid, then the first list
+                raise OSError("disk full")
+            return real(*a, **kw)
+        with mock.patch.object(probe.bot_session, "save_jar", side_effect=save):
+            code, out, adapter, _ = self.run_probe([ok(), ok(), page(PENDING_PAGE), page(UPCOMING_PAGE)], env=SEED,
+                                                   check_account=True)
+        self.assertEqual(code, probe.EXIT_JAR)
+        self.assertEqual(len(adapter.sent), 3, "nothing after the failed save")
+        self.assertIn("account pages: FAILED TO WRITE", out)
 
     def test_runs_once_after_round_one_only(self):
-        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok(), ok(), ok()], env=SEED,
-                                               repeat=2, check_account=True)
+        code, out, adapter, _ = self.run_probe([ok(), ok(), page(PENDING_PAGE), page(UPCOMING_PAGE), ok(), ok()],
+                                               env=SEED, repeat=2, check_account=True)
         self.assertEqual(code, probe.EXIT_OK)
         self.assertEqual([p for _, p, _ in self.requests_made(adapter)],
                          ["/booking", "/booking", "/bookings", "/bookings", "/booking", "/booking"])
@@ -453,23 +506,9 @@ class TestCheckAccount(ProbeTestCase):
         code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED)
         self.assertEqual(code, probe.EXIT_OK)
         self.assertEqual({p for _, p, _ in self.requests_made(adapter)}, {"/booking"})
-        code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok()], env=SEED, check_account=True)
+        code, out, adapter, _ = self.run_probe([ok(), ok(), page(PENDING_PAGE), page(UPCOMING_PAGE)], env=SEED,
+                                               check_account=True)
         self.assertEqual({m for m, _, _ in self.requests_made(adapter)}, {"GET"})
-
-    def test_jar_save_failure_on_an_account_page_stops(self):
-        real, calls = probe.bot_session.save_jar, {"n": 0}
-
-        def save(*a, **kw):
-            calls["n"] += 1
-            if calls["n"] == 4:   # seed, grid, grid, then /bookings
-                raise OSError("disk full")
-            return real(*a, **kw)
-        with mock.patch.object(probe.bot_session, "save_jar", side_effect=save):
-            code, out, adapter, _ = self.run_probe([ok(), ok(), account_ok(), account_ok()], env=SEED,
-                                                   check_account=True)
-        self.assertEqual(code, probe.EXIT_JAR)
-        self.assertEqual(len(adapter.sent), 3, "nothing after the failed save")
-        self.assertIn("account pages: FAILED TO WRITE", out)
 
     def test_cli_flag(self):
         with mock.patch.object(probe, "run", return_value=0) as run:

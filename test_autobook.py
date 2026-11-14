@@ -283,9 +283,9 @@ class TestParkedEndToEnd(AutobookTestCase):
         # The order: lists, slot page, review, POST, lists again — all GETs on
         # allowed paths. The redirect is never followed (no /payment or /wallet GET).
         order = [(s["method"], s["path"], s["query"].get("tab", s["query"].get("time", ""))) for s in self.site.sent]
-        self.assertEqual(order, [("GET", "/booking", "0"), ("GET", "/bookings", "pending"), ("GET", "/bookings", ""),
+        self.assertEqual(order, [("GET", "/booking", "0"), ("GET", "/bookings", "pending"), ("GET", "/bookings", "upcoming"),
                                  ("GET", "/booking", "18"), ("GET", "/booking/review", ""),
-                                 ("POST", "/booking/confirm", ""), ("GET", "/bookings", "pending"), ("GET", "/bookings", ""),
+                                 ("POST", "/booking/confirm", ""), ("GET", "/bookings", "pending"), ("GET", "/bookings", "upcoming"),
                                  ("GET", f"/bookings/{REF}", "")], "the new pending booking's own page, read before 🟡")
 
         self.assertEqual(self.subjects(sent), [f"🟡 Parked — pay within 15 min: Crystal Sports G G South-1 {self.date} 23:00 ฿500"])
@@ -2171,7 +2171,7 @@ class TestLoginRedirectNamesThePage(AutobookTestCase):
     CASES = {
         "grid": lambda m, p, q: p == "/booking" and q.get("time") == "0",
         "bookings (pending)": lambda m, p, q: p == "/bookings" and q.get("tab") == "pending",
-        "bookings": lambda m, p, q: p == "/bookings" and "tab" not in q,
+        "bookings (upcoming)": lambda m, p, q: p == "/bookings" and q.get("tab") == "upcoming",
         "booking detail": lambda m, p, q: p.startswith("/bookings/SPORTS-"),
         "slot page": lambda m, p, q: p == "/booking" and q.get("time") not in (None, "0"),
         "review": lambda m, p, q: p == "/booking/review",
@@ -2216,6 +2216,7 @@ class TestLoginRedirectNamesThePage(AutobookTestCase):
         self.assertEqual(pt("GET", "/booking", {"date": "x", "loc": "LOC001", "time": "23"}), "slot page")
         self.assertEqual(pt("GET", "/booking/review", {"sel": "abc"}), "review")
         self.assertEqual(pt("GET", "/bookings", {}), "bookings")
+        self.assertEqual(pt("GET", "/bookings", {"tab": "upcoming"}), "bookings (upcoming)")
         self.assertEqual(pt("GET", "/bookings", {"tab": "pending"}), "bookings (pending)")
         self.assertEqual(pt("GET", f"/bookings/{REF}", {}), "booking detail")
         self.assertEqual(pt("POST", "/booking/confirm"), "confirm")
@@ -2240,6 +2241,22 @@ class TestPostIsImpossibleElsewhere(unittest.TestCase):
             bot_session._send(self.jar, "GET", "/booking/confirm")
         with self.assertRaises(RuntimeError):
             bot_session._send(self.jar, "GET", "/booking", data=[("a", "b")])
+
+    def test_the_bookings_list_is_only_ever_these_two_gets(self):
+        for params in ({}, None, {"tab": "cancelled"}, {"tab": "Upcoming"}, {"tab": "upcoming", "x": "1"},
+                       {"tab": "pending", "page": "2"}, {"tab": ""}, {"x": "1"}):
+            with self.subTest(params=params), self.assertRaises(RuntimeError):
+                bot_session.fetch(self.jar, "/bookings", params)
+        with self.assertRaises(RuntimeError):
+            bot_session._send(self.jar, "POST", "/bookings", params={"tab": "upcoming"}, data=[("a", "b")])
+        site = FakeSite(Pages(FIXTURE_DATE))
+        self.jar.session.mount("https://", site)
+        with mock.patch.object(bot_session, "save_jar"):
+            for _, params in bot_session.BOOKINGS_LISTS:
+                bot_session.fetch(self.jar, "/bookings", params)
+        self.assertEqual([(x["method"], x["path"], x["query"]) for x in site.sent],
+                         [("GET", "/bookings", {"tab": "pending"}), ("GET", "/bookings", {"tab": "upcoming"})])
+        self.assertEqual(bot_session.BOOKINGS_LISTS, (("pending", {"tab": "pending"}), ("upcoming", {"tab": "upcoming"})))
 
     def test_booking_pages_are_get_only_and_exactly_that_shape(self):
         refused_gets = ["/bookings/SPORTS-1/sheet", "/bookings/SPORTS-1/cancel", "/bookings/lines/1/cancel",

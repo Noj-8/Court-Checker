@@ -50,6 +50,10 @@ BOOKINGS_PATH = "/bookings"
 CONFIRM_PATH = "/booking/confirm"
 ALLOWED_GET_PATHS = frozenset({BOOKING_PATH, REVIEW_PATH, BOOKINGS_PATH})
 ALLOWED_REQUESTS = frozenset({("GET", p) for p in ALLOWED_GET_PATHS} | {("POST", CONFIRM_PATH)})
+# The only two /bookings list GETs, in the order auto-book reads them —
+# each exactly this query (the Upcoming URL is the one the saved page came
+# from, so its active tab is known to be "upcoming").
+BOOKINGS_LISTS = (("pending", {"tab": "pending"}), ("upcoming", {"tab": "upcoming"}))
 # One booking's own page, e.g. /bookings/SPORTS-202611210443 (seen live
 # 2026-11-13): GET only, exactly this shape — not /sheet, not /cancel.
 BOOKING_DETAIL_RE = re.compile(r"/bookings/SPORTS-\d{1,20}")
@@ -456,7 +460,8 @@ def page_type(method, path, params=None):
     if path == REVIEW_PATH:
         return "review"
     if path == BOOKINGS_PATH:
-        return "bookings (pending)" if (params or {}).get("tab") == "pending" else "bookings"
+        tab = (params or {}).get("tab")
+        return f"bookings ({tab})" if tab in ("pending", "upcoming") else "bookings"
     if BOOKING_DETAIL_RE.fullmatch(path):
         return "booking detail"
     return "unknown"
@@ -493,6 +498,8 @@ def _send(jar, method, path, params=None, data=None, headers=None):
     no longer valid: stop."""
     url = BASE + path
     allowed = (method, path) in ALLOWED_REQUESTS or (method == "GET" and BOOKING_DETAIL_RE.fullmatch(path))
+    if path == BOOKINGS_PATH and not any(dict(params or {}) == q for _, q in BOOKINGS_LISTS):
+        allowed = False  # the list only as ?tab=pending or ?tab=upcoming, nothing else
     if not allowed or urlsplit(url).path != path:
         raise RuntimeError(f"refusing to {method} {path!r} — not an allowed request on the bot session")
     if (method == "POST") != (data is not None) or (method == "GET" and data is not None):
