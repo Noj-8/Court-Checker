@@ -65,6 +65,10 @@
         {
           "time": "21:00",
           "autoBook": false
+        },
+        {
+          "time": "23:00",
+          "autoBook": true
         }
       ]
     }
