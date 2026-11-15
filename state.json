@@ -1,11 +1,10 @@
 {
   "known_open": {
     "2026-11-20|LOC001|any|23:00": true,
-    "2026-11-20|LOC002|any|23:00": true,
-    "2026-11-17|LOC001|any|21:00": true
+    "2026-11-20|LOC002|any|23:00": true
   },
-  "last_check": "2026-11-16T01:08:23.019199+07:00",
-  "currently_open_count": 1,
+  "last_check": "2026-11-16T01:13:27.501690+07:00",
+  "currently_open_count": 0,
   "autobook_attempts": {},
   "autobook_mode": "live",
   "autobook_dry_run": {
