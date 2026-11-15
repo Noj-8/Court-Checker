@@ -3,30 +3,11 @@
     "2026-11-20|LOC001|any|23:00": true,
     "2026-11-20|LOC002|any|23:00": true
   },
-  "last_check": "2026-11-15T23:58:23.953092+07:00",
+  "last_check": "2026-11-16T00:03:35.652486+07:00",
   "currently_open_count": 0,
   "autobook_attempts": {},
   "autobook_mode": "live",
   "autobook_dry_run": {
-    "2026-11-15|23:00": {
-      "status": "aborted_mismatch",
-      "mode": "dry_run",
-      "loc": "LOC001",
-      "loc_name": "Crystal Sports",
-      "date": "2026-11-15",
-      "time": "23:00",
-      "started_at": "2026-11-15T03:50:26+07:00",
-      "attempts": [],
-      "result_at": "2026-11-15T03:50:27+07:00",
-      "problems": [
-        "field_required",
-        "field_required",
-        "field_required",
-        "field_required",
-        "field_required",
-        "coach_missing"
-      ]
-    },
     "2026-11-20|23:00": {
       "status": "dry_run",
       "mode": "dry_run",
