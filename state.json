@@ -1,9 +1,11 @@
 {
   "known_open": {
     "2026-11-20|LOC001|any|23:00": true,
-    "2026-11-20|LOC002|any|23:00": true
+    "2026-11-20|LOC002|any|23:00": true,
+    "2026-11-17|LOC001|any|23:00": true,
+    "2026-11-17|LOC002|any|23:00": true
   },
-  "last_check": "2026-11-15T23:03:35.308029+07:00",
+  "last_check": "2026-11-15T23:08:28.280315+07:00",
   "currently_open_count": 2,
   "autobook_attempts": {},
   "autobook_mode": "live",
@@ -40,5 +42,26 @@
     }
   },
   "autobook_retry": {},
-  "autobook": {}
+  "autobook": {
+    "2026-11-17|23:00": {
+      "status": "parked",
+      "mode": "live",
+      "loc": "LOC001",
+      "loc_name": "Crystal Sports",
+      "date": "2026-11-17",
+      "time": "23:00",
+      "started_at": "2026-11-15T23:05:21+07:00",
+      "attempts": [
+        {
+          "n": 1,
+          "court_index": 1,
+          "at": "2026-11-15T23:05:22+07:00",
+          "http": 302,
+          "hint": "parked",
+          "ref_fp": "1cc600003c8c"
+        }
+      ],
+      "result_at": "2026-11-15T23:05:23+07:00"
+    }
+  }
 }
