@@ -3,7 +3,7 @@
     "2026-11-20|LOC001|any|23:00": true,
     "2026-11-20|LOC002|any|23:00": true
   },
-  "last_check": "2026-11-15T21:03:35.110008+07:00",
+  "last_check": "2026-11-15T21:08:23.456567+07:00",
   "currently_open_count": 2,
   "autobook_attempts": {},
   "autobook_mode": "dry_run",
