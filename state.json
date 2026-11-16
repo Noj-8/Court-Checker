@@ -3,7 +3,7 @@
     "2026-11-20|LOC001|any|23:00": true,
     "2026-11-20|LOC002|any|23:00": true
   },
-  "last_check": "2026-11-16T20:48:28.237333+07:00",
+  "last_check": "2026-11-16T22:03:51.668611+07:00",
   "currently_open_count": 0,
   "autobook_attempts": {},
   "autobook_mode": "live",
@@ -42,10 +42,5 @@
       ],
       "result_at": "2026-11-15T23:05:23+07:00"
     }
-  },
-  "session_alert": {
-    "kind": "expired",
-    "sent_at": "2026-11-16T21:00:34.656795+07:00",
-    "jar_sha256": "472910024ad35b04"
   }
 }
