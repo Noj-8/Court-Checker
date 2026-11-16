@@ -100,9 +100,24 @@ jobs:
           path: .jar_cache/bot_session.enc
           key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # actions/cache/save only warns when a save fails, so look the entry up
+      # by its exact key: the softer "next run uses the cached copy" wording
+      # is used only when this hits AND the staged file is this run's jar.
+      - name: Check the bot session fallback was saved
+        id: cache_check
+        if: always() && hashFiles('.jar_cache/bot_session.enc') != ''
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: .jar_cache/bot_session.enc
+          key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}
+          lookup-only: true
+
       - name: Commit state and bot session
         id: save
         if: always()
+        env:
+          CACHE_HIT: ${{ steps.cache_check.outputs.cache-hit }}
         run: |
           if [ -z "$(git status --porcelain -- state.json bot_session.enc)" ]; then
             echo "No state or session changes — skipping commit."
@@ -140,7 +155,11 @@ jobs:
           fi
           if [ "$jar_changed" = true ]; then
             echo "session_lost=true" >> "$GITHUB_OUTPUT"
-            echo "::error title=Bot session likely lost::A cookie rotated during this run but bot_session.enc could not be pushed. The copy in the repo is now superseded and presenting it kills the session — reseed needed (see the email)."
+            if [ "$CACHE_HIT" = "true" ] && cmp -s .jar_cache/bot_session.enc bot_session.enc; then
+              echo "::error title=Bot session not pushed (cached)::A cookie rotated during this run but bot_session.enc could not be pushed. The newest jar is in the Actions cache and the next run uses it — reseed only if a \"Bot session expired\" email follows."
+            else
+              echo "::error title=Bot session likely lost::A cookie rotated during this run but bot_session.enc could not be pushed, and the Actions cache copy could not be confirmed. The copy in the repo is now superseded and presenting it kills the session — reseed needed (see the email)."
+            fi
           else
             echo "::error::state.json could not be pushed (the bot session was unchanged, so it is fine). Auto-book records from this run are not in the repo — see the email."
           fi
@@ -152,7 +171,14 @@ jobs:
           BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
-        run: python monitor.py --alert-session-lost "bot_session.enc could not be pushed after a cookie rotated"
+          CACHE_HIT: ${{ steps.cache_check.outputs.cache-hit }}
+        run: |
+          # Softer email only if the cache entry exists and holds this run's jar.
+          if [ "$CACHE_HIT" = "true" ] && cmp -s .jar_cache/bot_session.enc bot_session.enc; then
+            python monitor.py --alert-session-lost "bot_session.enc could not be pushed after a cookie rotated" --cache-saved
+          else
+            python monitor.py --alert-session-lost "bot_session.enc could not be pushed after a cookie rotated"
+          fi
 
       # The marker (the repo's state.json blob id at the failure) lives in the
       # Actions cache, since the repo itself is what can't be written. It

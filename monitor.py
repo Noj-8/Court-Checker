@@ -51,10 +51,13 @@ apart (default 60), then exits. Designed for GitHub Actions cron */5.
                      nothing and exit 0 (the dashboard shows "stale").
                   4  a rotated cookie couldn't be saved — session likely lost
 
-  python monitor.py --alert-session-lost "REASON"
+  python monitor.py --alert-session-lost "REASON" [--cache-saved]
                   sends the "session likely lost" email (used by
                   monitor.yml when bot_session.enc couldn't be pushed) and
-                  exits 4.
+                  exits 4. With --cache-saved (monitor.yml passes it only
+                  when the newest encrypted jar is confirmed in the Actions
+                  cache) the email is the softer "next run uses the cached
+                  copy" one, and it doesn't stop later runs.
 """
 
 import argparse
@@ -337,7 +340,19 @@ def fetch_availability(jar, date, loc_id):
     return "ok", open_times, None, links
 
 
+SESSION_CACHED_SUBJECT = "⚠️ Bot session not pushed — next run uses the cached copy"
+
+
 def session_alert_email(kind, detail):
+    if kind == "lost_cached":
+        body = ("A cookie rotated during this run but bot_session.enc couldn't be pushed to the repo"
+                + (f" ({detail})" if detail else "") + ".\n\n"
+                "The newest cookie was saved to the Actions cache, and the next run will use it\n"
+                "(its log says \"Jar: CACHE copy\"). Nothing to do now: checks carry on as usual.\n\n"
+                "You'll only need to reseed if a \"🔴 Bot session expired — reseed needed\" email\n"
+                "follows.\n\n"
+                f"In that case:\n{RESEED_STEPS}\n")
+        return SESSION_CACHED_SUBJECT, body
     if kind == "lost":
         subject = "🔴 Bot session likely lost — reseed needed"
         lead = ("A cookie rotated but the bot couldn't save it"
@@ -357,7 +372,9 @@ def alert_session(state, kind, detail, jar_fp, email):
     jar file is on disk. Recorded only if the send succeeds, so a failed
     send is retried next run."""
     prev = state.get("session_alert")
-    if prev and prev.get("jar_sha256") == jar_fp:
+    # A softer "lost_cached" email never holds back a later, different one
+    # (an "expired" email for the cached jar is the reseed signal).
+    if prev and prev.get("jar_sha256") == jar_fp and (prev.get("kind") != "lost_cached" or kind == "lost_cached"):
         log(f"  session email already sent at {prev.get('sent_at')} for this jar — not resending")
         return
     subject, body = session_alert_email(kind, detail)
@@ -753,7 +770,8 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
         save_state=save_state, try_save_state=try_save_state, log=log, locations=LOCATIONS))
 
     prev = state.get("session_alert")
-    if prev and prev.get("jar_sha256") == bot_session.file_fingerprint(jar.path):
+    # "lost_cached" only dedupes its email: the cached jar is the one to use next.
+    if prev and prev.get("kind") != "lost_cached" and prev.get("jar_sha256") == bot_session.file_fingerprint(jar.path):
         log(f"🔴 bot session marked {prev.get('kind')} at {prev.get('sent_at')} and {jar.path.name} hasn't "
             "changed since — not sending any requests until it's reseeded (already emailed; exit 0).")
         try_save_state(state)
@@ -800,16 +818,18 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
     return EXIT_OK
 
 
-def alert_session_lost(reason):
+def alert_session_lost(reason, cache_saved=False):
     """Called by monitor.yml when bot_session.enc couldn't be pushed after
-    a cookie rotated."""
+    a cookie rotated. cache_saved: the workflow confirmed this run's jar is
+    in the Actions cache, so the next run can carry on with it."""
     state = open_state()
     email = email_settings(load_config())
     if email is None:
         return EXIT_SETUP
     if is_halted(state):
         email_halt_once(state, email)
-    alert_session(state, "lost", reason, bot_session.file_fingerprint(current_jar_path()), email)
+    alert_session(state, "lost_cached" if cache_saved else "lost", reason,
+                  bot_session.file_fingerprint(current_jar_path()), email)
     try_save_state(state)
     return EXIT_JAR
 
@@ -970,11 +990,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Crystal Sports court monitor (notify-only).")
     ap.add_argument("--alert-session-lost", metavar="REASON",
                     help="send the 'session likely lost' email and exit 4")
+    ap.add_argument("--cache-saved", action="store_true",
+                    help="with --alert-session-lost: the newest jar is confirmed in the Actions cache")
     ap.add_argument("--alert-state-not-saved", metavar="REASON",
                     help="send the 'state not saved' email (deduped by $REMOTE_STATE_BLOB)")
     args = ap.parse_args(argv)
     if args.alert_session_lost is not None:
-        return alert_session_lost(args.alert_session_lost)
+        return alert_session_lost(args.alert_session_lost, cache_saved=args.cache_saved)
     if args.alert_state_not_saved is not None:
         return alert_state_not_saved(args.alert_state_not_saved, os.environ.get("REMOTE_STATE_BLOB", "").strip() or None)
     return run(iterations=int(os.environ.get("LOOP_ITERATIONS", "4")),

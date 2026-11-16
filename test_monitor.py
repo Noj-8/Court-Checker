@@ -749,6 +749,51 @@ class TestSessionFailures(MonitorTestCase):
         _, _, _, sent = self.run_monitor([], argv=["--alert-session-lost", "again"])
         self.assertEqual(sent, [], "same jar on disk -> no second email")
 
+    # --- a failed push whose jar IS in the Actions cache: the softer email ----
+    def cached_alert(self):
+        return self.run_monitor([], argv=["--alert-session-lost", "bot_session.enc could not be pushed",
+                                          "--cache-saved"])
+
+    def test_cache_saved_sends_the_softer_email(self):
+        code, _, adapter, sent = self.cached_alert()
+        self.assertEqual((code, adapter.sent), (monitor.EXIT_JAR, []))
+        self.assertEqual([m["subject"] for m in sent], [monitor.SESSION_CACHED_SUBJECT])
+        body = sent[0]["body"]
+        self.assertNotIn("likely lost", sent[0]["subject"] + body)
+        self.assertNotIn("stopped until you reseed", body)
+        self.assertIn("could not be pushed", body)
+        self.assertIn("The newest cookie was saved to the Actions cache, and the next run will use it", body)
+        soft = body.index("You'll only need to reseed if a \"🔴 Bot session expired — reseed needed\" email")
+        steps = body.index(monitor.RESEED_STEPS)
+        self.assertLess(soft, steps, "reseed steps stay at the bottom, for that case")
+        self.assertEqual(body.rstrip("\n"), body[:steps] + monitor.RESEED_STEPS)
+        self.assertEqual(self.state()["session_alert"]["kind"], "lost_cached")
+        _, _, _, sent = self.cached_alert()
+        self.assertEqual(sent, [], "same jar on disk -> no second email")
+
+    def test_without_cache_saved_the_wording_stays_strong(self):
+        _, _, _, sent = self.run_monitor([], argv=["--alert-session-lost", "push failed"])
+        self.assertEqual([m["subject"] for m in sent], ["🔴 Bot session likely lost — reseed needed"])
+        self.assertIn("stopped until you reseed", sent[0]["body"])
+        self.assertEqual(self.state()["session_alert"]["kind"], "lost")
+
+    def test_after_the_softer_email_the_next_run_carries_on(self):
+        self.cached_alert()
+        code, _, adapter, sent = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual([m for m in sent if "session" in m["subject"].lower()], [])
+        self.assertTrue(adapter.sent, "the cached jar is used: requests go out")
+        self.assertNotIn("session_alert", self.state())
+
+    def test_after_the_softer_email_an_expiry_still_emails(self):
+        self.cached_alert()
+        code, _, _, sent = self.run_monitor([login_redirect()])
+        self.assertEqual(code, monitor.EXIT_SESSION)
+        self.assertEqual([m["subject"] for m in sent], ["🔴 Bot session expired — reseed needed"])
+        self.assertEqual(self.state()["session_alert"]["kind"], "expired")
+        _, _, adapter, sent = self.run_monitor([ok(GRID_EN)])
+        self.assertEqual((adapter.sent, sent), ([], []), "a real expiry still stops the runs")
+
     def test_missing_jar_is_a_setup_error_and_never_seeds(self):
         self.jar.unlink()
         code, _, adapter, sent = self.run_monitor([ok()], env={"CS_DID": "DID_x_12345678", "CS_MEMBER": "MEMBER_x_12345678"})
@@ -984,12 +1029,52 @@ class TestJarFallback(MonitorTestCase):
                 self.assertLess(save, push, "cached before any push can fail or hang")
                 self.assertIn("restore-keys: bot-jar-", wf[restore:run])
                 self.assertIn("continue-on-error: true", wf[restore:run])
-                self.assertEqual(wf.count("key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}"), 2)
+                self.assertEqual(wf.count("key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}"), 3)  # save + check
                 self.assertIn("python bot_session.py stage-cache", wf[stage:save])
                 self.assertIn("if: always()", wf[stage:save])
                 self.assertIn("path: .jar_cache/bot_session.enc", wf[save:push])
                 self.assertIn("for delay in 10 20 40 60 90 last; do", wf)
                 self.assertIn('sleep "$delay"', wf)
+
+    def test_softer_wording_only_when_the_cache_entry_is_confirmed(self):
+        root = Path(__file__).resolve().parent / ".github" / "workflows"
+        confirmed = 'if [ "$CACHE_HIT" = "true" ] && cmp -s .jar_cache/bot_session.enc bot_session.enc; then'
+        for name in ("monitor.yml", "probe.yml"):
+            with self.subTest(name):
+                wf = (root / name).read_text(encoding="utf-8")
+                save = wf.index("- name: Save the bot session fallback")
+                check = wf.index("- name: Check the bot session fallback was saved")
+                push = wf.index("git push -q origin HEAD:main")
+                self.assertLess(save, check)
+                self.assertLess(check, push)
+                step = wf[check:wf.index("- name:", check + 1)]
+                self.assertIn("id: cache_check", step)
+                self.assertIn("lookup-only: true", step)
+                self.assertIn("uses: actions/cache/restore@v4", step)
+                self.assertIn("key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}", step)
+                self.assertIn("continue-on-error: true", step)
+                # every step that branches on CACHE_HIT is handed it in its own env
+                for start in [i for i in range(len(wf)) if wf.startswith("      - name:", i)]:
+                    st = wf[start:wf.find("      - name:", start + 1) % (len(wf) + 1)]
+                    if '"$CACHE_HIT"' in st:
+                        self.assertIn("CACHE_HIT: ${{ steps.cache_check.outputs.cache-hit }}", st)
+                # the cached annotation sits in the confirmed branch, the strong one in the else
+                c = wf.index(confirmed)
+                els = wf.index("else", c)
+                self.assertLess(c, wf.index("title=Bot session not pushed (cached)"))
+                self.assertLess(wf.index("title=Bot session not pushed (cached)"), els)
+                self.assertLess(els, wf.index("title=Bot session likely lost"))
+        wf = (root / "monitor.yml").read_text(encoding="utf-8")
+        email = wf[wf.index("- name: Email if the bot session was lost"):]
+        email = email[:email.index("- name:", 5)]
+        c = email.index(confirmed)
+        els = email.index("else", c)
+        self.assertIn('"$CACHE_HIT"', email)
+        self.assertEqual(email.count("--cache-saved"), 1)
+        self.assertLess(c, email.index("--cache-saved"))
+        self.assertLess(email.index("--cache-saved"), els)
+        self.assertIn('python monitor.py --alert-session-lost "bot_session.enc could not be pushed after a '
+                      'cookie rotated"\n', email[els:])
 
     def test_the_cache_folder_is_gitignored(self):
         gi = (Path(__file__).resolve().parent / ".gitignore").read_text()

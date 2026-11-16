@@ -727,7 +727,13 @@ function BotSessionPanel({ state, now }: { state: State; now: number }) {
   let tone: "ok" | "warn" | "bad"
   let label: string
   let detail: string
-  if (alert) {
+  if (alert && alert.kind === "lost_cached") {
+    tone = "warn"
+    label = "Not pushed — cached"
+    detail =
+      `A rotated cookie couldn't be pushed ${formatBangkok(alert.sent_at)} (${formatTimeAgo(alert.sent_at, now)}),` +
+      " but it was saved to the Actions cache and the next run uses it. Reseed only if a \"Bot session expired\" email follows."
+  } else if (alert) {
     tone = "bad"
     label = "Needs reseed"
     detail =

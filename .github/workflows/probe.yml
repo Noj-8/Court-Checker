@@ -87,8 +87,23 @@ jobs:
           path: .jar_cache/bot_session.enc
           key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # actions/cache/save only warns when a save fails, so look the entry up
+      # by its exact key: the softer "next run uses the cached copy" wording
+      # is used only when this hits AND the staged file is this run's jar.
+      - name: Check the bot session fallback was saved
+        id: cache_check
+        if: always() && hashFiles('.jar_cache/bot_session.enc') != ''
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: .jar_cache/bot_session.enc
+          key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}
+          lookup-only: true
+
       - name: Save rotated bot session
         if: always()
+        env:
+          CACHE_HIT: ${{ steps.cache_check.outputs.cache-hit }}
         run: |
           if [ -z "$(git status --porcelain -- bot_session.enc)" ]; then
             echo "bot_session.enc unchanged (no cookie changed) — nothing to commit."
@@ -116,7 +131,11 @@ jobs:
             fi
             attempt=$((attempt + 1))
           done
-          echo "::error title=Bot session likely lost::A cookie rotated during this run but bot_session.enc could not be pushed. The copy in the repo is now superseded and presenting it kills the session. The bot session is likely lost and needs reseeding: fresh private-window login, seed on the Mac, git rm bot_session.enc, rerun seal_session.py, update BOT_JAR_KEY."
+          if [ "$CACHE_HIT" = "true" ] && cmp -s .jar_cache/bot_session.enc bot_session.enc; then
+            echo "::error title=Bot session not pushed (cached)::A cookie rotated during this run but bot_session.enc could not be pushed. The newest jar is in the Actions cache and the next run uses it — reseed only if a \"Bot session expired\" email follows."
+          else
+            echo "::error title=Bot session likely lost::A cookie rotated during this run but bot_session.enc could not be pushed, and the Actions cache copy could not be confirmed. The copy in the repo is now superseded and presenting it kills the session. The bot session is likely lost and needs reseeding: fresh private-window login, seed on the Mac, git rm bot_session.enc, rerun seal_session.py, update BOT_JAR_KEY."
+          fi
           exit 1
 
       - name: Check no plaintext jar on the runner

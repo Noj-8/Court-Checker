@@ -33,7 +33,8 @@ export type Config = {
 // rotated cookie that couldn't be saved). Removed again by the next
 // successful page read.
 export type SessionAlert = {
-  kind: "expired" | "lost"        // "expired": login redirect; "lost": rotated cookie not saved/pushed
+  kind: "expired" | "lost" | "lost_cached" // "expired": login redirect; "lost": rotated cookie not saved/pushed;
+                                           // "lost_cached": not pushed, but the newest jar is in the Actions cache
   sent_at: string                 // ISO datetime (+07:00) when the "reseed needed" email went out
   jar_sha256: string | null       // sha256 prefix of the bot_session.enc it was sent for
 }
