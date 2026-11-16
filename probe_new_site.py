@@ -253,9 +253,10 @@ def summary_line(rnd, repeat, result):
     return line
 
 
-def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FILE, check_account_pages=False):
+def run(repeat=1, interval=300, jar_path=JAR_FILE, session=None, enc_path=ENC_FILE, check_account_pages=False,
+        cache_path=bot_session.CACHE_FILE):
     try:
-        jar = bot_session.open_jar(jar_path, enc_path, session=session)
+        jar = bot_session.open_jar(jar_path, enc_path, session=session, cache_path=cache_path)
     except SessionOpenError as e:
         return OPEN_ERROR_EXIT[e.kind]
     jar_path = jar.path

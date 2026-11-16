@@ -90,6 +90,7 @@ class MonitorTestCase(unittest.TestCase):
         self.enc = self.dir / "bot_session.enc"
         self.config_file = self.dir / "config.json"
         self.state_file = self.dir / "state.json"
+        self.cache = self.dir / ".jar_cache" / "bot_session.enc"   # the Actions-cache fallback copy
         self.write_jar({**COOKIES, **SITE_CULTURE})
         self.state_file.write_text("{}")  # tracked in git: always there (missing = halt, see test_autobook)
         marker = mock.patch.object(monitor, "STATE_ALERT_MARKER", self.dir / ".state_alert.json")
@@ -149,7 +150,7 @@ class MonitorTestCase(unittest.TestCase):
                 code = monitor.main(argv)
             else:
                 code = monitor.run(iterations=iterations, interval=0, jar_path=self.jar,
-                                   enc_path=self.enc, session=session)
+                                   enc_path=self.enc, session=session, cache_path=self.cache)
         self.assertTrue(all(r["method"] == "GET" for r in adapter.sent + adapter.lang_sent), adapter.sent)
         return code, out.getvalue(), adapter, sent
 
@@ -774,6 +775,225 @@ class TestEncryptedSession(MonitorTestCase):
         # .autobook_run.json holds only this run's auto-book date|time keys (no secrets).
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()),
                          [".autobook_run.json", "bot_session.enc", "config.json", "state.json"])
+
+
+@unittest.skipIf(Fernet is None, "cryptography not installed")
+class TestJarFallback(MonitorTestCase):
+    """A run rotates a cookie but can't push bot_session.enc: the Actions
+    cache holds the encrypted jar (stage_cache), and the next run uses
+    whichever of repo and cache has the higher generation — never a lower
+    one, never another session's, and the repo copy if the cache can't be
+    read."""
+
+    OLD, NEW = COOKIES["cs.member"], MEMBER_NEW
+    ROTATE = f"cs.member={MEMBER_NEW}; path=/; secure"
+
+    def setUp(self):
+        super().setUp()
+        self.key = Fernet.generate_key().decode()
+        self.fernet = Fernet(self.key.encode())
+        self.jar.unlink()
+        self.write_enc(self.enc, {**COOKIES, **SITE_CULTURE}, 3, "L1")
+
+    def write_enc(self, path, cookies, generation, lineage):
+        s = requests.Session()
+        for name, value in cookies.items():
+            s.cookies.set_cookie(bot_session.create_cookie(name, value, domain=bot_session.HOST, path="/", secure=True))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.unlink()
+        bot_session.save_jar(path, s, self.fernet, generation, lineage)
+
+    def read_enc(self, path):
+        gen, lineage, s = bot_session.peek_jar(path, self.fernet)
+        return gen, lineage, {c.name: c.value for c in s.cookies}
+
+    def run_enc(self, script, iterations=1):
+        return self.run_monitor(script, iterations=iterations, env={"BOT_JAR_KEY": self.key})
+
+    def stage(self):
+        with mock.patch.dict(os.environ, {"BOT_JAR_KEY": self.key}, clear=True), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            code = bot_session.stage_cache(self.enc, self.cache)
+        return code, out.getvalue()
+
+    def member_sent(self, adapter, i=0):
+        return dict(adapter.sent[i]["cookies"]).get("cs.member")
+
+    # --- the scenario from 2026-11-15 ---------------------------------------
+    def test_push_fails_after_a_rotation_and_the_next_run_uses_the_cache(self):
+        repo_before = self.enc.read_bytes()
+        code, out, adapter, _ = self.run_enc([ok(GRID_EN, set_cookies=[self.ROTATE])])
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(self.read_enc(self.enc)[:2], (4, "L1"), "the rotation bumped the generation")
+        self.stage()                                   # the workflow's always() step
+        self.assertEqual(self.read_enc(self.cache)[0], 4)
+        self.enc.write_bytes(repo_before)              # the push failed: the next checkout has the old copy
+
+        code, out, adapter, _ = self.run_enc([ok(GRID_EN)])
+        self.assertEqual(code, monitor.EXIT_OK)
+        self.assertEqual(self.member_sent(adapter), self.NEW, "the current cookie, not the superseded one")
+        self.assertIn("Jar: CACHE copy, generation 4", out)
+        self.assertIn("newer than the repo's generation 3", out)
+        self.assertEqual(self.read_enc(self.enc)[:2], (4, "L1"), "written over the repo copy, so it gets committed")
+        self.assertNotIn(self.NEW, out)
+        self.assertNotIn(self.key, out)
+
+    def test_control_without_the_cache_the_superseded_cookie_would_be_sent(self):
+        repo_before = self.enc.read_bytes()
+        self.run_enc([ok(GRID_EN, set_cookies=[self.ROTATE])])
+        self.enc.write_bytes(repo_before)
+        code, out, adapter, _ = self.run_enc([ok(GRID_EN)])
+        self.assertEqual(self.member_sent(adapter), self.OLD)
+        self.assertIn("Jar: repo copy, generation 3", out)
+        self.assertIn("no cache copy", out)
+
+    def test_a_rotation_in_the_cache_run_continues_from_the_cache_generation(self):
+        self.write_enc(self.cache, {**COOKIES, **SITE_CULTURE, "cs.member": self.NEW}, 7, "L1")
+        rotate2 = "cs.member=MEMBER_third_5555; path=/; secure"
+        self.run_enc([ok(GRID_EN, set_cookies=[rotate2])])
+        self.assertEqual(self.read_enc(self.enc)[0], 8)
+
+    # --- repo newer / same / cache unusable ---------------------------------
+    def test_repo_newer_than_the_cache_uses_the_repo(self):
+        self.write_enc(self.enc, {**COOKIES, **SITE_CULTURE, "cs.member": "MEMBER_repo_6666"}, 5, "L1")
+        self.write_enc(self.cache, {**COOKIES, **SITE_CULTURE, "cs.member": "MEMBER_cache_7777"}, 4, "L1")
+        code, out, adapter, _ = self.run_enc([ok(GRID_EN)])
+        self.assertEqual(self.member_sent(adapter), "MEMBER_repo_6666")
+        self.assertIn("Jar: repo copy, generation 5", out)
+        self.assertIn("cache copy generation 4", out)
+        self.assertIn("is older", out)
+
+    def test_same_generation_uses_the_repo(self):
+        self.write_enc(self.cache, {**COOKIES, **SITE_CULTURE, "cs.member": "MEMBER_cache_7777"}, 3, "L1")
+        code, out, adapter, _ = self.run_enc([ok(GRID_EN)])
+        self.assertEqual(self.member_sent(adapter), self.OLD)
+        self.assertIn("is the same", out)
+
+    def test_an_unreadable_cache_uses_the_repo(self):
+        other = Fernet(Fernet.generate_key())
+        s = requests.Session()
+        s.cookies.set_cookie(bot_session.create_cookie("cs.member", "MEMBER_x", domain=bot_session.HOST, path="/"))
+        cases = {"garbage": b"\x00not a jar", "empty": b"", "truncated": self.enc.read_bytes()[:40],
+                 "another key": None}
+        for label, data in cases.items():
+            with self.subTest(label):
+                self.cache.parent.mkdir(parents=True, exist_ok=True)
+                if data is None:
+                    self.cache.unlink(missing_ok=True)
+                    bot_session.save_jar(self.cache, s, other, 99, "L1")
+                else:
+                    self.cache.write_bytes(data)
+                code, out, adapter, _ = self.run_enc([ok(GRID_EN)])
+                self.assertEqual(code, monitor.EXIT_OK)
+                self.assertEqual(self.member_sent(adapter), self.OLD)
+                self.assertIn("the cache copy can't be read", out)
+
+    def test_a_cache_from_another_session_is_ignored_even_if_higher(self):
+        self.write_enc(self.cache, {**COOKIES, **SITE_CULTURE, "cs.member": "MEMBER_old_session"}, 50, "OTHER")
+        code, out, adapter, _ = self.run_enc([ok(GRID_EN)])
+        self.assertEqual(self.member_sent(adapter), self.OLD)
+        self.assertIn("from a different session (reseeded?) — ignored", out)
+
+    def test_an_unreadable_repo_jar_still_sends_nothing(self):
+        self.write_enc(self.cache, {**COOKIES, **SITE_CULTURE}, 9, "L1")
+        self.enc.write_bytes(b"garbage")
+        code, out, adapter, _ = self.run_enc([])
+        self.assertEqual(code, monitor.EXIT_SETUP)
+        self.assertEqual((adapter.sent, adapter.lang_sent), ([], []))
+
+    # --- generations never go backwards -------------------------------------
+    def test_generation_counts_rotations_only(self):
+        self.run_enc([ok(GRID_EN, set_cookies=[self.ROTATE]), ok(GRID_EN), ok(GRID_EN)], iterations=3)
+        self.assertEqual(self.read_enc(self.enc)[0], 4, "one rotation, two unchanged responses")
+
+    def test_save_jar_refuses_a_lower_generation_of_the_same_session(self):
+        before = self.enc.read_bytes()
+        s = requests.Session()
+        with self.assertRaises(OSError):
+            bot_session.save_jar(self.enc, s, self.fernet, 2, "L1")
+        self.assertEqual(self.enc.read_bytes(), before)
+        bot_session.save_jar(self.enc, s, self.fernet, 0, "NEW-SESSION")   # a reseed may start again at 0
+        self.assertEqual(self.read_enc(self.enc)[:2], (0, "NEW-SESSION"))
+
+    def test_stage_cache_keeps_a_higher_cache_and_copies_a_newer_repo(self):
+        self.write_enc(self.cache, {**COOKIES, "cs.member": "MEMBER_cache_7777"}, 6, "L1")
+        cached = self.cache.read_bytes()
+        code, out = self.stage()
+        self.assertEqual((code, self.cache.read_bytes()), (0, cached), "repo gen 3 never replaces cache gen 6")
+        self.assertIn("kept the cache copy, generation 6", out)
+        self.write_enc(self.enc, {**COOKIES, "cs.member": "MEMBER_repo_8888"}, 7, "L1")
+        code, out = self.stage()
+        self.assertEqual(self.cache.read_bytes(), self.enc.read_bytes(), "the repo's ciphertext, byte for byte")
+        self.assertIn("staged the repo copy, generation 7", out)
+
+    def test_stage_cache_replaces_another_sessions_or_unreadable_cache(self):
+        for label in ("other session", "unreadable"):
+            with self.subTest(label):
+                if label == "other session":
+                    self.write_enc(self.cache, COOKIES, 99, "OTHER")
+                else:
+                    self.cache.write_bytes(b"junk")
+                self.stage()
+                self.assertEqual(self.cache.read_bytes(), self.enc.read_bytes())
+
+    def test_stage_cache_writes_ciphertext_only_and_needs_the_key(self):
+        self.stage()
+        data = self.cache.read_bytes()
+        for needle in (self.OLD, COOKIES["cs.did"], "cs.member", "cookies"):
+            self.assertNotIn(needle.encode(), data)
+        self.cache.unlink()
+        with mock.patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bot_session.stage_cache(self.enc, self.cache), 1)
+        self.assertFalse(self.cache.exists())
+
+    def test_stage_cache_keeps_the_cache_when_the_repo_jar_is_unreadable(self):
+        self.write_enc(self.cache, COOKIES, 5, "L1")
+        cached = self.cache.read_bytes()
+        self.enc.write_bytes(b"garbage")
+        code, out = self.stage()
+        self.assertEqual((code, self.cache.read_bytes()), (0, cached))
+
+    def test_a_jar_from_before_generations_loads_as_generation_0(self):
+        legacy = json.dumps({"version": 1, "host": bot_session.HOST, "updated_at": "x",
+                             "cookies": [{"name": "cs.member", "value": "M", "domain": bot_session.HOST,
+                                          "path": "/", "secure": True, "expires": None}]}).encode()
+        self.enc.write_bytes(self.fernet.encrypt(legacy))
+        self.assertEqual(self.read_enc(self.enc)[:2], (0, ""))
+        for bad in ({"generation": -1}, {"generation": "3"}, {"generation": True}, {"lineage": 5}):
+            with self.subTest(bad=bad):
+                d = json.loads(legacy); d.update(bad)
+                self.enc.write_bytes(self.fernet.encrypt(json.dumps(d).encode()))
+                with self.assertRaises(bot_session.JarError):
+                    self.read_enc(self.enc)
+
+    # --- the workflows ------------------------------------------------------
+    def test_both_workflows_restore_before_and_save_right_after_the_run(self):
+        root = Path(__file__).resolve().parent / ".github" / "workflows"
+        for name, run_step in (("monitor.yml", "- name: Run monitor"), ("probe.yml", "- name: Run probe")):
+            with self.subTest(name):
+                wf = (root / name).read_text(encoding="utf-8")
+                restore = wf.index("- name: Restore the bot session fallback")
+                run = wf.index(run_step)
+                stage = wf.index("- name: Stage the bot session fallback")
+                save = wf.index("- name: Save the bot session fallback")
+                push = wf.index("git push -q origin HEAD:main")
+                self.assertLess(restore, run)
+                self.assertLess(run, stage)
+                self.assertLess(stage, save)
+                self.assertLess(save, push, "cached before any push can fail or hang")
+                self.assertIn("restore-keys: bot-jar-", wf[restore:run])
+                self.assertIn("continue-on-error: true", wf[restore:run])
+                self.assertEqual(wf.count("key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}"), 2)
+                self.assertIn("python bot_session.py stage-cache", wf[stage:save])
+                self.assertIn("if: always()", wf[stage:save])
+                self.assertIn("path: .jar_cache/bot_session.enc", wf[save:push])
+                self.assertIn("for delay in 10 20 40 60 90 last; do", wf)
+                self.assertIn('sleep "$delay"', wf)
+
+    def test_the_cache_folder_is_gitignored(self):
+        gi = (Path(__file__).resolve().parent / ".gitignore").read_text()
+        self.assertIn(".jar_cache/", gi.splitlines())
 
 
 if __name__ == "__main__":

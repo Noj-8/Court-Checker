@@ -29,11 +29,19 @@ presenting a superseded cs.member kills the whole login session. So:
     such cookie (site_culture_cookie), and the cookie is kept in the jar
     like any other the server issued. Nothing language-related is added
     to requests by the bot itself.
+  * Generations: the jar carries a counter, incremented on every cookie
+    change, and a lineage id (new on every seed/seal). In Actions, a copy of
+    the ENCRYPTED jar is also kept in the Actions cache (stage_cache, every
+    run): if a run rotated a cookie but couldn't push bot_session.enc, the
+    next run takes the cache copy when it is the same lineage with a higher
+    generation (open_jar). A jar is never replaced by a lower generation of
+    the same lineage — save_jar refuses to write one.
   * Cookie values are never printed: only names and fingerprints (length +
     first 8 hex chars of SHA-256), and every line goes through redact().
 """
 
 import hashlib
+import secrets
 import hmac
 import json
 import os
@@ -78,6 +86,9 @@ BROWSER_HEADERS = {
 ROOT = Path(__file__).resolve().parent
 JAR_FILE = ROOT / ".bot_session.json"
 ENC_FILE = ROOT / "bot_session.enc"
+# The fallback copy of the encrypted jar, restored from / saved to the
+# Actions cache by the workflows (gitignored; ciphertext only).
+CACHE_FILE = ROOT / ".jar_cache" / "bot_session.enc"
 JAR_KEY_ENV = "BOT_JAR_KEY"
 JAR_VERSION = 1
 SEED_ENV = {"cs_auth": "CS_AUTH", "cs.did": "CS_DID", "cs.member": "CS_MEMBER"}
@@ -211,7 +222,13 @@ def handed_off_files(jar_path):
     return sorted(jar_path.parent.glob(f"{jar_path.name}.handed-off-*"))
 
 
+def new_lineage():
+    return secrets.token_hex(8)
+
+
 def load_jar(path, session, fernet=None):
+    """Load the cookies into `session`. Returns (generation, lineage): 0 and
+    "" for a jar written before generations existed."""
     try:
         raw = Path(path).read_bytes()
         if fernet is not None:
@@ -222,6 +239,9 @@ def load_jar(path, session, fernet=None):
         data = json.loads(raw)
         if data.get("version") != JAR_VERSION or not isinstance(data.get("cookies"), list):
             raise JarError(f"unexpected format (version={data.get('version')!r})")
+        generation, lineage = data.get("generation", 0), data.get("lineage", "")
+        if type(generation) is not int or generation < 0 or not isinstance(lineage, str):
+            raise JarError("unexpected format (generation/lineage)")
         for r in data["cookies"]:
             session.cookies.set_cookie(create_cookie(
                 r["name"], r["value"], domain=r["domain"], path=r["path"],
@@ -230,24 +250,41 @@ def load_jar(path, session, fernet=None):
             remember_secret(r["value"])
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise JarError(f"{type(e).__name__}: {e}") from None
+    return generation, lineage
 
 
-def save_jar(path, session, fernet=None):
+def peek_jar(path, fernet=None):
+    """(generation, lineage, session) of the jar at `path`, or raises
+    JarError. Nothing is written."""
+    session = requests.Session()
+    generation, lineage = load_jar(path, session, fernet)
+    return generation, lineage, session
+
+
+def save_jar(path, session, fernet=None, generation=0, lineage=""):
     """Write the jar atomically: a crash or failed write at any point leaves
     the previous file intact, never a half-written one. With `fernet`, the
     bytes written are ciphertext only, and an unchanged jar isn't rewritten
     (returns False) so bot_session.enc changes in git only on a real cookie
-    change."""
+    change. Raises OSError rather than replace a jar of the same lineage
+    with a LOWER generation (generations never go backwards on disk)."""
     path = Path(path)
     records = jar_records(session)
-    if fernet is not None and path.exists():
+    if path.exists():
         try:
-            if json.loads(fernet.decrypt(path.read_bytes()))["cookies"] == records:
-                return False
-        except Exception:  # unreadable with this key: fall through and rewrite it
-            pass
+            raw = path.read_bytes()
+            old = json.loads(fernet.decrypt(raw) if fernet is not None else raw)
+            old_gen, old_lineage = old.get("generation", 0), old.get("lineage", "")
+        except Exception:  # unreadable with this key: nothing to compare, rewrite it
+            old = None
+        if old is not None and old_lineage == lineage and isinstance(old_gen, int) and old_gen > generation:
+            raise OSError(f"refusing to replace generation {old_gen} with {generation} (same session)")
+        if (fernet is not None and old is not None and old.get("cookies") == records
+                and old_gen == generation and old_lineage == lineage):
+            return False
     data = (json.dumps({
-        "version": JAR_VERSION, "host": HOST, "updated_at": stamp(), "cookies": records,
+        "version": JAR_VERSION, "host": HOST, "updated_at": stamp(), "generation": generation,
+        "lineage": lineage, "cookies": records,
     }, indent=2) + "\n").encode("utf-8")
     if fernet is not None:
         data = fernet.encrypt(data)  # in memory; only the ciphertext reaches the disk
@@ -376,12 +413,102 @@ class Jar:
     session: requests.Session
     path: Path
     fernet: object = None
+    generation: int = 0
+    lineage: str = ""
 
 
-def open_jar(jar_path=JAR_FILE, enc_path=ENC_FILE, session=None, allow_seed=True):
+def _choose_with_cache(path, session, fernet, generation, lineage, cache_path):
+    """The repo jar is loaded into `session` (generation, lineage). If the
+    cache copy is the same lineage with a HIGHER generation, its cookies
+    replace the session's and it is written over the repo file (so it gets
+    committed). Returns the (generation) in use. Never raises for the cache:
+    an unreadable cache means "use the repo copy", as before the cache."""
+    cache_path = Path(cache_path)
+    repo_fp = file_fingerprint(path)
+    if not cache_path.exists():
+        say(f"Jar: repo copy, generation {generation} (file {repo_fp}); no cache copy.")
+        return generation
+    try:
+        c_gen, c_lineage, c_session = peek_jar(cache_path, fernet)
+    except JarError as e:
+        say(f"Jar: repo copy, generation {generation} (file {repo_fp}); the cache copy can't be read ({e}).")
+        return generation
+    cache_fp = file_fingerprint(cache_path)
+    if c_lineage != lineage:
+        say(f"Jar: repo copy, generation {generation} (file {repo_fp}); the cache copy (file {cache_fp}) is "
+            "from a different session (reseeded?) — ignored.")
+        return generation
+    if c_gen <= generation:
+        say(f"Jar: repo copy, generation {generation} (file {repo_fp}); cache copy generation {c_gen} "
+            f"(file {cache_fp}) is {'the same' if c_gen == generation else 'older'}.")
+        return generation
+    session.cookies.clear()
+    for c in c_session.cookies:
+        session.cookies.set_cookie(c)
+    save_jar(path, session, fernet, c_gen, lineage)
+    say(f"Jar: CACHE copy, generation {c_gen} (file {cache_fp}) — newer than the repo's generation "
+        f"{generation} (file {repo_fp}); a push must have failed. Written over {path.name}.")
+    return c_gen
+
+
+def stage_cache(enc_path=ENC_FILE, cache_path=CACHE_FILE):
+    """After a run (monitor.yml / probe.yml, always): put the newest
+    encrypted jar at `cache_path` for the Actions cache to save. The cache
+    keeps its copy if it is the same lineage with a higher generation than
+    the repo file (e.g. this run couldn't even open the jar); otherwise the
+    repo file's bytes are copied as they are — ciphertext only, never
+    decrypted to disk. Exit status 0, or 1 if there's nothing to stage."""
+    key = os.environ.get(JAR_KEY_ENV, "").strip()
+    enc_path, cache_path = Path(enc_path), Path(cache_path)
+    if not key:
+        say(f"stage-cache: {JAR_KEY_ENV} not set — nothing staged.")
+        return 1
+    remember_secret(key)
+    try:
+        fernet = make_fernet(key)
+    except JarError as e:
+        say(f"stage-cache: {e} — nothing staged.")
+        return 1
+    try:
+        r_gen, r_lineage, _ = peek_jar(enc_path, fernet)
+    except JarError as e:
+        say(f"stage-cache: the repo jar can't be read ({e}) — cache copy left as it is.")
+        return 0 if cache_path.exists() else 1
+    if cache_path.exists():
+        try:
+            c_gen, c_lineage, _ = peek_jar(cache_path, fernet)
+            if c_lineage == r_lineage and c_gen > r_gen:
+                say(f"stage-cache: kept the cache copy, generation {c_gen} (file {file_fingerprint(cache_path)}) "
+                    f"— newer than the repo's {r_gen}.")
+                return 0
+        except JarError:
+            pass  # unreadable: replaced by the repo copy below
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    data = enc_path.read_bytes()
+    fd, tmp = tempfile.mkstemp(prefix=".bot_session.", suffix=".tmp", dir=cache_path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, cache_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    say(f"stage-cache: staged the repo copy, generation {r_gen} (file {file_fingerprint(cache_path)}).")
+    return 0
+
+
+def open_jar(jar_path=JAR_FILE, enc_path=ENC_FILE, session=None, allow_seed=True, cache_path=None):
     """Load the bot's session (or seed it once from env vars, if allowed).
-    Prints what it did, fingerprints only. Raises SessionOpenError — and
-    sends nothing — if there is no usable jar."""
+    With BOT_JAR_KEY and `cache_path`, the Actions-cache copy is used instead
+    when it is newer (see _choose_with_cache). Prints what it did,
+    fingerprints only. Raises SessionOpenError — and sends nothing — if
+    there is no usable jar."""
     session = session or requests.Session()
     session.headers.update(BROWSER_HEADERS)
 
@@ -410,15 +537,23 @@ def open_jar(jar_path=JAR_FILE, enc_path=ENC_FILE, session=None, allow_seed=True
             say("move the handed-off file out of this folder, and reseed.")
             raise SessionOpenError("handed_off")
 
+    generation, lineage = 0, ""
     if path.exists():
         try:
-            load_jar(path, session, fernet)
+            generation, lineage = load_jar(path, session, fernet)
         except JarError as e:
             say(f"ERROR: {path.name} exists but couldn't be read ({e}).")
             say("Not falling back to CS_AUTH/CS_DID/CS_MEMBER — they may be superseded cookies,")
             say("and presenting one kills the session. Fix or delete the file, then reseed from a fresh login.")
             raise SessionOpenError("jar") from None
         say(f"Using existing jar {path.name} (mode {oct(path.stat().st_mode & 0o777)}).")
+        if fernet is not None and cache_path is not None:
+            try:
+                generation = _choose_with_cache(path, session, fernet, generation, lineage, cache_path)
+            except OSError as e:
+                say(f"ERROR: couldn't write the newer cache copy over {path.name} ({type(e).__name__}: {e}). "
+                    "No requests sent.")
+                raise SessionOpenError("jar") from None
         set_env = [env for env in SEED_ENV.values() if os.environ.get(env)]
         if set_env:
             say(f"  {', '.join(set_env)} set but IGNORED — the jar exists, so it is the only source of cookies.")
@@ -430,8 +565,9 @@ def open_jar(jar_path=JAR_FILE, enc_path=ENC_FILE, session=None, allow_seed=True
         if missing:
             say(f"ERROR: no {path.name} yet and {', '.join(missing)} missing — nothing seeded, no requests sent.")
             raise SessionOpenError("no_seed")
+        lineage = new_lineage()
         try:
-            save_jar(path, session, fernet)
+            save_jar(path, session, fernet, 0, lineage)
         except OSError as e:
             say(f"ERROR: couldn't create {path.name} ({type(e).__name__}: {e}) — no requests sent.")
             raise SessionOpenError("jar") from None
@@ -443,7 +579,7 @@ def open_jar(jar_path=JAR_FILE, enc_path=ENC_FILE, session=None, allow_seed=True
     names, _ = cookie_values(session)
     for name in sorted(names):
         say(f"  {name} {fingerprint(names[name])}")
-    return Jar(session=session, path=path, fernet=fernet)
+    return Jar(session=session, path=path, fernet=fernet, generation=generation, lineage=lineage)
 
 
 # --- the one way to talk to the site ----------------------------------------
@@ -554,8 +690,10 @@ def _send(jar, method, path, params=None, data=None, headers=None):
         after, dupes = cookie_values(jar.session)
         after_exp = cookie_expiries(jar.session)
         changes = diff_cookies(before, after)
+        if changes:
+            jar.generation += 1   # every rotation: the newest copy always has the highest number
         try:
-            save_jar(jar.path, jar.session, jar.fernet)
+            save_jar(jar.path, jar.session, jar.fernet, jar.generation, jar.lineage)
         except OSError as e:
             raise JarSaveError(f"{type(e).__name__}: {e}", changes) from request_error
         if request_error is not None:
@@ -581,3 +719,11 @@ def log_cookie_changes(changes, dupes, before_exp, after_exp):
             say(f"[{stamp()}] REMOVED {name}: was {fingerprint(old)}")
     for name in sorted(dupes):
         say(f"[{stamp()}] WARNING: jar holds more than one {name} cookie")
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["stage-cache"]:
+        sys.exit(stage_cache())
+    print("usage: python bot_session.py stage-cache", file=sys.stderr)
+    sys.exit(2)

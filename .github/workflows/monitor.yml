@@ -17,7 +17,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20             # ~5 min run + up to ~4 min of push retries
     steps:
       - name: Checkout repo
         uses: actions/checkout@v5
@@ -35,6 +35,18 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt "cryptography>=42"
+
+      # Fallback copy of the ENCRYPTED bot session (bot_session.py,
+      # open_jar/stage_cache): if a run rotated a cookie but couldn't push
+      # bot_session.enc, the next run uses this copy when it has a higher
+      # generation. A failed restore just means "use the repo copy".
+      - name: Restore the bot session fallback
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: .jar_cache/bot_session.enc
+          key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: bot-jar-
 
       # The "state not saved" marker (see the email steps below). Restored
       # before the monitor runs: while the repo's state.json is still the one
@@ -70,6 +82,24 @@ jobs:
           export REPO_STATE_BLOB
           python monitor.py
 
+      # Right after the run, before any push: the newest encrypted jar goes
+      # to the Actions cache under a key unique to this run, so a push that
+      # fails (or hangs) can't lose a rotated cookie.
+      - name: Stage the bot session fallback
+        if: always()
+        continue-on-error: true
+        env:
+          BOT_JAR_KEY: ${{ secrets.BOT_JAR_KEY }}
+        run: python bot_session.py stage-cache
+
+      - name: Save the bot session fallback
+        if: always() && hashFiles('.jar_cache/bot_session.enc') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .jar_cache/bot_session.enc
+          key: bot-jar-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Commit state and bot session
         id: save
         if: always()
@@ -86,19 +116,24 @@ jobs:
           git config user.email "tennis-monitor@users.noreply.github.com"
           git add state.json bot_session.enc
           git commit -q -m "Update state [skip ci]"
-          for attempt in 1 2 3 4 5; do
+          # GitHub sometimes rejects pushes for minutes at a time, so the
+          # retries are spread over ~4 minutes (10+20+40+60+90 s), rebasing
+          # before each one.
+          attempt=1
+          for delay in 10 20 40 60 90 last; do
             if git push -q origin HEAD:main; then
               echo "Pushed (attempt $attempt)."
               exit 0
             fi
-            [ "$attempt" -eq 5 ] && break
-            echo "Push attempt $attempt failed; rebasing onto origin/main."
+            [ "$delay" = last ] && break
+            echo "Push attempt $attempt failed; retrying in ${delay}s after rebasing onto origin/main."
+            sleep "$delay"
             if ! git pull -q --rebase origin main; then
               git rebase --abort || true
               echo "Rebase conflict — something else changed state.json or bot_session.enc."
               break
             fi
-            sleep $((attempt * 2))
+            attempt=$((attempt + 1))
           done
           if [ "$state_changed" = true ]; then
             echo "state_not_saved=true" >> "$GITHUB_OUTPUT"

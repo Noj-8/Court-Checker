@@ -720,7 +720,8 @@ def set_language(state, jar):
     state.pop(autobook.LANG_RETRY_KEY, None)
 
 
-def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None):
+def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_session.ENC_FILE, session=None,
+        cache_path=bot_session.CACHE_FILE):
     mode = autobook.mode_from_env(log)
     state = open_state()  # first: a halt is on disk before any early return below
     marker_block = handle_push_marker(state)  # a push-failure halt, too, is on disk before any early return
@@ -742,7 +743,7 @@ def run(iterations=4, interval=60, jar_path=bot_session.JAR_FILE, enc_path=bot_s
     state.pop("last_session_alert", None)  # the PHPSESSID-era throttle, replaced by session_alert
 
     try:
-        jar = bot_session.open_jar(jar_path, enc_path, session=session, allow_seed=False)
+        jar = bot_session.open_jar(jar_path, enc_path, session=session, allow_seed=False, cache_path=cache_path)
     except bot_session.SessionOpenError as e:
         log(f"ERROR: couldn't open the bot session ({e.kind}) — no requests sent.")
         return EXIT_SETUP

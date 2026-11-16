@@ -150,6 +150,7 @@ class ProbeTestCase(unittest.TestCase):
         self.dir = Path(self._tmp.name)
         self.jar = self.dir / ".bot_session.json"
         self.enc = self.dir / "bot_session.enc"
+        self.cache = self.dir / ".jar_cache" / "bot_session.enc"
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -163,7 +164,7 @@ class ProbeTestCase(unittest.TestCase):
              mock.patch.object(probe.time, "sleep") as sleep, \
              contextlib.redirect_stdout(out):
             code = probe.run(repeat=repeat, interval=0, jar_path=self.jar, session=session,
-                             enc_path=self.enc, check_account_pages=check_account)
+                             enc_path=self.enc, check_account_pages=check_account, cache_path=self.cache)
         return code, out.getvalue(), adapter, sleep
 
     def jar_cookies(self):
@@ -680,6 +681,25 @@ class TestEncryptedJar(ProbeTestCase):
     def setUp(self):
         super().setUp()
         self.key = Fernet.generate_key().decode()
+
+    def test_a_newer_cache_copy_is_used_like_the_monitor_does(self):
+        f = Fernet(self.key.encode())
+        probe.save_jar(self.enc, session_with({**SEEDED, ".AspNetCore.Culture": "c=en|uic=en"}), f, 3, "L1")
+        self.cache.parent.mkdir()
+        probe.save_jar(self.cache, session_with({**SEEDED, "cs.member": MEMBER_NEW,
+                                                 ".AspNetCore.Culture": "c=en|uic=en"}), f, 4, "L1")
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env={"BOT_JAR_KEY": self.key})
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertIn(("cs.member", MEMBER_NEW), adapter.sent[0]["cookies"])
+        self.assertIn("Jar: CACHE copy, generation 4", out)
+        self.assertEqual(self.enc_cookies()["cs.member"], MEMBER_NEW)
+
+    def test_the_mac_plaintext_jar_never_looks_at_the_cache(self):
+        self.cache.parent.mkdir()
+        self.cache.write_bytes(b"anything")
+        code, out, adapter, _ = self.run_probe([ok(), ok()], env=SEED)
+        self.assertEqual(code, probe.EXIT_OK)
+        self.assertNotIn("Jar:", out)
 
     def enc_cookies(self, key=None):
         s = requests.Session()

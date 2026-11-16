@@ -56,6 +56,22 @@ class TestSeal(unittest.TestCase):
         self.assertIn(probe.fingerprint(key.decode()), out)
         self.assertEqual(sorted(p.name for p in self.dir.glob(".bot_session.*.tmp")), [])
 
+    def test_the_sealed_jar_gets_a_lineage_and_keeps_its_generation(self):
+        code, _ = self.seal()
+        [key] = self.clipboard
+        gen, lineage = probe.load_jar(self.enc, requests.Session(), Fernet(key))
+        self.assertEqual(gen, 0)
+        self.assertRegex(lineage, r"^[0-9a-f]{16}$", "a session id, so an old cache copy never matches it")
+
+    def test_a_seeded_lineage_carries_over(self):
+        s = requests.Session()
+        probe.load_jar(self.jar, s)
+        self.jar.unlink()
+        probe.save_jar(self.jar, s, None, 5, "abcd1234abcd1234")
+        self.seal()
+        [key] = self.clipboard
+        self.assertEqual(probe.load_jar(self.enc, requests.Session(), Fernet(key)), (5, "abcd1234abcd1234"))
+
     def test_refuses_when_enc_already_exists(self):
         self.enc.write_bytes(b"live actions session")
         code, out = self.seal()

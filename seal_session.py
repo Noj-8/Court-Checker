@@ -48,7 +48,7 @@ def seal(jar_path=bs.JAR_FILE, enc_path=bs.ENC_FILE, clipboard=pbcopy):
 
     session = requests.Session()
     try:
-        bs.load_jar(jar_path, session)
+        generation, lineage = bs.load_jar(jar_path, session)
     except bs.JarError as e:
         say(f"ERROR: couldn't read {jar_path.name} ({e}). Nothing changed.")
         return 1
@@ -63,7 +63,9 @@ def seal(jar_path=bs.JAR_FILE, enc_path=bs.ENC_FILE, clipboard=pbcopy):
     bs.remember_secret(key.decode("ascii"))
     fernet = Fernet(key)
     try:
-        bs.save_jar(enc_path, session, fernet)
+        # Its generation and lineage carry over (a new lineage if it has none),
+        # so the Actions-cache fallback only ever matches this session.
+        bs.save_jar(enc_path, session, fernet, generation, lineage or bs.new_lineage())
         check = requests.Session()
         bs.load_jar(enc_path, check, fernet)
         if bs.jar_records(check) != bs.jar_records(session):
