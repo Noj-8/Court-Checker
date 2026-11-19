@@ -1,6 +1,6 @@
 {
   "known_open": {},
-  "last_check": "2026-11-19T14:33:38.149880+07:00",
+  "last_check": "2026-11-19T14:38:28.765506+07:00",
   "currently_open_count": 0,
   "autobook_attempts": {},
   "autobook_mode": "live",
@@ -38,6 +38,26 @@
         }
       ],
       "result_at": "2026-11-19T10:18:40+07:00"
+    },
+    "2026-11-20|21:00": {
+      "status": "parked",
+      "mode": "live",
+      "loc": "LOC002",
+      "loc_name": "Crystal Sports G",
+      "date": "2026-11-20",
+      "time": "21:00",
+      "started_at": "2026-11-19T14:35:21+07:00",
+      "attempts": [
+        {
+          "n": 1,
+          "court_index": 6,
+          "at": "2026-11-19T14:35:22+07:00",
+          "http": 302,
+          "hint": "parked",
+          "ref_fp": "57db1a94abee"
+        }
+      ],
+      "result_at": "2026-11-19T14:35:23+07:00"
     }
   }
 }
