@@ -1,3 +1,26 @@
 {
-  "targets": []
+  "targets": [
+    {
+      "name": "Sun",
+      "date": "2026-12-06",
+      "locations": [
+        "LOC001",
+        "LOC002"
+      ],
+      "times": [
+        {
+          "time": "18:00",
+          "autoBook": false
+        },
+        {
+          "time": "19:00",
+          "autoBook": false
+        },
+        {
+          "time": "20:00",
+          "autoBook": false
+        }
+      ]
+    }
+  ]
 }
